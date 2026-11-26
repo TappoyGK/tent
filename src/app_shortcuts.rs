@@ -256,13 +256,17 @@ impl TentApp {
                 }
             }
             AppShortcut::Paste => {
-                if let Some(text) = macos::read_clipboard_text()
-                    && let Some(ws) = self.workspace.as_mut()
+                if let Some(ws) = self.workspace.as_mut()
                     && let Some(pane) = ws.active_pane_mut()
+                    && let Some(text) = macos::resolve_terminal_paste_payload(
+                        macos::read_clipboard_text(),
+                        macos::save_clipboard_image_to_temp,
+                    )
                 {
                     pane.terminal.scroll_viewport(ScrollViewport::Bottom);
                     pane.mark_dirty();
                     pane.paste_text(&text);
+                    self.request_redraw_now();
                 }
             }
         }
