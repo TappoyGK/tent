@@ -484,6 +484,7 @@ impl TentApp {
         };
 
         if self.hovered_url != next {
+            macos::set_terminal_pointer_cursor(next.is_some());
             if let Some(window) = &self.window {
                 let icon = if next.is_some() {
                     CursorIcon::Pointer
@@ -534,6 +535,8 @@ impl ApplicationHandler<AppEvent> for TentApp {
         install_macos_shortcut_monitor(self.proxy.clone());
         // Finder ファイル・スクショ右下サムネイル等の D&D を確実に受け取る
         macos::install_file_drop_handler(&window, self.proxy.clone());
+        // WKWebView 上の CSS カーソル（リンクのポインタ等）が WinitView に上書きされないようにする
+        macos::install_cursor_rect_passthrough(&window);
 
         let scale = window.scale_factor() as f32;
         let gap = (6.0 * scale).round();

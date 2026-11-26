@@ -523,6 +523,7 @@ impl BrowserManager {
         scale_factor: f64,
     ) {
         let scale = scale_factor.max(1.0);
+        let mut cursor_rects_dirty = false;
 
         // 1. 今回表示しない WebView を非表示にする
         // macOS では isHidden = YES でも frame がウィンドウ内にあると CoreDrag が
@@ -539,6 +540,7 @@ impl BrowserManager {
                 let _ = managed.webview.set_bounds(offscreen);
                 managed.last_bounds = (-10000.0, -10000.0, lw, lh);
                 managed.visible = false;
+                cursor_rects_dirty = true;
             }
         }
 
@@ -562,10 +564,12 @@ impl BrowserManager {
                 {
                     let _ = managed.webview.set_bounds(wry_rect);
                     managed.last_bounds = bounds_tuple;
+                    cursor_rects_dirty = true;
                 }
                 if !managed.visible {
                     let _ = managed.webview.set_visible(true);
                     managed.visible = true;
+                    cursor_rects_dirty = true;
                 }
             } else {
                 let proxy_nav = self.proxy.clone();
@@ -638,12 +642,16 @@ impl BrowserManager {
                                 in_flight: Arc::new(AtomicBool::new(false)),
                             },
                         );
+                        cursor_rects_dirty = true;
                     }
                     Err(err) => {
                         eprintln!("TenT: failed to create WKWebView for pane {id}: {err}");
                     }
                 }
             }
+        }
+        if cursor_rects_dirty {
+            crate::macos::invalidate_cursor_rects(window);
         }
     }
 
