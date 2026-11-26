@@ -26,6 +26,11 @@ cargo run
 # リリースビルド
 cargo build --release
 
+# macOS アプリバンドル（dist/TenT.app）の生成
+./scripts/bundle-macos.sh
+# /Applications へ配置して起動する例:
+# cp -R dist/TenT.app /Applications/ && open /Applications/TenT.app
+
 # テスト・フォーマット・Lint
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
