@@ -8,6 +8,7 @@
 ### Added
 - TenT カスタムアプリアイコンを追加（`assets/tent-icon.png`・`assets/tent-icon-256.png`・`assets/TenT.icns`）
 - macOS の Dock / `Cmd+Tab` へ起動時にカスタムアイコンを自動適用
+- GitHub Actions CI（`.github/workflows/ci.yml`）を追加（`macos-latest` で `fmt` / `clippy` / `test` を自動実行）
 
 ## [0.1.21] - 2026-11-26
 
