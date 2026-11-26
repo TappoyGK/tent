@@ -306,35 +306,76 @@ fn test_notification_clears_when_background_output_resumes() {
 }
 
 #[test]
-fn test_clear_screen_and_scrollback_clears_viewport() {
+fn test_clear_screen_and_scrollback_clears_viewport_and_history_across_resync() {
     use std::path::PathBuf;
 
+    use ghostty_vt::terminal::ScrollViewport;
+
     use super::TerminalPane;
-    use crate::daemon::{DaemonClient, ReplayedPane};
+    use crate::daemon::{DaemonClient, ReplayedPane, encode_terminal_snapshot};
+
+    // デーモン側と GUI 側の双方にスクロールバック付きの内容を流す
+    let initial =
+        b"PRE_CLEAR_MARKER\r\nline2\r\nline3\r\nline4\r\nline5\r\nline6\r\nline7\r\nline8";
+    let mut daemon_vt = Terminal::new(TerminalOptions {
+        cols: 40,
+        rows: 4,
+        ..Default::default()
+    })
+    .unwrap();
+    daemon_vt.vt_write(initial);
 
     let mut pane = TerminalPane::attach_from_replay(
         ReplayedPane {
             pane_id: 1,
             cols: 40,
-            rows: 6,
+            rows: 4,
             cwd: PathBuf::from("/tmp"),
-            replay_bytes: b"line1\r\nline2\r\nline3\r\nline4\r\nline5\r\nline6\r\nline7".to_vec(),
+            replay_bytes: encode_terminal_snapshot(&daemon_vt),
         },
         DaemonClient::dummy_for_test(),
     )
     .unwrap();
 
+    // クリア前はスクロールアップで PRE_CLEAR_MARKER が見えること
+    pane.terminal.scroll_viewport(ScrollViewport::Top);
+    let before = pane.extract_selection_text((0, 0), (39, 3));
+    assert!(before.contains("PRE_CLEAR_MARKER"));
+    pane.terminal.scroll_viewport(ScrollViewport::Bottom);
+
+    // ClientMsg::Clear 相当の消去をデーモン側・GUI 側へ適用
+    const CLEAR_SEQ: &[u8] = b"\x1b[3J\x1b[2J\x1b[H";
+    daemon_vt.vt_write(CLEAR_SEQ);
     pane.clear_screen_and_scrollback();
-    let visible = pane.extract_selection_text((0, 0), (39, 5));
-    assert!(visible.trim().is_empty());
+
+    // GUI の可視領域・スクロールバックともに消去されていること
+    pane.terminal.scroll_viewport(ScrollViewport::Top);
+    let after_clear = pane.extract_selection_text((0, 0), (39, 3));
+    assert!(!after_clear.contains("PRE_CLEAR_MARKER"));
+    assert!(after_clear.trim().is_empty());
+
+    // デーモンから再同期スナップショットが適用されても PRE_CLEAR_MARKER が復活しないこと
+    pane.apply_resync_snapshot(ReplayedPane {
+        pane_id: 1,
+        cols: 40,
+        rows: 4,
+        cwd: PathBuf::from("/tmp"),
+        replay_bytes: encode_terminal_snapshot(&daemon_vt),
+    });
+    pane.terminal.scroll_viewport(ScrollViewport::Top);
+    let after_resync = pane.extract_selection_text((0, 0), (39, 3));
+    assert!(!after_resync.contains("PRE_CLEAR_MARKER"));
+    assert!(after_resync.trim().is_empty());
 }
 
 #[test]
-fn test_background_completion_notification_threshold() {
+fn test_background_completion_notification_survives_silent_gap() {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
-    use super::{BACKGROUND_NOTIFY_MIN_DURATION, TerminalPane};
+    use super::{
+        BACKGROUND_NOTIFY_MIN_DURATION, STARTUP_GRACE_PERIOD, TerminalPane, WAITING_IDLE_THRESHOLD,
+    };
     use crate::daemon::{DaemonClient, ReplayedPane};
 
     let mut pane = TerminalPane::attach_from_replay(
@@ -343,19 +384,40 @@ fn test_background_completion_notification_threshold() {
             cols: 40,
             rows: 6,
             cwd: PathBuf::from("/tmp"),
-            replay_bytes: Vec::new(),
+            replay_bytes: b"ready> ".to_vec(),
         },
         DaemonClient::dummy_for_test(),
     )
     .unwrap();
-
     let t0 = Instant::now();
-    pane.background_output_started_at = Some(t0);
-    // 実行時間がしきい値未満なら通知しない
-    pane.last_output_instant = Some(t0 + BACKGROUND_NOTIFY_MIN_DURATION - Duration::from_secs(1));
-    assert!(!pane.should_notify_background_completion(t0 + Duration::from_secs(10)));
+    pane.created_at = t0 - STARTUP_GRACE_PERIOD - Duration::from_secs(1);
+    pane.mark_screen_seen();
 
-    // 実行時間がしきい値以上なら通知対象になる
-    pane.last_output_instant = Some(t0 + BACKGROUND_NOTIFY_MIN_DURATION);
-    assert!(pane.should_notify_background_completion(t0 + Duration::from_secs(10)));
+    // 1. t=0: 開始メッセージ出力（裏スロット）
+    pane.terminal.vt_write(b"\r\nbuilding...");
+    pane.had_background_output = true;
+    pane.background_output_started_at = Some(t0);
+    pane.last_output_instant = Some(t0);
+
+    // 2. t=4s: 計算中の無出力区間で update_waiting_state が発火
+    //    （この時点では 5 秒未満なので通知未発火、開始時刻は保持されること）
+    let t4 = t0 + WAITING_IDLE_THRESHOLD;
+    assert!(pane.update_waiting_state(t4, false, None));
+    assert!(pane.is_waiting_input);
+    assert_eq!(pane.background_output_started_at, Some(t0));
+
+    // 3. t=10s: 計算完了メッセージ出力
+    let t10 = t0 + BACKGROUND_NOTIFY_MIN_DURATION + Duration::from_secs(5);
+    pane.terminal.vt_write(b"\r\ndone!");
+    pane.is_waiting_input = false;
+    pane.had_background_output = true;
+    pane.background_output_started_at.get_or_insert(t10);
+    pane.last_output_instant = Some(t10);
+
+    // 4. t=14s: 完了後のアイドル遷移で通知対象（>= 5s）と判定され、その後開始時刻がリセットされること
+    let t14 = t10 + WAITING_IDLE_THRESHOLD;
+    assert!(pane.should_notify_background_completion(t14));
+    assert!(pane.update_waiting_state(t14, false, None));
+    assert!(pane.is_waiting_input);
+    assert_eq!(pane.background_output_started_at, None);
 }

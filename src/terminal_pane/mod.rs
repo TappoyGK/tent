@@ -472,13 +472,19 @@ impl TerminalPane {
         self.generation = self.generation.wrapping_add(1);
     }
 
-    /// 画面およびスクロールバックをクリアする（macOS 標準の Cmd+K 相当）
+    /// 画面およびスクロールバックをクリアする（macOS 標準の Cmd+K 相当）。
+    /// プロトコル v4+ のデーモン接続時は明示的な Clear コマンドを送り、
+    /// PTY 出力と順序を保ったままデーモン・GUI 双方の画面とスクロールバックを消去する。
     pub fn clear_screen_and_scrollback(&mut self) {
         use ghostty_vt::terminal::ScrollViewport;
 
-        self.terminal.vt_write(b"\x1b[3J\x1b[2J\x1b[H");
+        if self.daemon.supports_clear() {
+            self.daemon.clear_pane(self.id);
+        } else {
+            self.terminal.vt_write(b"\x1b[3J\x1b[2J\x1b[H");
+        }
         self.terminal.scroll_viewport(ScrollViewport::Bottom);
-        // 通常スクリーン（シェル等）では Ctrl+L も送り、プロンプト再描画とデーモン側同期を行う
+        // 通常スクリーン（シェル等）では Ctrl+L も送り、クリア後にプロンプトを再描画する
         let is_alt = self.terminal.mode(Mode::ALT_SCREEN_SAVE).unwrap_or(false)
             || self.terminal.mode(Mode::ALT_SCREEN).unwrap_or(false);
         if !is_alt {
@@ -601,7 +607,6 @@ impl TerminalPane {
             }
             let should_notify = self.should_notify_background_completion(now);
             self.had_background_output = false;
-            self.background_output_started_at = None;
             // 最後に確認した時点から可視テキストが一切変わっていなければ（カーソル点滅・同一再描画等）黄色にしない
             let cur_hash = self.current_screen_hash();
             if cur_hash == self.last_seen_screen_hash {
@@ -609,12 +614,17 @@ impl TerminalPane {
             }
             if !self.is_waiting_input {
                 self.is_waiting_input = true;
-                if should_notify && let Some(label) = slot_label {
-                    let title = format!("TenT [{}] {}", label, self.folder_name);
-                    self.try_send_os_notification(
-                        title,
-                        "出力が完了し入力待ちになりました".to_string(),
-                    );
+                if should_notify {
+                    // 完了通知を発火した時点で実行区間をリセット（未発火の無出力区間では開始時刻を保持し、
+                    // 「開始出力 → 4秒無出力 → 10秒後に完了出力」の長時間処理でも通知を逃さない）
+                    self.background_output_started_at = None;
+                    if let Some(label) = slot_label {
+                        let title = format!("TenT [{}] {}", label, self.folder_name);
+                        self.try_send_os_notification(
+                            title,
+                            "出力が完了し入力待ちになりました".to_string(),
+                        );
+                    }
                 }
                 return true;
             }

@@ -18,6 +18,7 @@ use super::{DAEMON_PROTOCOL_VERSION, DaemonEvent, ReplayedPane};
 #[derive(Clone)]
 pub struct DaemonClient {
     cmd_tx: Sender<ClientMsg>,
+    server_version: u32,
 }
 
 /// 初回接続ハンドシェイクの結果
@@ -112,7 +113,10 @@ impl DaemonClient {
             })?;
 
         Ok(AttachResult {
-            client: DaemonClient { cmd_tx },
+            client: DaemonClient {
+                cmd_tx,
+                server_version,
+            },
             replayed_panes,
             next_pane_id,
             daemon_version_mismatch,
@@ -150,10 +154,23 @@ impl DaemonClient {
         let _ = self.cmd_tx.send(ClientMsg::QueryCwds);
     }
 
+    pub fn supports_clear(&self) -> bool {
+        self.server_version >= 4
+    }
+
+    pub fn clear_pane(&self, pane_id: PaneId) {
+        if self.supports_clear() {
+            let _ = self.cmd_tx.send(ClientMsg::Clear { pane_id });
+        }
+    }
+
     #[cfg(test)]
     pub fn dummy_for_test() -> Self {
         let (cmd_tx, _cmd_rx) = mpsc::channel();
-        Self { cmd_tx }
+        Self {
+            cmd_tx,
+            server_version: 0,
+        }
     }
 }
 

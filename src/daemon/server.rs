@@ -446,6 +446,20 @@ fn handle_client_connection(mut reader_stream: UnixStream, state: Arc<Mutex<Daem
                 };
                 outbox.push_event(DaemonEvent::CwdList(cwds));
             }
+            ClientMsg::Clear { pane_id } => {
+                const CLEAR_SEQ: &[u8] = b"\x1b[3J\x1b[2J\x1b[H";
+                if let Ok(mut st) = state.lock() {
+                    let cleared = if let Some(dp) = st.panes.get_mut(&pane_id) {
+                        dp.terminal.vt_write(CLEAR_SEQ);
+                        true
+                    } else {
+                        false
+                    };
+                    if cleared {
+                        st.emit_output(pane_id, CLEAR_SEQ.to_vec());
+                    }
+                }
+            }
         }
     }
 
