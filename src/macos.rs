@@ -229,6 +229,41 @@ pub fn shell_escape_path(path: &std::path::Path) -> String {
     out
 }
 
+/// macOS の Dock / Cmd+Tab に TenT のカスタムアイコンを設定する（bare binary 起動時用）
+#[cfg(target_os = "macos")]
+pub fn install_app_icon() {
+    use objc2::msg_send;
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyClass, AnyObject};
+    use objc2_foundation::NSData;
+
+    const ICON_PNG: &[u8] = include_bytes!("../assets/tent-icon-256.png");
+    let data = NSData::with_bytes(ICON_PNG);
+    unsafe {
+        let Some(app_cls) = AnyClass::get(c"NSApplication") else {
+            return;
+        };
+        let Some(img_cls) = AnyClass::get(c"NSImage") else {
+            return;
+        };
+        let app: *mut AnyObject = msg_send![app_cls, sharedApplication];
+        if app.is_null() {
+            return;
+        }
+        let alloc: *mut AnyObject = msg_send![img_cls, alloc];
+        if alloc.is_null() {
+            return;
+        }
+        let raw_img: *mut AnyObject = msg_send![alloc, initWithData: &*data];
+        if let Some(img) = Retained::from_raw(raw_img) {
+            let _: () = msg_send![app, setApplicationIconImage: &*img];
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn install_app_icon() {}
+
 /// macOS の `WinitView` にファイル／スクショ画像 D&D ハンドラを登録する。
 /// `winit` 標準は非推奨の `NSFilenamesPboardType` のみ対応のため、
 /// `public.file-url` およびスクショ右下サムネイル等の `public.png` / `public.tiff` も受け取れるようにする。
