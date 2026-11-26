@@ -1,0 +1,18 @@
+# Build outputs
+/target/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Local / temporary files
+*.log
+.env

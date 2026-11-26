@@ -1,0 +1,735 @@
+use std::ffi::CStr;
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::thread;
+
+/// 指定 PID のカレントディレクトリを macOS libc::proc_pidinfo で高速取得する
+pub fn get_pid_cwd(pid: i32) -> Option<PathBuf> {
+    if pid <= 0 {
+        return None;
+    }
+    let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    let ret = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if ret <= 0 {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    let cstr = unsafe { CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr().cast()) };
+    let s = cstr.to_str().ok()?;
+    if s.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(s))
+    }
+}
+
+/// macOS ネイティブ通知をバックグラウンドスレッドで非同期送信する
+pub fn send_notification(title: String, body: String) {
+    thread::spawn(move || {
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!(
+            "display notification \"{}\" with title \"{}\"",
+            esc(&body),
+            esc(&title)
+        );
+        let _ = Command::new("osascript").args(["-e", &script]).output();
+    });
+}
+
+/// macOS 標準のシステムベル音（Glass）を非同期再生する
+pub fn play_system_bell() {
+    thread::spawn(|| {
+        let _ = Command::new("afplay")
+            .arg("/System/Library/Sounds/Glass.aiff")
+            .status();
+    });
+}
+
+/// macOS クリップボードからテキストを取得する（Finder/Dock 起動時も UTF-8 保証）
+pub fn read_clipboard_text() -> Option<String> {
+    let output = Command::new("pbpaste")
+        .env("LC_CTYPE", "UTF-8")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+/// macOS クリップボードへテキストを書き込む（UTF-8 保証）
+pub fn write_clipboard_text(text: &str) {
+    if let Ok(mut child) = Command::new("pbcopy")
+        .env("LC_CTYPE", "UTF-8")
+        .stdin(Stdio::piped())
+        .spawn()
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+    }
+}
+
+/// http:// または https:// の URL を macOS のデフォルトブラウザで非同期に開く
+pub fn open_url(url: &str) {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return;
+    }
+    let url = url.to_string();
+    thread::spawn(move || {
+        let _ = Command::new("open").arg(&url).status();
+    });
+}
+
+/// パニックログの出力先（~/Library/Logs/TenT/panic.log）
+pub fn panic_log_path() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME") {
+        PathBuf::from(home)
+            .join("Library")
+            .join("Logs")
+            .join("TenT")
+            .join("panic.log")
+    } else {
+        PathBuf::from("/tmp/tent-panic.log")
+    }
+}
+
+/// macOS の Wi-Fi 電波状態
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WifiStatus {
+    Disconnected,
+    Connected { bars: u8, rssi: i32 },
+}
+
+/// `system_profiler SPAirPortDataType` から現在の Wi-Fi 電波強度を取得する
+pub fn read_wifi_status() -> WifiStatus {
+    let Ok(out) = Command::new("system_profiler")
+        .arg("SPAirPortDataType")
+        .output()
+    else {
+        return WifiStatus::Disconnected;
+    };
+    if !out.status.success() {
+        return WifiStatus::Disconnected;
+    }
+    parse_airport_wifi(&String::from_utf8_lossy(&out.stdout))
+}
+
+pub fn parse_airport_wifi(text: &str) -> WifiStatus {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("Signal / Noise:") {
+            let token = rest.split_whitespace().next().unwrap_or("");
+            if let Ok(rssi) = token.parse::<i32>() {
+                let bars = if rssi >= -55 {
+                    4
+                } else if rssi >= -67 {
+                    3
+                } else if rssi >= -78 {
+                    2
+                } else {
+                    1
+                };
+                return WifiStatus::Connected { bars, rssi };
+            }
+        }
+    }
+    WifiStatus::Disconnected
+}
+
+/// macOS のバッテリー状態
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BatteryStatus {
+    pub percent: u8,
+    pub charging: bool,
+}
+
+/// `pmset -g batt` を実行して現在のバッテリー残量と充電状態を取得する
+pub fn read_battery_status() -> Option<BatteryStatus> {
+    let out = Command::new("pmset").args(["-g", "batt"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_pmset_batt(&String::from_utf8_lossy(&out.stdout))
+}
+
+pub fn parse_pmset_batt(text: &str) -> Option<BatteryStatus> {
+    for line in text.lines() {
+        let Some(pct_pos) = line.find('%') else {
+            continue;
+        };
+        let before = &line[..pct_pos];
+        let digits: String = before
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        let Ok(percent) = digits.parse::<u8>() else {
+            continue;
+        };
+        let lower = line.to_ascii_lowercase();
+        let charging = lower.contains("charging;") && !lower.contains("discharging");
+        return Some(BatteryStatus {
+            percent: percent.min(100),
+            charging,
+        });
+    }
+    None
+}
+
+/// D&D されたファイルパスを zsh / bash / Codex / Claude Code でそのまま扱えるよう
+/// バックスラッシュエスケープする（iTerm2 / Ghostty / Terminal.app 互換）
+pub fn shell_escape_path(path: &std::path::Path) -> String {
+    let raw = path.to_string_lossy();
+    let mut out = String::with_capacity(raw.len() + 8);
+    for ch in raw.chars() {
+        if matches!(
+            ch,
+            ' ' | '\t'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '&'
+                | ';'
+                | '\''
+                | '"'
+                | '\\'
+                | '$'
+                | '`'
+                | '*'
+                | '?'
+                | '<'
+                | '>'
+                | '|'
+                | '!'
+                | '#'
+                | '~'
+        ) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// macOS の `WinitView` にファイル／スクショ画像 D&D ハンドラを登録する。
+/// `winit` 標準は非推奨の `NSFilenamesPboardType` のみ対応のため、
+/// `public.file-url` およびスクショ右下サムネイル等の `public.png` / `public.tiff` も受け取れるようにする。
+#[cfg(target_os = "macos")]
+pub fn install_file_drop_handler(
+    window: &winit::window::Window,
+    proxy: winit::event_loop::EventLoopProxy<crate::terminal_pane::AppEvent>,
+) {
+    use std::ffi::c_char;
+    use std::ptr::NonNull;
+    use std::sync::OnceLock;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use block2::RcBlock;
+    use objc2::ffi::{class_replaceMethod, object_getClass};
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyClass, AnyObject, Bool, Imp, Sel};
+    use objc2::{msg_send, sel};
+    use objc2_core_foundation::{CGPoint, CGRect};
+    use objc2_foundation::{NSArray, NSData, NSDictionary, NSString, NSURL};
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    static DROP_PROXY: OnceLock<winit::event_loop::EventLoopProxy<crate::terminal_pane::AppEvent>> =
+        OnceLock::new();
+    let _ = DROP_PROXY.set(proxy);
+
+    unsafe fn drag_location_px(sender: *mut AnyObject) -> Option<(f32, f32)> {
+        if sender.is_null() {
+            return None;
+        }
+        let win: *mut AnyObject = unsafe { msg_send![sender, draggingDestinationWindow] };
+        if win.is_null() {
+            return None;
+        }
+        let content: *mut AnyObject = unsafe { msg_send![win, contentView] };
+        if content.is_null() {
+            return None;
+        }
+        let loc: CGPoint = unsafe { msg_send![sender, draggingLocation] };
+        let frame: CGRect = unsafe { msg_send![content, frame] };
+        let scale: f64 = unsafe { msg_send![win, backingScaleFactor] };
+        let scale = if scale > 0.0 { scale } else { 1.0 };
+        let px = (loc.x * scale) as f32;
+        let py = ((frame.size.height - loc.y) * scale) as f32;
+        Some((px, py))
+    }
+
+    fn notify_drag_hover(sender: *mut AnyObject) {
+        if let Some((px, py)) = unsafe { drag_location_px(sender) }
+            && let Some(proxy) = DROP_PROXY.get()
+        {
+            let _ = proxy.send_event(crate::terminal_pane::AppEvent::DragHover { px, py });
+        }
+    }
+
+    /// macOS スクショ右下サムネイルの一時領域（`TemporaryItems/NSIRD_screencaptureui_*`）は
+    /// サムネイル消滅後に削除されたりサンドボックスから読めないため、`/tmp/tent-drops/` へ退避する。
+    fn materialize_ephemeral_drop(path: PathBuf) -> PathBuf {
+        let s = path.to_string_lossy();
+        if !s.contains("TemporaryItems/NSIRD_screencaptureui_") {
+            return path;
+        }
+        let drop_dir = PathBuf::from("/tmp/tent-drops");
+        if std::fs::create_dir_all(&drop_dir).is_err() {
+            return path;
+        }
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_else(|| {
+                let ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                std::ffi::OsString::from(format!("screenshot-{ms}.png"))
+            });
+        let dest = drop_dir.join(file_name);
+        if std::fs::copy(&path, &dest).is_ok() {
+            dest
+        } else {
+            path
+        }
+    }
+
+    unsafe extern "C" fn dragging_entered(
+        _this: *mut AnyObject,
+        _cmd: Sel,
+        sender: *mut AnyObject,
+    ) -> usize {
+        notify_drag_hover(sender);
+        1 // NSDragOperationCopy
+    }
+
+    unsafe extern "C" fn dragging_updated(
+        _this: *mut AnyObject,
+        _cmd: Sel,
+        sender: *mut AnyObject,
+    ) -> usize {
+        notify_drag_hover(sender);
+        1 // NSDragOperationCopy
+    }
+
+    unsafe extern "C" fn prepare_for_drag(
+        _this: *mut AnyObject,
+        _cmd: Sel,
+        _sender: *mut AnyObject,
+    ) -> Bool {
+        Bool::YES
+    }
+
+    fn save_dropped_image_bytes(bytes: &[u8], ext: &str) -> Option<PathBuf> {
+        let drop_dir = PathBuf::from("/tmp/tent-drops");
+        let _ = std::fs::create_dir_all(&drop_dir);
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let path = drop_dir.join(format!("tent-drop-{ms}.{ext}"));
+        std::fs::write(&path, bytes).ok()?;
+        Some(path)
+    }
+
+    unsafe extern "C" fn perform_drag(
+        _this: *mut AnyObject,
+        _cmd: Sel,
+        sender: *mut AnyObject,
+    ) -> Bool {
+        if sender.is_null() {
+            return Bool::NO;
+        }
+        let pb: *mut AnyObject = unsafe { msg_send![sender, draggingPasteboard] };
+        if pb.is_null() {
+            return Bool::NO;
+        }
+
+        let drop_pos = unsafe { drag_location_px(sender) };
+        let mut paths: Vec<PathBuf> = Vec::new();
+
+        // 1. Ghostty と同じ方式: item.propertyListForType("public.file-url") -> NSURL(pasteboardPropertyList:ofType:)
+        let file_url_type = NSString::from_str("public.file-url");
+        let items: Option<Retained<NSArray<AnyObject>>> = unsafe { msg_send![pb, pasteboardItems] };
+        if let Some(items) = items {
+            let nsurl_cls = AnyClass::get(c"NSURL");
+            for item in items.iter() {
+                let mut resolved_url: Option<Retained<NSURL>> = None;
+                if let Some(cls) = nsurl_cls {
+                    let plist: Option<Retained<AnyObject>> =
+                        unsafe { msg_send![&*item, propertyListForType: &*file_url_type] };
+                    if let Some(plist) = plist {
+                        let alloc: *mut AnyObject = unsafe { msg_send![cls, alloc] };
+                        if !alloc.is_null() {
+                            let raw: *mut NSURL = unsafe {
+                                msg_send![
+                                    alloc,
+                                    initWithPasteboardPropertyList: &*plist,
+                                    ofType: &*file_url_type
+                                ]
+                            };
+                            resolved_url = unsafe { Retained::from_raw(raw) };
+                        }
+                    }
+                }
+                if resolved_url.is_none() {
+                    let url_str: Option<Retained<NSString>> =
+                        unsafe { msg_send![&*item, stringForType: &*file_url_type] };
+                    if let Some(url_str) = url_str {
+                        resolved_url = NSURL::URLWithString(&url_str);
+                    }
+                }
+                if let Some(nsurl) = resolved_url {
+                    let resolved = nsurl.filePathURL().unwrap_or(nsurl);
+                    if let Some(path_str) = resolved.path() {
+                        let p = PathBuf::from(path_str.to_string());
+                        if !p.as_os_str().is_empty() {
+                            paths.push(p);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. 旧 NSFilenamesPboardType フォールバック
+        if paths.is_empty() {
+            let legacy_type = NSString::from_str("NSFilenamesPboardType");
+            let plist: Option<Retained<AnyObject>> =
+                unsafe { msg_send![pb, propertyListForType: &*legacy_type] };
+            if let Some(plist) = plist {
+                let count: usize = unsafe { msg_send![&*plist, count] };
+                for i in 0..count {
+                    let s: Option<Retained<NSString>> =
+                        unsafe { msg_send![&*plist, objectAtIndex: i] };
+                    if let Some(s) = s {
+                        let p = PathBuf::from(s.to_string());
+                        if !p.as_os_str().is_empty() {
+                            paths.push(p);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. macOS スクショ直後の右下サムネイル等（NSFilePromiseReceiver）
+        if paths.is_empty()
+            && let Some(promise_cls) = AnyClass::get(c"NSFilePromiseReceiver")
+            && let Some(queue_cls) = AnyClass::get(c"NSOperationQueue")
+        {
+            let cls_obj: &AnyObject = unsafe { &*(promise_cls as *const AnyClass).cast() };
+            let classes = NSArray::from_slice(&[cls_obj]);
+            let empty_opts: Retained<NSDictionary<NSString, AnyObject>> = NSDictionary::new();
+            let receivers: Option<Retained<NSArray<AnyObject>>> =
+                unsafe { msg_send![pb, readObjectsForClasses: &*classes, options: &*empty_opts] };
+            if let Some(receivers) = receivers
+                && !receivers.is_empty()
+            {
+                let drop_dir = PathBuf::from("/tmp/tent-drops");
+                let _ = std::fs::create_dir_all(&drop_dir);
+                let dir_str = NSString::from_str(&drop_dir.to_string_lossy());
+                let dest_url = NSURL::fileURLWithPath_isDirectory(&dir_str, true);
+                // Apple 推奨: mainQueue ではなくバックグラウンド NSOperationQueue を渡す（デッドロック防止）
+                let bg_queue: Option<Retained<AnyObject>> = unsafe { msg_send![queue_cls, new] };
+                if let Some(queue) = bg_queue {
+                    for receiver in receivers.iter() {
+                        let block =
+                            RcBlock::new(move |file_url: NonNull<NSURL>, err: *mut AnyObject| {
+                                if !err.is_null() {
+                                    return;
+                                }
+                                let url_ref = unsafe { file_url.as_ref() };
+                                let resolved = url_ref.filePathURL();
+                                let path_opt = resolved
+                                    .as_deref()
+                                    .and_then(NSURL::path)
+                                    .or_else(|| url_ref.path());
+                                if let Some(path_str) = path_opt {
+                                    let p = PathBuf::from(path_str.to_string());
+                                    if !p.as_os_str().is_empty()
+                                        && let Some(proxy) = DROP_PROXY.get()
+                                    {
+                                        let _ = proxy.send_event(
+                                            crate::terminal_pane::AppEvent::DroppedFiles {
+                                                paths: vec![p],
+                                                pos: drop_pos,
+                                            },
+                                        );
+                                    }
+                                }
+                            });
+                        unsafe {
+                            let _: () = msg_send![
+                                &*receiver,
+                                receivePromisedFilesAtDestination: &*dest_url,
+                                options: &*empty_opts,
+                                operationQueue: &*queue,
+                                reader: &*block
+                            ];
+                        }
+                    }
+                    // 非同期コールバック完了までキューを保持
+                    std::mem::forget(queue);
+                    return Bool::YES;
+                }
+            }
+        }
+
+        // 4. スクショ直後の右下サムネイルや他アプリからの生画像（PNG / TIFF）
+        if paths.is_empty() {
+            let png_type = NSString::from_str("public.png");
+            let png_data: Option<Retained<NSData>> =
+                unsafe { msg_send![pb, dataForType: &*png_type] };
+            if let Some(data) = png_data {
+                let bytes = unsafe { data.as_bytes_unchecked() };
+                if !bytes.is_empty()
+                    && let Some(path) = save_dropped_image_bytes(bytes, "png")
+                {
+                    paths.push(path);
+                }
+            }
+        }
+        if paths.is_empty() {
+            let tiff_type = NSString::from_str("public.tiff");
+            let tiff_data: Option<Retained<NSData>> =
+                unsafe { msg_send![pb, dataForType: &*tiff_type] };
+            if let Some(data) = tiff_data {
+                // 可能なら NSBitmapImageRep で PNG へ変換して保存（agy / Claude 等で扱いやすくする）
+                let mut saved = None;
+                if let Some(cls) = AnyClass::get(c"NSBitmapImageRep") {
+                    let rep: Option<Retained<AnyObject>> =
+                        unsafe { msg_send![cls, imageRepWithData: &*data] };
+                    if let Some(rep) = rep {
+                        let empty_props: Retained<NSDictionary<NSString, AnyObject>> =
+                            NSDictionary::new();
+                        // NSBitmapImageFileTypePNG = 4
+                        let png: Option<Retained<NSData>> = unsafe {
+                            msg_send![
+                                &*rep,
+                                representationUsingType: 4usize,
+                                properties: &*empty_props
+                            ]
+                        };
+                        if let Some(png) = png {
+                            let bytes = unsafe { png.as_bytes_unchecked() };
+                            if !bytes.is_empty() {
+                                saved = save_dropped_image_bytes(bytes, "png");
+                            }
+                        }
+                    }
+                }
+                if saved.is_none() {
+                    let bytes = unsafe { data.as_bytes_unchecked() };
+                    if !bytes.is_empty() {
+                        saved = save_dropped_image_bytes(bytes, "tiff");
+                    }
+                }
+                if let Some(path) = saved {
+                    paths.push(path);
+                }
+            }
+        }
+
+        if !paths.is_empty()
+            && let Some(proxy) = DROP_PROXY.get()
+        {
+            let materialized: Vec<PathBuf> =
+                paths.into_iter().map(materialize_ephemeral_drop).collect();
+            let _ = proxy.send_event(crate::terminal_pane::AppEvent::DroppedFiles {
+                paths: materialized,
+                pos: drop_pos,
+            });
+            return Bool::YES;
+        }
+        Bool::NO
+    }
+
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return;
+    };
+    let view = appkit.ns_view.as_ptr().cast::<AnyObject>();
+    if view.is_null() {
+        return;
+    }
+
+    unsafe {
+        let imp_enter: Imp = std::mem::transmute::<
+            unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject) -> usize,
+            Imp,
+        >(dragging_entered);
+        let imp_update: Imp = std::mem::transmute::<
+            unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject) -> usize,
+            Imp,
+        >(dragging_updated);
+        let imp_prep: Imp = std::mem::transmute::<
+            unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject) -> Bool,
+            Imp,
+        >(prepare_for_drag);
+        let imp_perf: Imp = std::mem::transmute::<
+            unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject) -> Bool,
+            Imp,
+        >(perform_drag);
+
+        // WinitView と NSWindow の delegate（WinitWindowDelegate）の両方へ確実にメソッドを登録する
+        let mut target_classes: Vec<*mut AnyClass> = Vec::new();
+        let view_cls = object_getClass(view.cast()).cast_mut();
+        if !view_cls.is_null() {
+            target_classes.push(view_cls);
+        }
+        let ns_win: *mut AnyObject = msg_send![view, window];
+        if !ns_win.is_null() {
+            let delegate: *mut AnyObject = msg_send![ns_win, delegate];
+            if !delegate.is_null() {
+                let del_cls = object_getClass(delegate.cast()).cast_mut();
+                if !del_cls.is_null() {
+                    target_classes.push(del_cls);
+                }
+            }
+        }
+
+        for cls in target_classes {
+            let _ = class_replaceMethod(
+                cls,
+                sel!(draggingEntered:),
+                imp_enter,
+                c"Q@:@".as_ptr().cast::<c_char>(),
+            );
+            let _ = class_replaceMethod(
+                cls,
+                sel!(draggingUpdated:),
+                imp_update,
+                c"Q@:@".as_ptr().cast::<c_char>(),
+            );
+            let _ = class_replaceMethod(
+                cls,
+                sel!(prepareForDragOperation:),
+                imp_prep,
+                c"B@:@".as_ptr().cast::<c_char>(),
+            );
+            let _ = class_replaceMethod(
+                cls,
+                sel!(performDragOperation:),
+                imp_perf,
+                c"B@:@".as_ptr().cast::<c_char>(),
+            );
+        }
+
+        let t1 = NSString::from_str("public.file-url");
+        let t2 = NSString::from_str("public.utf8-plain-text");
+        let t3 = NSString::from_str("NSFilenamesPboardType");
+        let t4 = NSString::from_str("public.png");
+        let t5 = NSString::from_str("public.tiff");
+        let mut type_objs: Vec<Retained<NSString>> = vec![t1, t2, t3, t4, t5];
+        if let Some(promise_cls) = AnyClass::get(c"NSFilePromiseReceiver") {
+            let promise_types: Option<Retained<NSArray<NSString>>> =
+                msg_send![promise_cls, readableDraggedTypes];
+            if let Some(ptypes) = promise_types {
+                for t in ptypes.iter() {
+                    type_objs.push(t);
+                }
+            }
+        }
+        let type_refs: Vec<&NSString> = type_objs.iter().map(|s| &**s).collect();
+        let types = NSArray::from_slice(&type_refs);
+        let _: () = msg_send![view, registerForDraggedTypes: &*types];
+        if !ns_win.is_null() {
+            let _: () = msg_send![ns_win, registerForDraggedTypes: &*types];
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn install_file_drop_handler(
+    _window: &winit::window::Window,
+    _proxy: winit::event_loop::EventLoopProxy<crate::terminal_pane::AppEvent>,
+) {
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_current_process_cwd() {
+        let pid = std::process::id() as i32;
+        let cwd = get_pid_cwd(pid).expect("proc_pidinfo should return cwd for current process");
+        let expected = std::env::current_dir().unwrap();
+        assert_eq!(
+            cwd.canonicalize().unwrap_or(cwd),
+            expected.canonicalize().unwrap_or(expected)
+        );
+    }
+
+    #[test]
+    fn test_shell_escape_path() {
+        assert_eq!(
+            shell_escape_path(std::path::Path::new(
+                "/Users/tappoy/Desktop/Screenshot 2026-11-26 at 09.55.00.png"
+            )),
+            r"/Users/tappoy/Desktop/Screenshot\ 2026-11-26\ at\ 09.55.00.png"
+        );
+        assert_eq!(
+            shell_escape_path(std::path::Path::new("/tmp/スクショ (1).png")),
+            r"/tmp/スクショ\ \(1\).png"
+        );
+    }
+
+    #[test]
+    fn test_parse_pmset_batt() {
+        let discharging = "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=1)\t84%; discharging; 5:12 remaining present: true\n";
+        assert_eq!(
+            parse_pmset_batt(discharging),
+            Some(BatteryStatus {
+                percent: 84,
+                charging: false
+            })
+        );
+        let charging = "Now drawing from 'AC Power'\n -InternalBattery-0 (id=1)\t76%; charging; 0:45 remaining present: true\n";
+        assert_eq!(
+            parse_pmset_batt(charging),
+            Some(BatteryStatus {
+                percent: 76,
+                charging: true
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_airport_wifi() {
+        let strong = "          Status: Connected\n          Signal / Noise: -52 dBm / -92 dBm\n";
+        assert_eq!(
+            parse_airport_wifi(strong),
+            WifiStatus::Connected { bars: 4, rssi: -52 }
+        );
+        let fair = "          Signal / Noise: -72 dBm / -90 dBm\n";
+        assert_eq!(
+            parse_airport_wifi(fair),
+            WifiStatus::Connected { bars: 2, rssi: -72 }
+        );
+        assert_eq!(
+            parse_airport_wifi("Status: Off\n"),
+            WifiStatus::Disconnected
+        );
+    }
+}

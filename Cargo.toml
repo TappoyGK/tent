@@ -1,0 +1,31 @@
+[package]
+name = "tent"
+version = "0.1.21"
+edition = "2024"
+rust-version = "1.100"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "10-slot macOS terminal and embedded browser workspace"
+
+[dependencies]
+ghostty-vt = { version = "0.9.0", default-features = false }
+portable-pty = "0.9"
+winit = "0.30"
+wgpu = "30"
+glyphon = "0.12"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+chrono = "0.4"
+libc = "0.2"
+wry = { version = "0.58", default-features = false, features = ["devtools", "os-webview"] }
+block2 = "0.6"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSEvent", "NSGraphicsContext", "NSImage", "NSImageRep", "NSResponder", "NSView", "NSWindow", "block2", "objc2-core-graphics"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFCGTypes"] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["CGBitmapContext", "CGColorSpace", "CGContext", "CGImage"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSArray", "NSData", "NSDictionary", "NSError", "NSString", "NSURL", "NSValue"] }
+objc2-web-kit = { version = "0.3", default-features = false, features = ["WKNavigation", "WKSnapshotConfiguration", "WKWebView", "block2"] }
+
+# dev ビルドでも wgpu / glyphon / cosmic-text を最適化して軽快に動作させる
+[profile.dev.package."*"]
+opt-level = 2
