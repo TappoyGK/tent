@@ -3,7 +3,7 @@
 このプロジェクトの主な変更履歴を記録します。  
 フォーマットは [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に準拠し、バージョニングは [Semantic Versioning](https://semver.org/lang/ja/) に従います。
 
-## [0.1.22] - Unreleased
+## [0.1.22] - 2026-11-27
 
 ### Added
 - TenT カスタムアプリアイコンを追加（`assets/tent-icon.png`・`assets/tent-icon-256.png`・`assets/TenT.icns`）
