@@ -3,6 +3,11 @@
 このプロジェクトの主な変更履歴を記録します。  
 フォーマットは [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に準拠し、バージョニングは [Semantic Versioning](https://semver.org/lang/ja/) に従います。
 
+## [0.2.0] - Unreleased
+
+### Added
+- クリップボードに画像（PNG / TIFF）が入っている状態で `Cmd+V` を押した際、`/tmp/tent-drops/` へ PNG 保存してエスケープ済みファイルパスをターミナルへ貼り付ける機能を追加
+
 ## [0.1.22] - 2026-11-27
 
 ### Added

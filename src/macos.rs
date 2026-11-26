@@ -67,6 +67,118 @@ pub fn read_clipboard_text() -> Option<String> {
     String::from_utf8(output.stdout).ok()
 }
 
+/// ターミナルへの `Cmd+V` ペースト内容を決定する。
+/// テキストが存在する場合はテキストを優先し、空または未取得のときだけクリップボード画像パスへフォールバックする。
+pub fn resolve_terminal_paste_payload<F>(
+    clipboard_text: Option<String>,
+    save_clipboard_image: F,
+) -> Option<String>
+where
+    F: FnOnce() -> Option<PathBuf>,
+{
+    if let Some(text) = clipboard_text
+        && !text.is_empty()
+    {
+        return Some(text);
+    }
+    save_clipboard_image().map(|path| format!("{} ", shell_escape_path(&path)))
+}
+
+fn save_temp_image_bytes(prefix: &str, bytes: &[u8], ext: &str) -> Option<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let drop_dir = PathBuf::from("/tmp/tent-drops");
+    std::fs::create_dir_all(&drop_dir).ok()?;
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = drop_dir.join(format!("{prefix}-{ms}-{seq}.{ext}"));
+    std::fs::write(&path, bytes).ok()?;
+    Some(path)
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn extract_pasteboard_image_to_temp(
+    pb: *mut objc2::runtime::AnyObject,
+    prefix: &str,
+) -> Option<PathBuf> {
+    use objc2::msg_send;
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyClass, AnyObject};
+    use objc2_foundation::{NSData, NSDictionary, NSString};
+
+    if pb.is_null() {
+        return None;
+    }
+
+    let png_type = NSString::from_str("public.png");
+    let png_data: Option<Retained<NSData>> = unsafe { msg_send![pb, dataForType: &*png_type] };
+    if let Some(data) = png_data {
+        let bytes = unsafe { data.as_bytes_unchecked() };
+        if !bytes.is_empty()
+            && let Some(path) = save_temp_image_bytes(prefix, bytes, "png")
+        {
+            return Some(path);
+        }
+    }
+
+    let tiff_type = NSString::from_str("public.tiff");
+    let tiff_data: Option<Retained<NSData>> = unsafe { msg_send![pb, dataForType: &*tiff_type] };
+    if let Some(data) = tiff_data {
+        if let Some(cls) = AnyClass::get(c"NSBitmapImageRep") {
+            let rep: Option<Retained<AnyObject>> =
+                unsafe { msg_send![cls, imageRepWithData: &*data] };
+            if let Some(rep) = rep {
+                let empty_props: Retained<NSDictionary<NSString, AnyObject>> = NSDictionary::new();
+                // NSBitmapImageFileTypePNG = 4
+                let png: Option<Retained<NSData>> = unsafe {
+                    msg_send![
+                        &*rep,
+                        representationUsingType: 4usize,
+                        properties: &*empty_props
+                    ]
+                };
+                if let Some(png) = png {
+                    let bytes = unsafe { png.as_bytes_unchecked() };
+                    if !bytes.is_empty()
+                        && let Some(path) = save_temp_image_bytes(prefix, bytes, "png")
+                    {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+        let bytes = unsafe { data.as_bytes_unchecked() };
+        if !bytes.is_empty() {
+            return save_temp_image_bytes(prefix, bytes, "tiff");
+        }
+    }
+
+    None
+}
+
+/// macOS クリップボードに画像（PNG / TIFF）が入っていれば `/tmp/tent-drops/` へ保存してパスを返す。
+#[cfg(target_os = "macos")]
+pub fn save_clipboard_image_to_temp() -> Option<PathBuf> {
+    use objc2::msg_send;
+    use objc2::runtime::{AnyClass, AnyObject};
+
+    unsafe {
+        let cls = AnyClass::get(c"NSPasteboard")?;
+        let pb: *mut AnyObject = msg_send![cls, generalPasteboard];
+        extract_pasteboard_image_to_temp(pb, "tent-paste")
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn save_clipboard_image_to_temp() -> Option<PathBuf> {
+    None
+}
+
 /// macOS クリップボードへテキストを書き込む（UTF-8 保証）
 pub fn write_clipboard_text(text: &str) {
     if let Ok(mut child) = Command::new("pbcopy")
@@ -283,7 +395,7 @@ pub fn install_file_drop_handler(
     use objc2::runtime::{AnyClass, AnyObject, Bool, Imp, Sel};
     use objc2::{msg_send, sel};
     use objc2_core_foundation::{CGPoint, CGRect};
-    use objc2_foundation::{NSArray, NSData, NSDictionary, NSString, NSURL};
+    use objc2_foundation::{NSArray, NSDictionary, NSString, NSURL};
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
     static DROP_PROXY: OnceLock<winit::event_loop::EventLoopProxy<crate::terminal_pane::AppEvent>> =
@@ -372,18 +484,6 @@ pub fn install_file_drop_handler(
         _sender: *mut AnyObject,
     ) -> Bool {
         Bool::YES
-    }
-
-    fn save_dropped_image_bytes(bytes: &[u8], ext: &str) -> Option<PathBuf> {
-        let drop_dir = PathBuf::from("/tmp/tent-drops");
-        let _ = std::fs::create_dir_all(&drop_dir);
-        let ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let path = drop_dir.join(format!("tent-drop-{ms}.{ext}"));
-        std::fs::write(&path, bytes).ok()?;
-        Some(path)
     }
 
     unsafe extern "C" fn perform_drag(
@@ -529,58 +629,10 @@ pub fn install_file_drop_handler(
         }
 
         // 4. スクショ直後の右下サムネイルや他アプリからの生画像（PNG / TIFF）
-        if paths.is_empty() {
-            let png_type = NSString::from_str("public.png");
-            let png_data: Option<Retained<NSData>> =
-                unsafe { msg_send![pb, dataForType: &*png_type] };
-            if let Some(data) = png_data {
-                let bytes = unsafe { data.as_bytes_unchecked() };
-                if !bytes.is_empty()
-                    && let Some(path) = save_dropped_image_bytes(bytes, "png")
-                {
-                    paths.push(path);
-                }
-            }
-        }
-        if paths.is_empty() {
-            let tiff_type = NSString::from_str("public.tiff");
-            let tiff_data: Option<Retained<NSData>> =
-                unsafe { msg_send![pb, dataForType: &*tiff_type] };
-            if let Some(data) = tiff_data {
-                // 可能なら NSBitmapImageRep で PNG へ変換して保存（agy / Claude 等で扱いやすくする）
-                let mut saved = None;
-                if let Some(cls) = AnyClass::get(c"NSBitmapImageRep") {
-                    let rep: Option<Retained<AnyObject>> =
-                        unsafe { msg_send![cls, imageRepWithData: &*data] };
-                    if let Some(rep) = rep {
-                        let empty_props: Retained<NSDictionary<NSString, AnyObject>> =
-                            NSDictionary::new();
-                        // NSBitmapImageFileTypePNG = 4
-                        let png: Option<Retained<NSData>> = unsafe {
-                            msg_send![
-                                &*rep,
-                                representationUsingType: 4usize,
-                                properties: &*empty_props
-                            ]
-                        };
-                        if let Some(png) = png {
-                            let bytes = unsafe { png.as_bytes_unchecked() };
-                            if !bytes.is_empty() {
-                                saved = save_dropped_image_bytes(bytes, "png");
-                            }
-                        }
-                    }
-                }
-                if saved.is_none() {
-                    let bytes = unsafe { data.as_bytes_unchecked() };
-                    if !bytes.is_empty() {
-                        saved = save_dropped_image_bytes(bytes, "tiff");
-                    }
-                }
-                if let Some(path) = saved {
-                    paths.push(path);
-                }
-            }
+        if paths.is_empty()
+            && let Some(path) = unsafe { extract_pasteboard_image_to_temp(pb, "tent-drop") }
+        {
+            paths.push(path);
         }
 
         if !paths.is_empty()
@@ -766,5 +818,33 @@ mod tests {
             parse_airport_wifi("Status: Off\n"),
             WifiStatus::Disconnected
         );
+    }
+
+    #[test]
+    fn test_resolve_terminal_paste_payload() {
+        // テキストがあるときは画像フォールバックを呼ばずテキストを優先する
+        let mut called = false;
+        let out = resolve_terminal_paste_payload(Some("hello".to_string()), || {
+            called = true;
+            Some(PathBuf::from("/tmp/tent-drops/a.png"))
+        });
+        assert_eq!(out.as_deref(), Some("hello"));
+        assert!(!called);
+
+        // pbpaste が空文字を返したとき（画像のみコピー時）はエスケープ済みパス＋末尾スペースへフォールバック
+        let out = resolve_terminal_paste_payload(Some(String::new()), || {
+            Some(PathBuf::from("/tmp/tent-drops/shot (1).png"))
+        });
+        assert_eq!(out.as_deref(), Some(r"/tmp/tent-drops/shot\ \(1\).png "));
+
+        // テキスト未取得かつ画像あり
+        let out = resolve_terminal_paste_payload(None, || {
+            Some(PathBuf::from("/tmp/tent-drops/paste.png"))
+        });
+        assert_eq!(out.as_deref(), Some("/tmp/tent-drops/paste.png "));
+
+        // どちらも空
+        let out = resolve_terminal_paste_payload(Some(String::new()), || None);
+        assert_eq!(out, None);
     }
 }
