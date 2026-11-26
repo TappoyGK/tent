@@ -230,9 +230,11 @@ fn test_resize_alone_does_not_trigger_waiting_input() {
 
     // 裏スロットのまま幅が変わっても、折り返し変化だけで黄色（入力待ち）にならないこと
     pane.resize(20, 20, 10, 20);
-    assert!(
-        !pane.update_waiting_state(t0 + WAITING_IDLE_THRESHOLD + Duration::from_secs(1), false)
-    );
+    assert!(!pane.update_waiting_state(
+        t0 + WAITING_IDLE_THRESHOLD + Duration::from_secs(1),
+        false,
+        None,
+    ));
     assert!(!pane.is_waiting_input);
 }
 
@@ -264,9 +266,11 @@ fn test_work_indicator_in_upper_viewport_suppresses_waiting_input() {
     pane.last_output_instant = Some(t0);
     pane.had_background_output = true;
 
-    assert!(
-        !pane.update_waiting_state(t0 + WAITING_IDLE_THRESHOLD + Duration::from_secs(1), false)
-    );
+    assert!(!pane.update_waiting_state(
+        t0 + WAITING_IDLE_THRESHOLD + Duration::from_secs(1),
+        false,
+        None,
+    ));
     assert!(!pane.is_waiting_input);
 }
 
@@ -299,4 +303,59 @@ fn test_notification_clears_when_background_output_resumes() {
     // 2. その後、同じペインで通常出力が再開したらオレンジが消えること
     pane.feed_pty_bytes(b"next step running...\r\n", false, true, "1");
     assert!(!pane.has_notification);
+}
+
+#[test]
+fn test_clear_screen_and_scrollback_clears_viewport() {
+    use std::path::PathBuf;
+
+    use super::TerminalPane;
+    use crate::daemon::{DaemonClient, ReplayedPane};
+
+    let mut pane = TerminalPane::attach_from_replay(
+        ReplayedPane {
+            pane_id: 1,
+            cols: 40,
+            rows: 6,
+            cwd: PathBuf::from("/tmp"),
+            replay_bytes: b"line1\r\nline2\r\nline3\r\nline4\r\nline5\r\nline6\r\nline7".to_vec(),
+        },
+        DaemonClient::dummy_for_test(),
+    )
+    .unwrap();
+
+    pane.clear_screen_and_scrollback();
+    let visible = pane.extract_selection_text((0, 0), (39, 5));
+    assert!(visible.trim().is_empty());
+}
+
+#[test]
+fn test_background_completion_notification_threshold() {
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    use super::{BACKGROUND_NOTIFY_MIN_DURATION, TerminalPane};
+    use crate::daemon::{DaemonClient, ReplayedPane};
+
+    let mut pane = TerminalPane::attach_from_replay(
+        ReplayedPane {
+            pane_id: 1,
+            cols: 40,
+            rows: 6,
+            cwd: PathBuf::from("/tmp"),
+            replay_bytes: Vec::new(),
+        },
+        DaemonClient::dummy_for_test(),
+    )
+    .unwrap();
+
+    let t0 = Instant::now();
+    pane.background_output_started_at = Some(t0);
+    // 実行時間がしきい値未満なら通知しない
+    pane.last_output_instant = Some(t0 + BACKGROUND_NOTIFY_MIN_DURATION - Duration::from_secs(1));
+    assert!(!pane.should_notify_background_completion(t0 + Duration::from_secs(10)));
+
+    // 実行時間がしきい値以上なら通知対象になる
+    pane.last_output_instant = Some(t0 + BACKGROUND_NOTIFY_MIN_DURATION);
+    assert!(pane.should_notify_background_completion(t0 + Duration::from_secs(10)));
 }

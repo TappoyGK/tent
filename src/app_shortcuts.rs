@@ -269,6 +269,15 @@ impl TentApp {
                     self.request_redraw_now();
                 }
             }
+            AppShortcut::ClearScreen => {
+                self.selection = None;
+                if let Some(ws) = self.workspace.as_mut()
+                    && let Some(pane) = ws.active_pane_mut()
+                {
+                    pane.clear_screen_and_scrollback();
+                    self.request_redraw_now();
+                }
+            }
         }
     }
 }

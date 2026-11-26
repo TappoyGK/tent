@@ -27,6 +27,8 @@ const NOTIFICATION_COOLDOWN: Duration = Duration::from_secs(1);
 const STARTUP_GRACE_PERIOD: Duration = Duration::from_secs(3);
 const RESIZE_GRACE_PERIOD: Duration = Duration::from_secs(1);
 const WAITING_IDLE_THRESHOLD: Duration = Duration::from_secs(4);
+/// 裏スロットでの完了・入力待ち OS 通知を出すための最小実行時間（短時間ノイズ抑制）
+const BACKGROUND_NOTIFY_MIN_DURATION: Duration = Duration::from_secs(5);
 /// DEC Mode 2026 (Synchronized Output) で描画ホールドを許可する最大時間（固まり防止）
 const SYNC_OUTPUT_MAX_HOLD: Duration = Duration::from_secs(1);
 
@@ -100,6 +102,7 @@ pub struct TerminalPane {
     sync_hold_since: Option<Instant>,
     pub has_notification: bool,
     pub had_background_output: bool,
+    pub background_output_started_at: Option<Instant>,
     pub is_waiting_input: bool,
     last_seen_screen_hash: u64,
     last_notification_sent: Option<Instant>,
@@ -172,6 +175,7 @@ impl TerminalPane {
             sync_hold_since: None,
             has_notification: false,
             had_background_output: false,
+            background_output_started_at: None,
             is_waiting_input: false,
             last_seen_screen_hash: 0,
             last_notification_sent: None,
@@ -235,6 +239,7 @@ impl TerminalPane {
             sync_hold_since: None,
             has_notification: false,
             had_background_output: false,
+            background_output_started_at: None,
             is_waiting_input: false,
             last_seen_screen_hash: 0,
             last_notification_sent: None,
@@ -400,6 +405,7 @@ impl TerminalPane {
             self.has_notification = false;
             if !is_active && !in_startup_grace {
                 self.had_background_output = true;
+                self.background_output_started_at.get_or_insert(now);
             }
         } else if !self.had_background_output {
             // リサイズ猶予中の再描画は未確認出力とみなさず基準ハッシュを更新する
@@ -464,6 +470,22 @@ impl TerminalPane {
     pub fn mark_dirty(&mut self) {
         self.minimap_dirty = true;
         self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// 画面およびスクロールバックをクリアする（macOS 標準の Cmd+K 相当）
+    pub fn clear_screen_and_scrollback(&mut self) {
+        use ghostty_vt::terminal::ScrollViewport;
+
+        self.terminal.vt_write(b"\x1b[3J\x1b[2J\x1b[H");
+        self.terminal.scroll_viewport(ScrollViewport::Bottom);
+        // 通常スクリーン（シェル等）では Ctrl+L も送り、プロンプト再描画とデーモン側同期を行う
+        let is_alt = self.terminal.mode(Mode::ALT_SCREEN_SAVE).unwrap_or(false)
+            || self.terminal.mode(Mode::ALT_SCREEN).unwrap_or(false);
+        if !is_alt {
+            self.write_input(b"\x0c");
+        }
+        self.mark_screen_seen();
+        self.mark_dirty();
     }
 
     /// DEC Mode 2026（Synchronized Output）が有効で画面書き換え途中の場合は true を返す。
@@ -549,10 +571,24 @@ impl TerminalPane {
             || lower.contains("esc to cancel")
     }
 
-    /// 裏タブで出力が止まったときに「AI入力待ち」へ遷移させる
-    pub fn update_waiting_state(&mut self, now: Instant, is_active: bool) -> bool {
+    /// 裏スロットでの実行時間が通知しきい値以上だったか判定する
+    pub(crate) fn should_notify_background_completion(&self, now: Instant) -> bool {
+        let end = self.last_output_instant.unwrap_or(now);
+        self.background_output_started_at.is_some_and(|start| {
+            end.saturating_duration_since(start) >= BACKGROUND_NOTIFY_MIN_DURATION
+        })
+    }
+
+    /// 裏タブで出力が止まったときに「AI入力待ち」へ遷移させ、一定時間以上動いていた場合は OS 通知する
+    pub fn update_waiting_state(
+        &mut self,
+        now: Instant,
+        is_active: bool,
+        slot_label: Option<&str>,
+    ) -> bool {
         if is_active {
             self.had_background_output = false;
+            self.background_output_started_at = None;
             return false;
         }
         let idle_long_enough = self
@@ -563,7 +599,9 @@ impl TerminalPane {
             if self.has_active_work_indicator() {
                 return false;
             }
+            let should_notify = self.should_notify_background_completion(now);
             self.had_background_output = false;
+            self.background_output_started_at = None;
             // 最後に確認した時点から可視テキストが一切変わっていなければ（カーソル点滅・同一再描画等）黄色にしない
             let cur_hash = self.current_screen_hash();
             if cur_hash == self.last_seen_screen_hash {
@@ -571,6 +609,13 @@ impl TerminalPane {
             }
             if !self.is_waiting_input {
                 self.is_waiting_input = true;
+                if should_notify && let Some(label) = slot_label {
+                    let title = format!("TenT [{}] {}", label, self.folder_name);
+                    self.try_send_os_notification(
+                        title,
+                        "出力が完了し入力待ちになりました".to_string(),
+                    );
+                }
                 return true;
             }
         }
