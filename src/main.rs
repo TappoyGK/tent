@@ -199,6 +199,7 @@ struct TentApp {
     restart_requested: bool,
     daemon_version_mismatch: bool,
     daemon_upgrade_confirm_until: Option<Instant>,
+    version_copied_until: Option<Instant>,
     status_timer: StatusTimerState,
 }
 
@@ -245,6 +246,7 @@ impl TentApp {
             restart_requested: false,
             daemon_version_mismatch: false,
             daemon_upgrade_confirm_until: None,
+            version_copied_until: None,
             status_timer: StatusTimerState::default(),
         }
     }
@@ -847,6 +849,12 @@ impl ApplicationHandler<AppEvent> for TentApp {
             && now >= deadline
         {
             self.daemon_upgrade_confirm_until = None;
+            need_redraw = true;
+        }
+        if let Some(deadline) = self.version_copied_until
+            && now >= deadline
+        {
+            self.version_copied_until = None;
             need_redraw = true;
         }
 

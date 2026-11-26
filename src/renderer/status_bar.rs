@@ -82,18 +82,22 @@ impl Renderer {
         }
 
         // アプリバージョン表記（リリース版は v0.2.0、開発版は v0.2.0-dev@2adc49c 等）を更新
-        let ver_key = (scale_factor * 100.0).round() as u32;
+        let ver_key =
+            ((scale_factor * 100.0).round() as u32) * 2 + u32::from(overlays.version_copied);
         if self.version_cache_key != ver_key {
             let ver_font_size = (10.5 * scale_factor).round().max(9.0);
             let ver_metrics = Metrics::new(ver_font_size, (ver_font_size * 1.35).ceil());
             self.version_buffer.set_metrics(ver_metrics);
             self.version_buffer
                 .set_size(Some(sb_ctrl.version_rect.w), Some(sb_ctrl.version_rect.h));
+            let (ver_text, ver_color) = if overlays.version_copied {
+                ("Copied!", Color::rgb(0x5c, 0xd6, 0x8d))
+            } else {
+                (env!("TENT_DISPLAY_VERSION"), Color::rgb(0x6e, 0x7a, 0x92))
+            };
             self.version_buffer.set_text(
-                env!("TENT_DISPLAY_VERSION"),
-                &Attrs::new()
-                    .family(Family::Name("Menlo"))
-                    .color(Color::rgb(0x6e, 0x7a, 0x92)),
+                ver_text,
+                &Attrs::new().family(Family::Name("Menlo")).color(ver_color),
                 Shaping::Basic,
                 None,
             );

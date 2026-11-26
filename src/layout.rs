@@ -79,6 +79,7 @@ pub enum StatusBarHit {
     SplitBrowser,
     ToggleHelp,
     UpgradeDaemon,
+    Version,
     Timer,
     TimerIcon,
 }
@@ -368,6 +369,9 @@ impl AppLayout {
         }
         if show_daemon_upgrade && c.upgrade_daemon_rect.contains(px, py) {
             return Some(StatusBarHit::UpgradeDaemon);
+        }
+        if c.version_rect.contains(px, py) {
+            return Some(StatusBarHit::Version);
         }
         if c.help_rect.contains(px, py) {
             return Some(StatusBarHit::ToggleHelp);
