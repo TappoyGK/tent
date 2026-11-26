@@ -1204,6 +1204,18 @@ pub fn install_macos_shortcut_monitor(proxy: EventLoopProxy<AppEvent>) {
                     let _ = proxy.send_event(AppEvent::Shortcut(shortcut));
                     return std::ptr::null_mut();
                 }
+
+                // winit 標準アプリには Edit メニューが存在せず WryWebView 子ビューの
+                // performKeyEquivalent も抑止されるため、WKWebView フォーカス中の基本編集
+                // ショートカット（Cmd+C/V/X/A/Z/Shift+Z/Shift+V）を First Responder へ直接配送する
+                if let Some(action) = match_webview_edit_action(key_code, shift, opt)
+                    && let Some(mtm) = MainThreadMarker::new()
+                    && let Some(win) = event.window(mtm)
+                    && unsafe { is_webview_first_responder(&win) }
+                {
+                    let _ = unsafe { dispatch_webview_edit_action(action) };
+                    return std::ptr::null_mut();
+                }
             }
         }
         event_ptr.as_ptr()
@@ -1251,6 +1263,87 @@ pub fn current_macos_modifiers() -> winit::keyboard::ModifiersState {
 #[cfg(not(target_os = "macos"))]
 pub fn current_macos_modifiers() -> winit::keyboard::ModifiersState {
     winit::keyboard::ModifiersState::empty()
+}
+
+/// WKWebView フォーカス中に First Responder へ配送する基本編集アクション
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WebViewEditAction {
+    Copy,
+    Paste,
+    PasteAsPlainText,
+    Cut,
+    SelectAll,
+    Undo,
+    Redo,
+}
+
+#[cfg(target_os = "macos")]
+fn match_webview_edit_action(key_code: u16, shift: bool, opt: bool) -> Option<WebViewEditAction> {
+    if opt {
+        return None;
+    }
+    if shift {
+        return match key_code {
+            0x06 => Some(WebViewEditAction::Redo),             // Shift+Z
+            0x09 => Some(WebViewEditAction::PasteAsPlainText), // Shift+V
+            _ => None,
+        };
+    }
+    match key_code {
+        0x08 => Some(WebViewEditAction::Copy),      // C
+        0x09 => Some(WebViewEditAction::Paste),     // V
+        0x07 => Some(WebViewEditAction::Cut),       // X
+        0x00 => Some(WebViewEditAction::SelectAll), // A
+        0x06 => Some(WebViewEditAction::Undo),      // Z
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn is_webview_first_responder(win: &objc2_app_kit::NSWindow) -> bool {
+    use objc2::ffi::object_getClass;
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    let resp: *mut AnyObject = unsafe { msg_send![win, firstResponder] };
+    if resp.is_null() {
+        return false;
+    }
+    let cls = unsafe { object_getClass(resp.cast()) };
+    if cls.is_null() {
+        return false;
+    }
+    let name = unsafe { (*cls).name().to_string_lossy() };
+    !name.contains("Winit") && name != "NSWindow"
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn dispatch_webview_edit_action(action: WebViewEditAction) -> bool {
+    use objc2::runtime::{AnyClass, AnyObject, Bool};
+    use objc2::{msg_send, sel};
+
+    let Some(app_cls) = AnyClass::get(c"NSApplication") else {
+        return false;
+    };
+    let app: *mut AnyObject = unsafe { msg_send![app_cls, sharedApplication] };
+    if app.is_null() {
+        return false;
+    }
+    let nil: *const AnyObject = std::ptr::null();
+    let send = |sel_val: objc2::runtime::Sel| -> bool {
+        let ok: Bool = unsafe { msg_send![app, sendAction: sel_val, to: nil, from: nil] };
+        ok.as_bool()
+    };
+    match action {
+        WebViewEditAction::Copy => send(sel!(copy:)),
+        WebViewEditAction::Paste => send(sel!(paste:)),
+        WebViewEditAction::PasteAsPlainText => send(sel!(pasteAsPlainText:)) || send(sel!(paste:)),
+        WebViewEditAction::Cut => send(sel!(cut:)),
+        WebViewEditAction::SelectAll => send(sel!(selectAll:)),
+        WebViewEditAction::Undo => send(sel!(undo:)),
+        WebViewEditAction::Redo => send(sel!(redo:)),
+    }
 }
 
 /// macOS Carbon 仮想キーコードから TenT ショートカットへ変換
@@ -1341,5 +1434,39 @@ mod tests {
             "localhost:3000"
         );
         assert_eq!(extract_host_label("about:blank"), "about:blank");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_match_webview_edit_action() {
+        assert_eq!(
+            match_webview_edit_action(0x08, false, false),
+            Some(WebViewEditAction::Copy)
+        );
+        assert_eq!(
+            match_webview_edit_action(0x09, false, false),
+            Some(WebViewEditAction::Paste)
+        );
+        assert_eq!(
+            match_webview_edit_action(0x09, true, false),
+            Some(WebViewEditAction::PasteAsPlainText)
+        );
+        assert_eq!(
+            match_webview_edit_action(0x07, false, false),
+            Some(WebViewEditAction::Cut)
+        );
+        assert_eq!(
+            match_webview_edit_action(0x00, false, false),
+            Some(WebViewEditAction::SelectAll)
+        );
+        assert_eq!(
+            match_webview_edit_action(0x06, false, false),
+            Some(WebViewEditAction::Undo)
+        );
+        assert_eq!(
+            match_webview_edit_action(0x06, true, false),
+            Some(WebViewEditAction::Redo)
+        );
+        assert_eq!(match_webview_edit_action(0x08, false, true), None);
     }
 }
