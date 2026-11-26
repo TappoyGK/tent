@@ -185,6 +185,12 @@ impl TentApp {
                         StatusBarHit::ToggleHelp => {
                             self.handle_shortcut(AppShortcut::ToggleHelp);
                         }
+                        StatusBarHit::Version => {
+                            macos::write_clipboard_text(env!("TENT_DISPLAY_VERSION"));
+                            self.version_copied_until =
+                                Some(Instant::now() + std::time::Duration::from_millis(1200));
+                            self.request_redraw_now();
+                        }
                         StatusBarHit::TimerIcon => {
                             // 砂時計クリック: 前回と同じ分数で即座にタイマーを開始
                             if self.status_timer.last_minutes > 0 {
@@ -555,6 +561,9 @@ impl TentApp {
                     daemon_version_mismatch: self.daemon_version_mismatch,
                     daemon_upgrade_confirm: self
                         .daemon_upgrade_confirm_until
+                        .is_some_and(|d| Instant::now() < d),
+                    version_copied: self
+                        .version_copied_until
                         .is_some_and(|d| Instant::now() < d),
                     timer: self.status_timer.overlay(Instant::now()),
                 };

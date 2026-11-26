@@ -79,6 +79,10 @@ src/
 - セッション設定・ソケット: `~/Library/Application Support/TenT/`
 - パニックログ: `~/Library/Logs/TenT/panic.log`
 
+## リリース・開発手順
+
+バージョニング規則とリリースブランチの運用手順は [docs/release.md](docs/release.md) を参照してください。
+
 ## ライセンス
 
 Copyright (c) 2026 TAPPOY G.K.

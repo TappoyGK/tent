@@ -96,6 +96,7 @@ pub struct RenderOverlays<'a> {
     pub show_help: bool,
     pub daemon_version_mismatch: bool,
     pub daemon_upgrade_confirm: bool,
+    pub version_copied: bool,
     pub timer: TimerOverlay,
 }
 
