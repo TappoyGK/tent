@@ -249,7 +249,8 @@ impl AppLayout {
         let ext_w = 36.0 * scale;
         let help_w = 22.0 * scale;
         let upgrade_w = 68.0 * scale;
-        let version_w = 48.0 * scale;
+        let version_chars = env!("TENT_DISPLAY_VERSION").len().max(7) as f32;
+        let version_w = (version_chars * 6.6 + 6.0) * scale;
         let clock_w = 208.0 * scale;
 
         // Wi-Fi＋バッテリー＋日時を右端へ右寄せ配置し、その左側にバージョンと操作ボタン群を並べる
