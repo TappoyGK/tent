@@ -117,6 +117,11 @@ cat > "$APP_DIR/Contents/Info.plist" <<EOF
   <string>${VERSION}</string>
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsArbitraryLoadsInWebContent</key>
+    <true/>
+  </dict>
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSSupportsAutomaticGraphicsSwitching</key>
