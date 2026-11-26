@@ -203,3 +203,100 @@ fn test_sync_output_mode_2026_holds_render_until_reset() {
     pane.terminal.vt_write(b"\x1b[?2026l");
     assert!(!pane.is_render_held(t0));
 }
+
+#[test]
+fn test_resize_alone_does_not_trigger_waiting_input() {
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    use super::{TerminalPane, WAITING_IDLE_THRESHOLD};
+    use crate::daemon::{DaemonClient, ReplayedPane};
+
+    let mut pane = TerminalPane::attach_from_replay(
+        ReplayedPane {
+            pane_id: 1,
+            cols: 80,
+            rows: 20,
+            cwd: PathBuf::from("/tmp"),
+            replay_bytes: b"1234567890123456789012345678901234567890\r\nready> ".to_vec(),
+        },
+        DaemonClient::dummy_for_test(),
+    )
+    .unwrap();
+    let t0 = Instant::now();
+    pane.mark_screen_seen();
+    pane.last_output_instant = Some(t0);
+    pane.had_background_output = true;
+
+    // 裏スロットのまま幅が変わっても、折り返し変化だけで黄色（入力待ち）にならないこと
+    pane.resize(20, 20, 10, 20);
+    assert!(
+        !pane.update_waiting_state(t0 + WAITING_IDLE_THRESHOLD + Duration::from_secs(1), false)
+    );
+    assert!(!pane.is_waiting_input);
+}
+
+#[test]
+fn test_work_indicator_in_upper_viewport_suppresses_waiting_input() {
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    use super::{TerminalPane, WAITING_IDLE_THRESHOLD};
+    use crate::daemon::{DaemonClient, ReplayedPane};
+
+    let mut pane = TerminalPane::attach_from_replay(
+        ReplayedPane {
+            pane_id: 1,
+            cols: 60,
+            rows: 24,
+            cwd: PathBuf::from("/tmp"),
+            replay_bytes: b"prompt> ".to_vec(),
+        },
+        DaemonClient::dummy_for_test(),
+    )
+    .unwrap();
+    pane.mark_screen_seen();
+
+    // ビューポート上部（下部8行より上）に esc to interrupt が表示されていても処理中として扱うこと
+    pane.terminal
+        .vt_write(b"\x1b[2;1HWorking... (esc to interrupt)");
+    let t0 = Instant::now();
+    pane.last_output_instant = Some(t0);
+    pane.had_background_output = true;
+
+    assert!(
+        !pane.update_waiting_state(t0 + WAITING_IDLE_THRESHOLD + Duration::from_secs(1), false)
+    );
+    assert!(!pane.is_waiting_input);
+}
+
+#[test]
+fn test_notification_clears_when_background_output_resumes() {
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    use super::{STARTUP_GRACE_PERIOD, TerminalPane};
+    use crate::daemon::{DaemonClient, ReplayedPane};
+
+    let mut pane = TerminalPane::attach_from_replay(
+        ReplayedPane {
+            pane_id: 1,
+            cols: 60,
+            rows: 10,
+            cwd: PathBuf::from("/tmp"),
+            replay_bytes: Vec::new(),
+        },
+        DaemonClient::dummy_for_test(),
+    )
+    .unwrap();
+    // 起動猶予を超えた状態にする
+    pane.created_at = Instant::now() - STARTUP_GRACE_PERIOD - Duration::from_secs(1);
+
+    // 1. 裏で BEL を受けるとオレンジ（has_notification）になる
+    pane.feed_pty_bytes(b"done\x07", false, true, "1");
+    assert!(pane.has_notification);
+
+    // 2. その後、同じペインで通常出力が再開したらオレンジが消えること
+    pane.feed_pty_bytes(b"next step running...\r\n", false, true, "1");
+    assert!(!pane.has_notification);
+}

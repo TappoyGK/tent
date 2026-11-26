@@ -387,6 +387,7 @@ impl TerminalPane {
         }
         let now = Instant::now();
         self.terminal.vt_write(bytes);
+        let in_startup_grace = now.duration_since(self.created_at) < STARTUP_GRACE_PERIOD;
         let is_resize_redraw = self
             .last_resize_instant
             .is_some_and(|t| now.duration_since(t) < RESIZE_GRACE_PERIOD);
@@ -394,9 +395,15 @@ impl TerminalPane {
             self.last_output_at = Local::now();
             self.last_output_instant = Some(now);
             self.is_waiting_input = false;
-            if !is_active && now.duration_since(self.created_at) >= STARTUP_GRACE_PERIOD {
+            // 処理が再開して新規出力が流れた場合は古い通知フラグを解除する
+            // （同一チャンク内に新規通知・BEL が含まれていれば後段で再点灯する）
+            self.has_notification = false;
+            if !is_active && !in_startup_grace {
                 self.had_background_output = true;
             }
+        } else if !self.had_background_output {
+            // リサイズ猶予中の再描画は未確認出力とみなさず基準ハッシュを更新する
+            self.mark_screen_seen();
         }
         self.minimap_dirty = true;
         self.generation = self.generation.wrapping_add(1);
@@ -443,7 +450,7 @@ impl TerminalPane {
                 };
                 self.try_send_os_notification(notif_title, notif_body);
             }
-        } else if saw_bell {
+        } else if saw_bell && !in_startup_grace && !is_resize_redraw {
             if !is_active {
                 self.has_notification = true;
             }
@@ -478,11 +485,17 @@ impl TerminalPane {
         if self.cols == cols && self.rows == rows {
             return;
         }
+        // リサイズ時点で未確認の変化がなかった場合は、リサイズによる折り返し変化を
+        // 「未確認の出力」と誤認しないよう基準ハッシュを新サイズへ追従させる
+        let screen_was_unseen_clean = self.current_screen_hash() == self.last_seen_screen_hash;
         self.cols = cols;
         self.rows = rows;
         self.last_cell_px = (cell_w_px, cell_h_px);
         self.last_resize_instant = Some(Instant::now());
         let _ = self.terminal.resize(cols, rows, cell_w_px, cell_h_px);
+        if screen_was_unseen_clean {
+            self.mark_screen_seen();
+        }
         self.daemon.resize_pane(self.id, cols, rows);
         self.mark_dirty();
     }
@@ -516,22 +529,21 @@ impl TerminalPane {
         self.last_seen_screen_hash = self.current_screen_hash();
     }
 
-    /// 画面下部に AI エージェントの実行中インジケータ（`esc to interrupt` 等）が表示中か判定する
+    /// ビューポート内に AI エージェントの実行中インジケータ（`esc to interrupt` 等）が表示中か判定する
     fn has_active_work_indicator(&mut self) -> bool {
         if self.rows == 0 || self.cols == 0 {
             return false;
         }
-        let start_row = self.rows.saturating_sub(8);
         let end_row = self.rows.saturating_sub(1);
         let end_col = self.cols.saturating_sub(1);
-        let tail = extract_selection_from_terminal(
+        let visible = extract_selection_from_terminal(
             &self.terminal,
             self.cols,
             self.rows,
-            (0, start_row),
+            (0, 0),
             (end_col, end_row),
         );
-        let lower = tail.to_ascii_lowercase();
+        let lower = visible.to_ascii_lowercase();
         lower.contains("esc to interrupt")
             || lower.contains("ctrl+c to interrupt")
             || lower.contains("esc to cancel")
