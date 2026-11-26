@@ -526,6 +526,8 @@ impl ApplicationHandler<AppEvent> for TentApp {
         );
         window.set_ime_allowed(true);
 
+        // Dock / Cmd+Tab に TenT のカスタムアイコンを適用
+        macos::install_app_icon();
         // WKWebView フォーカス中でも Cmd+1..0 / Cmd+B / Cmd+L 等を拾えるようにする
         install_macos_shortcut_monitor(self.proxy.clone());
         // Finder ファイル・スクショ右下サムネイル等の D&D を確実に受け取る
