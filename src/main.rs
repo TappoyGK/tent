@@ -30,7 +30,7 @@ use crate::layout::{AppLayout, Rect, SidebarState};
 use crate::renderer::Renderer;
 use crate::slot::Workspace;
 use crate::state::{SavedState, WindowGeometry};
-use crate::terminal_pane::{AppEvent, PaneId, UrlMatch};
+use crate::terminal_pane::{AppEvent, PaneId, TrackedGridRef, UrlMatch};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const CWD_POLL_INTERVAL: Duration = Duration::from_millis(1000);
@@ -66,25 +66,25 @@ struct SelectionState {
     pane_id: PaneId,
     pane_rect: Rect,
     mode: SelectionMode,
-    anchor_start: (u16, u32),
-    anchor_end: (u16, u32),
-    start: (u16, u32),
-    end: (u16, u32),
+    anchor_start: TrackedGridRef,
+    anchor_end: TrackedGridRef,
+    start: TrackedGridRef,
+    end: TrackedGridRef,
     active: bool,
+    has_dragged: bool,
 }
 
-/// ドラッグ選択中のカーソル Y 座標がペインの上下端付近にあるとき、自動スクロール行数（負=上, 正=下）を返す
+/// ドラッグ選択中のカーソル Y 座標がペインの上下端より外に出たとき、自動スクロール行数（負=上, 正=下）を返す
 pub(crate) fn selection_autoscroll_delta(py: f32, pane_rect: Rect, cell_h: f32) -> isize {
     if pane_rect.h <= 1.0 {
         return 0;
     }
     let ch = cell_h.max(1.0);
-    let edge = (ch * 0.5).max(8.0).min(pane_rect.h * 0.25);
-    if py < pane_rect.y + edge {
-        let overshoot = ((pane_rect.y + edge - py) / ch).floor().max(0.0) as isize;
+    if py < pane_rect.y {
+        let overshoot = ((pane_rect.y - py) / ch).floor().max(0.0) as isize;
         -(1 + overshoot).min(4)
-    } else if py > pane_rect.bottom() - edge {
-        let overshoot = ((py - (pane_rect.bottom() - edge)) / ch).floor().max(0.0) as isize;
+    } else if py > pane_rect.bottom() {
+        let overshoot = ((py - pane_rect.bottom()) / ch).floor().max(0.0) as isize;
         (1 + overshoot).min(4)
     } else {
         0
@@ -496,15 +496,28 @@ impl TentApp {
                 .unwrap_or(now);
             wake_at = wake_at.min(next_sand);
         }
-        if let Some(sel) = &self.selection
-            && sel.active
-        {
-            let cell_h = self.renderer.as_ref().map(|r| r.cell_h).unwrap_or(20.0);
-            if selection_autoscroll_delta(self.cursor_pos.1, sel.pane_rect, cell_h) != 0 {
-                wake_at = wake_at.min(self.last_autoscroll + AUTOSCROLL_INTERVAL);
-            }
+        if self.can_autoscroll_selection() {
+            wake_at = wake_at.min((self.last_autoscroll + AUTOSCROLL_INTERVAL).max(now));
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(wake_at));
+    }
+
+    fn can_autoscroll_selection(&self) -> bool {
+        let Some(sel) = &self.selection else {
+            return false;
+        };
+        if !sel.active || !sel.has_dragged {
+            return false;
+        }
+        let cell_h = self.renderer.as_ref().map(|r| r.cell_h).unwrap_or(20.0);
+        if selection_autoscroll_delta(self.cursor_pos.1, sel.pane_rect, cell_h) == 0 {
+            return false;
+        }
+        self.workspace
+            .as_ref()
+            .and_then(|ws| ws.active_slot_ref().root.as_ref())
+            .and_then(|root| root.terminal_pane(sel.pane_id))
+            .is_some_and(|pane| !pane.is_alt_screen())
     }
 
     fn pixel_to_cell(&self, pane_rect: Rect, px: f32, py: f32) -> (u16, u16) {
@@ -526,8 +539,6 @@ impl TentApp {
         let pid = sel.pane_id;
         let rect = sel.pane_rect;
         let mode = sel.mode;
-        let anchor_start = sel.anchor_start;
-        let anchor_end = sel.anchor_end;
         let vp_cell = self.pixel_to_cell(rect, px, py);
 
         let computed = self
@@ -535,9 +546,13 @@ impl TentApp {
             .as_ref()
             .and_then(|ws| ws.active_slot_ref().root.as_ref())
             .and_then(|root| root.terminal_pane(pid))
-            .map(|pane| {
+            .and_then(|pane| {
+                let anchor_start = pane.resolve_tracked_point(&sel.anchor_start)?;
+                let anchor_end = pane.resolve_tracked_point(&sel.anchor_end)?;
+                let cur_start_old = pane.resolve_tracked_point(&sel.start);
+                let cur_end_old = pane.resolve_tracked_point(&sel.end);
                 let (col, srow) = pane.viewport_cell_to_screen(vp_cell);
-                match mode {
+                let (new_start, new_end) = match mode {
                     SelectionMode::Char => (anchor_start, (col, srow)),
                     SelectionMode::Word => {
                         let (ws, we) = pane.word_bounds_at_screen(col, srow);
@@ -557,20 +572,31 @@ impl TentApp {
                             (anchor_start, le)
                         }
                     }
+                };
+                if cur_start_old == Some(new_start) && cur_end_old == Some(new_end) {
+                    return Some(None);
                 }
+                let start_pin = pane.track_screen_point(new_start)?;
+                let end_pin = pane.track_screen_point(new_end)?;
+                Some(Some((start_pin, end_pin)))
             });
 
-        let Some((new_start, new_end)) = computed else {
-            return false;
-        };
-        if let Some(sel_mut) = self.selection.as_mut()
-            && (sel_mut.start != new_start || sel_mut.end != new_end)
-        {
-            sel_mut.start = new_start;
-            sel_mut.end = new_end;
-            return true;
+        match computed {
+            Some(Some((new_start, new_end))) => {
+                if let Some(sel_mut) = self.selection.as_mut() {
+                    sel_mut.start = new_start;
+                    sel_mut.end = new_end;
+                    return true;
+                }
+                false
+            }
+            Some(None) => false,
+            None => {
+                // アンカーがスクロールバックパージや CSI 3 J で消滅した場合は選択を解除
+                self.selection = None;
+                true
+            }
         }
-        false
     }
 
     fn update_url_hover(&mut self) {
@@ -992,28 +1018,32 @@ impl ApplicationHandler<AppEvent> for TentApp {
             }
         }
 
-        // ドラッグ選択中のペイン上下端オートスクロール
-        if let Some(sel) = &self.selection
-            && sel.active
+        // ドラッグ選択中のペイン上下端オートスクロール（ペイン外へのドラッグ時のみ）
+        if self.can_autoscroll_selection()
             && now.duration_since(self.last_autoscroll) >= AUTOSCROLL_INTERVAL
         {
-            let cell_h = self.renderer.as_ref().map(|r| r.cell_h).unwrap_or(20.0);
-            let delta = selection_autoscroll_delta(self.cursor_pos.1, sel.pane_rect, cell_h);
-            if delta != 0 {
+            self.last_autoscroll = now;
+            if let Some(sel) = &self.selection {
                 let pid = sel.pane_id;
-                let mut scrolled = false;
-                if let Some(ws) = self.workspace.as_mut()
+                let cell_h = self.renderer.as_ref().map(|r| r.cell_h).unwrap_or(20.0);
+                let delta = selection_autoscroll_delta(self.cursor_pos.1, sel.pane_rect, cell_h);
+                let mut moved = false;
+                if delta != 0
+                    && let Some(ws) = self.workspace.as_mut()
                     && let Some(root) = ws.active_slot_mut().root.as_mut()
                     && let Some(pane) = root.terminal_pane_mut(pid)
                     && !pane.is_alt_screen()
                 {
+                    let before_top = pane.viewport_top_screen_row();
                     pane.terminal
                         .scroll_viewport(ghostty_vt::terminal::ScrollViewport::Delta(delta));
-                    pane.mark_dirty();
-                    scrolled = true;
+                    let after_top = pane.viewport_top_screen_row();
+                    if after_top != before_top {
+                        pane.mark_dirty();
+                        moved = true;
+                    }
                 }
-                if scrolled {
-                    self.last_autoscroll = now;
+                if moved {
                     let (px, py) = self.cursor_pos;
                     let _ = self.extend_selection_to_cursor(px, py);
                     need_redraw = true;
@@ -1128,14 +1158,20 @@ mod tests {
         let pane = Rect::new(0.0, 100.0, 400.0, 300.0); // y: 100..400
         let cell_h = 20.0;
 
-        // ペイン中央ではスクロールしない
+        // ペイン内部（最上行の上半分・最下行の下半分を含む）ではスクロールしない
+        assert_eq!(selection_autoscroll_delta(100.0, pane, cell_h), 0);
+        assert_eq!(selection_autoscroll_delta(105.0, pane, cell_h), 0);
         assert_eq!(selection_autoscroll_delta(250.0, pane, cell_h), 0);
-        // 上端付近・上はみ出しは負方向（上スクロール）
-        assert_eq!(selection_autoscroll_delta(105.0, pane, cell_h), -1);
+        assert_eq!(selection_autoscroll_delta(395.0, pane, cell_h), 0);
+        assert_eq!(selection_autoscroll_delta(400.0, pane, cell_h), 0);
+
+        // ペイン上端の外は負方向（上スクロール）
+        assert_eq!(selection_autoscroll_delta(95.0, pane, cell_h), -1);
         assert!(selection_autoscroll_delta(60.0, pane, cell_h) < -1);
         assert_eq!(selection_autoscroll_delta(-500.0, pane, cell_h), -4);
-        // 下端付近・下はみ出しは正方向（下スクロール）
-        assert_eq!(selection_autoscroll_delta(395.0, pane, cell_h), 1);
+
+        // ペイン下端の外は正方向（下スクロール）
+        assert_eq!(selection_autoscroll_delta(405.0, pane, cell_h), 1);
         assert!(selection_autoscroll_delta(440.0, pane, cell_h) > 1);
         assert_eq!(selection_autoscroll_delta(1000.0, pane, cell_h), 4);
     }

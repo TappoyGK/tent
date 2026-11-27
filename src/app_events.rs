@@ -95,8 +95,13 @@ impl TentApp {
                     }
                 }
 
-                if self.extend_selection_to_cursor(px, py) {
-                    self.request_redraw_now();
+                if let Some(sel) = self.selection.as_mut()
+                    && sel.active
+                {
+                    sel.has_dragged = true;
+                    if self.extend_selection_to_cursor(px, py) {
+                        self.request_redraw_now();
+                    }
                 }
             }
             WindowEvent::MouseInput {
@@ -328,9 +333,9 @@ impl TentApp {
                                 .as_ref()
                                 .and_then(|ws| ws.active_slot_ref().root.as_ref())
                                 .and_then(|r| r.terminal_pane(pid))
-                                .map(|pane| {
+                                .and_then(|pane| {
                                     let (col, srow) = pane.viewport_cell_to_screen(vp_cell);
-                                    match mode {
+                                    let (start_pt, end_pt) = match mode {
                                         SelectionMode::Char => ((col, srow), (col, srow)),
                                         SelectionMode::Word => {
                                             let (ws_col, we_col) =
@@ -338,18 +343,26 @@ impl TentApp {
                                             ((ws_col, srow), (we_col, srow))
                                         }
                                         SelectionMode::Line => pane.line_bounds_at_screen(srow),
-                                    }
+                                    };
+                                    Some((
+                                        pane.track_screen_point(start_pt)?,
+                                        pane.track_screen_point(end_pt)?,
+                                        pane.track_screen_point(start_pt)?,
+                                        pane.track_screen_point(end_pt)?,
+                                    ))
                                 });
-                            if let Some((start, end)) = selection_bounds {
+                            if let Some((anchor_start, anchor_end, start, end)) = selection_bounds {
+                                self.last_autoscroll = now;
                                 self.selection = Some(SelectionState {
                                     pane_id: pid,
                                     pane_rect: prect,
                                     mode,
-                                    anchor_start: start,
-                                    anchor_end: end,
+                                    anchor_start,
+                                    anchor_end,
                                     start,
                                     end,
                                     active: true,
+                                    has_dragged: false,
                                 });
                             }
                             self.sync_browsers();
@@ -396,7 +409,23 @@ impl TentApp {
                     && sel.active
                 {
                     sel.active = false;
-                    if sel.mode == SelectionMode::Char && sel.start == sel.end {
+                    let empty_char_click = if sel.mode == SelectionMode::Char {
+                        if !sel.has_dragged {
+                            true
+                        } else {
+                            self.workspace
+                                .as_ref()
+                                .and_then(|ws| ws.active_slot_ref().root.as_ref())
+                                .and_then(|r| r.terminal_pane(sel.pane_id))
+                                .is_none_or(|pane| {
+                                    pane.resolve_tracked_point(&sel.start)
+                                        == pane.resolve_tracked_point(&sel.end)
+                                })
+                        }
+                    } else {
+                        false
+                    };
+                    if empty_char_click {
                         self.selection = None;
                         self.request_redraw_now();
                     }
@@ -570,25 +599,26 @@ impl TentApp {
                         .as_ref()
                         .filter(|d| d.is_dragging)
                         .and_then(|d| d.hover_slot),
-                    selection: self
-                        .selection
-                        .as_ref()
-                        .filter(|s| s.mode != SelectionMode::Char || s.start != s.end)
-                        .and_then(|s| {
-                            let pane = self
-                                .workspace
-                                .as_ref()?
-                                .active_slot_ref()
-                                .root
-                                .as_ref()?
-                                .terminal_pane(s.pane_id)?;
-                            let (start, end) = pane.screen_selection_to_viewport(s.start, s.end)?;
-                            Some(SelectionOverlay {
-                                pane_id: s.pane_id,
-                                start,
-                                end,
-                            })
-                        }),
+                    selection: self.selection.as_ref().and_then(|s| {
+                        let pane = self
+                            .workspace
+                            .as_ref()?
+                            .active_slot_ref()
+                            .root
+                            .as_ref()?
+                            .terminal_pane(s.pane_id)?;
+                        let pa = pane.resolve_tracked_point(&s.start)?;
+                        let pb = pane.resolve_tracked_point(&s.end)?;
+                        if s.mode == SelectionMode::Char && pa == pb {
+                            return None;
+                        }
+                        let (start, end) = pane.screen_selection_to_viewport(pa, pb)?;
+                        Some(SelectionOverlay {
+                            pane_id: s.pane_id,
+                            start,
+                            end,
+                        })
+                    }),
                     hovered_url: self.hovered_url.as_ref().map(|(pid, m)| UrlHoverOverlay {
                         pane_id: *pid,
                         row: m.row,

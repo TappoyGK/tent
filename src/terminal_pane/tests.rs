@@ -739,3 +739,49 @@ fn test_screen_selection_across_scrollback_and_viewport_projection() {
     let offscreen = screen_selection_to_viewport((0, 0), (5, 0), bottom_top, 20, 4);
     assert_eq!(offscreen, None);
 }
+
+#[test]
+fn test_tracked_selection_survives_scrollback_pruning_and_clears_on_csi_3j() {
+    use std::path::PathBuf;
+
+    use super::TerminalPane;
+    use crate::daemon::{DaemonClient, ReplayedPane};
+
+    let mut pane = TerminalPane::attach_from_replay(
+        ReplayedPane {
+            pane_id: 1,
+            cols: 20,
+            rows: 4,
+            cwd: PathBuf::from("/tmp"),
+            replay_bytes: Vec::new(),
+        },
+        DaemonClient::dummy_for_test(),
+    )
+    .unwrap();
+    // スクロールバック上限を小さくして先頭パージを起こす
+    pane.terminal.set_scrollback_max_bytes(Some(1024)).unwrap();
+
+    for i in 1..=80 {
+        pane.terminal.vt_write(format!("L{i:03}\r\n").as_bytes());
+    }
+    // 最新の出力付近（まだパージされない位置）を追跡ピンで選択
+    let vp_top = pane.viewport_top_screen_row();
+    let target_row = vp_top.saturating_sub(2);
+    let pin_a = pane.track_screen_point((0, target_row)).unwrap();
+    let pin_b = pane.track_screen_point((3, target_row)).unwrap();
+    let original = pane.extract_tracked_selection_text(&pin_a, &pin_b);
+    assert!(original.starts_with('L'));
+
+    // 追加出力でスクロールバック先頭をパージさせても、残存している行は同じ内容を指し続けること
+    for i in 81..=100 {
+        pane.terminal.vt_write(format!("L{i:03}\r\n").as_bytes());
+    }
+    let after_prune = pane.extract_tracked_selection_text(&pin_a, &pin_b);
+    assert_eq!(after_prune, original);
+
+    // CSI 3 J（スクロールバック消去）で対象行が消えたら別内容を指さず無効になること
+    pane.terminal.vt_write(b"\x1b[3J");
+    assert_eq!(pane.resolve_tracked_point(&pin_a), None);
+    assert_eq!(pane.tracked_selection_to_viewport(&pin_a, &pin_b), None);
+    assert_eq!(pane.extract_tracked_selection_text(&pin_a, &pin_b), "");
+}
