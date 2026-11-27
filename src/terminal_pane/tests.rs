@@ -927,8 +927,8 @@ fn test_ai_managed_pane_ignores_pty_noise_and_tracks_hook_lifecycle() {
     assert!(!pane.is_waiting_input);
 
     // 4. Waiting フックで緑が消え、裏スロットが黄LED（is_waiting_input）になること。
-    //    短時間内（2 秒以内）に重なった重複 Waiting（PermissionRequest 直後の Notification 等）は無視されるが、
-    //    ユーザー入力（write_input）後や 2 秒経過後の正当な Waiting は再び受け付けること
+    //    あいだに Working / Idle / ユーザー入力 / スロット確認を挟まずに届いた重複 Waiting は時間経過にかかわらず抑止され、
+    //    ユーザー入力（write_input）後の正当な Waiting は再び受け付けること
     assert!(pane.apply_ai_hook_event(AiHookState::Waiting, Some(AiTool::Agy), false, true, "1"));
     assert!(!pane.is_actively_outputting(Instant::now()));
     assert!(pane.is_waiting_input);

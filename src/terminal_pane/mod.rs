@@ -37,8 +37,6 @@ const WAITING_IDLE_THRESHOLD: Duration = Duration::from_secs(4);
 const BACKGROUND_NOTIFY_MIN_DURATION: Duration = Duration::from_secs(5);
 /// 連続出力中に全行ハッシュ比較を省略する短時間ウィンドウ（高スループット維持用）
 const ACTIVE_OUTPUT_FAST_PATH: Duration = Duration::from_millis(50);
-/// AI フックで同一待ちを知らせる短時間重複 Waiting（PermissionRequest 直後の Notification 等）を抑止するウィンドウ
-const AI_WAITING_DEDUP_WINDOW: Duration = Duration::from_secs(2);
 /// DEC Mode 2026 (Synchronized Output) で描画ホールドを許可する最大時間（固まり防止）
 const SYNC_OUTPUT_MAX_HOLD: Duration = Duration::from_secs(1);
 
@@ -128,8 +126,6 @@ pub struct TerminalPane {
     pub ai_hook_state: Option<AiHookState>,
     /// AI が Working 状態に入った時刻（長時間処理の OS 通知判定用）
     ai_working_since: Option<Instant>,
-    /// 直近に Waiting フックを受信した時刻（短時間重複 Waiting の抑止用）
-    ai_last_waiting_at: Option<Instant>,
     last_seen_line_hashes: Vec<Option<u64>>,
     last_seen_total_rows: usize,
     last_active_line_hashes: Vec<Option<u64>>,
@@ -213,7 +209,6 @@ impl TerminalPane {
             ai_hook_active: false,
             ai_hook_state: None,
             ai_working_since: None,
-            ai_last_waiting_at: None,
             last_seen_line_hashes: Vec::new(),
             last_seen_total_rows: 0,
             last_active_line_hashes: Vec::new(),
@@ -288,7 +283,6 @@ impl TerminalPane {
             ai_hook_active: false,
             ai_hook_state: None,
             ai_working_since: None,
-            ai_last_waiting_at: None,
             last_seen_line_hashes: Vec::new(),
             last_seen_total_rows: 0,
             last_active_line_hashes: Vec::new(),
@@ -312,7 +306,6 @@ impl TerminalPane {
             // 以降の正当な Waiting（PermissionRequest / Stop）を取りこぼさないようにする
             if self.ai_hook_state == Some(AiHookState::Waiting) {
                 self.ai_hook_state = None;
-                self.ai_last_waiting_at = None;
                 self.is_waiting_input = false;
             }
             self.daemon.send_input(self.id, bytes.to_vec());
@@ -419,7 +412,6 @@ impl TerminalPane {
             self.ai_hook_active = false;
             self.ai_hook_state = None;
             self.ai_working_since = None;
-            self.ai_last_waiting_at = None;
             self.had_background_output = false;
             self.work_indicator_started_at = None;
             self.last_output_instant = None;
@@ -450,20 +442,15 @@ impl TerminalPane {
             AiHookState::Working => {
                 self.ai_hook_state = Some(AiHookState::Working);
                 self.ai_working_since.get_or_insert(now);
-                self.ai_last_waiting_at = None;
                 self.is_waiting_input = false;
                 self.has_notification = false;
                 self.last_output_at = Local::now();
                 self.last_output_instant = Some(now);
             }
             AiHookState::Waiting => {
-                // 同一待ちを知らせる短時間内の重複 Waiting（例: PermissionRequest 直後の Notification）のみ抑止し、
-                // ツール失敗後や時間経過後の正当な Waiting は取りこぼさない
-                if self.ai_hook_state == Some(AiHookState::Waiting)
-                    && self
-                        .ai_last_waiting_at
-                        .is_some_and(|t| now.duration_since(t) < AI_WAITING_DEDUP_WINDOW)
-                {
+                // あいだに Working / Idle / ユーザー入力（write_input） / スロット確認（clear_attention）を
+                // 挟まずに届いた重複 Waiting（例: PermissionRequest の 6 秒後に来る Notification）を抑止する
+                if self.ai_hook_state == Some(AiHookState::Waiting) {
                     return false;
                 }
                 let worked_duration = self
@@ -471,7 +458,6 @@ impl TerminalPane {
                     .take()
                     .map(|start| now.saturating_duration_since(start));
                 self.ai_hook_state = Some(AiHookState::Waiting);
-                self.ai_last_waiting_at = Some(now);
                 self.last_output_at = Local::now();
                 self.last_output_instant = None;
                 if !is_active {
@@ -490,7 +476,6 @@ impl TerminalPane {
             AiHookState::Idle => {
                 self.ai_hook_state = None;
                 self.ai_working_since = None;
-                self.ai_last_waiting_at = None;
                 self.is_waiting_input = false;
                 self.has_notification = false;
                 self.last_output_instant = None;

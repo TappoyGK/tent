@@ -24,7 +24,7 @@ TenT は **Claude Code / agy / Codex** の 3 ツールをフォアグラウン�
 ## 1. Claude Code (`~/.claude/settings.json`)
 
 - `SessionStart` は `startup|resume|clear` に絞り、自動コンパクション（`compact`）時に作業中の緑表示が消えないようにします。
-- `Notification` の `matcher` は `permission_prompt|elicitation_dialog` に絞り、`idle_prompt` や `auth_success` での誤点灯を防ぎます。
+- `Notification` の `matcher` は `elicitation_dialog` に絞り、`PermissionRequest` との重複通知や `idle_prompt` / `auth_success` での誤点灯を防ぎます。
 - **制限事項**: Claude Code の仕様上、`Esc` / `Ctrl+C` でユーザーが中断したときは `Stop` フックが発火しないため、次のプロンプト送信またはセッション終了まで緑表示が残ります。
 
 ```json
@@ -68,7 +68,7 @@ TenT は **Claude Code / agy / Codex** の 3 ツールをフォアグラウン�
     ],
     "Notification": [
       {
-        "matcher": "permission_prompt|elicitation_dialog",
+        "matcher": "elicitation_dialog",
         "hooks": [
           { "type": "command", "command": "/Applications/TenT.app/Contents/MacOS/tent hook waiting --tool claude" }
         ]
