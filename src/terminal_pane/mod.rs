@@ -37,6 +37,8 @@ const WAITING_IDLE_THRESHOLD: Duration = Duration::from_secs(4);
 const BACKGROUND_NOTIFY_MIN_DURATION: Duration = Duration::from_secs(5);
 /// 連続出力中に全行ハッシュ比較を省略する短時間ウィンドウ（高スループット維持用）
 const ACTIVE_OUTPUT_FAST_PATH: Duration = Duration::from_millis(50);
+/// AI フックで同一待ちを知らせる短時間重複 Waiting（PermissionRequest 直後の Notification 等）を抑止するウィンドウ
+const AI_WAITING_DEDUP_WINDOW: Duration = Duration::from_secs(2);
 /// DEC Mode 2026 (Synchronized Output) で描画ホールドを許可する最大時間（固まり防止）
 const SYNC_OUTPUT_MAX_HOLD: Duration = Duration::from_secs(1);
 
@@ -126,6 +128,8 @@ pub struct TerminalPane {
     pub ai_hook_state: Option<AiHookState>,
     /// AI が Working 状態に入った時刻（長時間処理の OS 通知判定用）
     ai_working_since: Option<Instant>,
+    /// 直近に Waiting フックを受信した時刻（短時間重複 Waiting の抑止用）
+    ai_last_waiting_at: Option<Instant>,
     last_seen_line_hashes: Vec<Option<u64>>,
     last_seen_total_rows: usize,
     last_active_line_hashes: Vec<Option<u64>>,
@@ -209,6 +213,7 @@ impl TerminalPane {
             ai_hook_active: false,
             ai_hook_state: None,
             ai_working_since: None,
+            ai_last_waiting_at: None,
             last_seen_line_hashes: Vec::new(),
             last_seen_total_rows: 0,
             last_active_line_hashes: Vec::new(),
@@ -283,6 +288,7 @@ impl TerminalPane {
             ai_hook_active: false,
             ai_hook_state: None,
             ai_working_since: None,
+            ai_last_waiting_at: None,
             last_seen_line_hashes: Vec::new(),
             last_seen_total_rows: 0,
             last_active_line_hashes: Vec::new(),
@@ -302,6 +308,13 @@ impl TerminalPane {
 
     pub fn write_input(&mut self, bytes: &[u8]) {
         if !bytes.is_empty() {
+            // ユーザーが承認・拒否・次プロンプト等を入力したら AI の Waiting 状態を解除し、
+            // 以降の正当な Waiting（PermissionRequest / Stop）を取りこぼさないようにする
+            if self.ai_hook_state == Some(AiHookState::Waiting) {
+                self.ai_hook_state = None;
+                self.ai_last_waiting_at = None;
+                self.is_waiting_input = false;
+            }
             self.daemon.send_input(self.id, bytes.to_vec());
         }
     }
@@ -406,6 +419,7 @@ impl TerminalPane {
             self.ai_hook_active = false;
             self.ai_hook_state = None;
             self.ai_working_since = None;
+            self.ai_last_waiting_at = None;
             self.had_background_output = false;
             self.work_indicator_started_at = None;
             self.last_output_instant = None;
@@ -436,15 +450,20 @@ impl TerminalPane {
             AiHookState::Working => {
                 self.ai_hook_state = Some(AiHookState::Working);
                 self.ai_working_since.get_or_insert(now);
+                self.ai_last_waiting_at = None;
                 self.is_waiting_input = false;
                 self.has_notification = false;
                 self.last_output_at = Local::now();
                 self.last_output_instant = Some(now);
             }
             AiHookState::Waiting => {
-                // 既に Waiting 状態のところへ重ねて届いた Waiting（例: PermissionRequest 後の Notification や
-                // Stop 後の idle_prompt）は無視し、時刻更新・再点灯・重複 OS 通知を防ぐ
-                if self.ai_hook_state == Some(AiHookState::Waiting) {
+                // 同一待ちを知らせる短時間内の重複 Waiting（例: PermissionRequest 直後の Notification）のみ抑止し、
+                // ツール失敗後や時間経過後の正当な Waiting は取りこぼさない
+                if self.ai_hook_state == Some(AiHookState::Waiting)
+                    && self
+                        .ai_last_waiting_at
+                        .is_some_and(|t| now.duration_since(t) < AI_WAITING_DEDUP_WINDOW)
+                {
                     return false;
                 }
                 let worked_duration = self
@@ -452,6 +471,7 @@ impl TerminalPane {
                     .take()
                     .map(|start| now.saturating_duration_since(start));
                 self.ai_hook_state = Some(AiHookState::Waiting);
+                self.ai_last_waiting_at = Some(now);
                 self.last_output_at = Local::now();
                 self.last_output_instant = None;
                 if !is_active {
@@ -470,6 +490,7 @@ impl TerminalPane {
             AiHookState::Idle => {
                 self.ai_hook_state = None;
                 self.ai_working_since = None;
+                self.ai_last_waiting_at = None;
                 self.is_waiting_input = false;
                 self.has_notification = false;
                 self.last_output_instant = None;
@@ -625,7 +646,9 @@ impl TerminalPane {
         for event in events {
             match event {
                 VtEvent::PtyWrite(resp) => {
-                    self.write_input(&resp);
+                    if !resp.is_empty() {
+                        self.daemon.send_input(self.id, resp);
+                    }
                 }
                 VtEvent::PwdChanged(uri) => {
                     if let Some(path) = parse_pwd_uri(&uri) {

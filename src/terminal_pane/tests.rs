@@ -927,13 +927,20 @@ fn test_ai_managed_pane_ignores_pty_noise_and_tracks_hook_lifecycle() {
     assert!(!pane.is_waiting_input);
 
     // 4. Waiting フックで緑が消え、裏スロットが黄LED（is_waiting_input）になること。
-    //    さらに連続で届いた 2 回目の Waiting（PermissionRequest 後の Notification 等）は無視されること
+    //    短時間内（2 秒以内）に重なった重複 Waiting（PermissionRequest 直後の Notification 等）は無視されるが、
+    //    ユーザー入力（write_input）後や 2 秒経過後の正当な Waiting は再び受け付けること
     assert!(pane.apply_ai_hook_event(AiHookState::Waiting, Some(AiTool::Agy), false, true, "1"));
     assert!(!pane.is_actively_outputting(Instant::now()));
     assert!(pane.is_waiting_input);
     let ts_first_waiting = pane.last_output_at;
     assert!(!pane.apply_ai_hook_event(AiHookState::Waiting, Some(AiTool::Agy), false, true, "1"));
     assert_eq!(pane.last_output_at, ts_first_waiting);
+
+    // ユーザーが承認/拒否を入力すると Waiting が解除され、次の Waiting が正しく反応すること
+    pane.write_input(b"y\r");
+    assert!(!pane.is_waiting_input);
+    assert!(pane.apply_ai_hook_event(AiHookState::Waiting, Some(AiTool::Agy), false, true, "1"));
+    assert!(pane.is_waiting_input);
 
     // 5. Idle フック（ユーザーキャンセル等）で緑も黄もクリアされること
     assert!(pane.apply_ai_hook_event(AiHookState::Idle, Some(AiTool::Agy), false, true, "1"));

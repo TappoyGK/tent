@@ -1,6 +1,8 @@
 # AI エージェント監視フック設定ガイド
 
 TenT は **Claude Code / agy / Codex** の 3 ツールをフォアグラウンドプロセスから自動判別します。  
+判別対象は、実行ファイル名（`claude` / `claude-code` / `agy` / `antigravity` / `antigravity-cli` / `codex` / `codex-cli`）、Claude Code ネイティブ版の `/claude/versions/` パス、`argv[0]` のベース名、および `node` / `bun` / `deno` 経由で起動された公式パッケージパス（`node_modules/@anthropic-ai/claude-code`・`node_modules/@openai/codex`）です。別名や独自ラッパー経由で起動した場合は判別されず一般ルールのまま動作します。
+
 フックを設定した環境では、セッション開始（`SessionStart`）または最初のフック受信から AI フック駆動モードに入り、PTY 出力による画面差分・アイドル推測を完全に停止して、各ツールのライフサイクルフック（`tent hook`）のみで LED（緑／黄）・タイムスタンプ・OS 通知を駆動します。
 
 - **フック未設定の環境**: フックを 1 度も受信していないペインでは従来の一般ルール（可視テキスト変化＋OSC 133）がそのまま動作します。
@@ -15,12 +17,13 @@ TenT は **Claude Code / agy / Codex** の 3 ツールをフォアグラウン�
    ln -sf /Applications/TenT.app/Contents/MacOS/tent ~/.local/bin/tent
    ```
    （開発ビルドを直接使う場合は `<repo>/target/debug/tent` へ置き換えてください。）
-2. **デーモンの再起動とペインの開き直し**: `TENT_PANE_ID` と `TENT_SOCKET` はデーモンプロトコル v5 でペインを起動するときに注入されます。旧バージョンのデーモンが動いている場合は、TenT ステータスバー右上のデーモン更新バッジからデーモンを再起動し、ペインを開き直してください。
+2. **デーモンのアップグレード**: `TENT_PANE_ID` と `TENT_SOCKET` はデーモンプロトコル v5 でペインを起動するときに注入されます。旧バージョンのデーモンが動いている場合は、ステータスバー右上の **「Upgrade」** ボタンを 2 回クリックしてください（1 回目で「Confirm?」に変わり、2 回目で旧デーモンを停止して GUI ごと再起動し、全ペインが v5 デーモン上で起動し直されます）。
 
 ---
 
 ## 1. Claude Code (`~/.claude/settings.json`)
 
+- `SessionStart` は `startup|resume|clear` に絞り、自動コンパクション（`compact`）時に作業中の緑表示が消えないようにします。
 - `Notification` の `matcher` は `permission_prompt|elicitation_dialog` に絞り、`idle_prompt` や `auth_success` での誤点灯を防ぎます。
 - **制限事項**: Claude Code の仕様上、`Esc` / `Ctrl+C` でユーザーが中断したときは `Stop` フックが発火しないため、次のプロンプト送信またはセッション終了まで緑表示が残ります。
 
@@ -29,6 +32,7 @@ TenT は **Claude Code / agy / Codex** の 3 ツールをフォアグラウン�
   "hooks": {
     "SessionStart": [
       {
+        "matcher": "startup|resume|clear",
         "hooks": [
           { "type": "command", "command": "/Applications/TenT.app/Contents/MacOS/tent hook idle --tool claude" }
         ]
@@ -42,6 +46,13 @@ TenT は **Claude Code / agy / Codex** の 3 ツールをフォアグラウン�
       }
     ],
     "PostToolUse": [
+      {
+        "hooks": [
+          { "type": "command", "command": "/Applications/TenT.app/Contents/MacOS/tent hook working --tool claude" }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
       {
         "hooks": [
           { "type": "command", "command": "/Applications/TenT.app/Contents/MacOS/tent hook working --tool claude" }
