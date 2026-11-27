@@ -34,9 +34,10 @@ const RESIZE_GRACE_PERIOD: Duration = Duration::from_secs(1);
 const WAITING_IDLE_THRESHOLD: Duration = Duration::from_secs(4);
 /// 裏スロットでの完了・入力待ち OS 通知を出すための最小実行時間（短時間ノイズ抑制）
 const BACKGROUND_NOTIFY_MIN_DURATION: Duration = Duration::from_secs(5);
-/// 裏スロットを「入力待ち（黄色）」にするために必要な最小変化行数
-/// （Claude Code 等のアイドル時ステータス行・ヒント 1〜2 行だけの書き換えによる偽陽性を防ぐ）
-const WAITING_MIN_CHANGED_LINES: usize = 3;
+/// 裏スロットを「入力待ち（黄色）」にするために必要なビューポート最小変化割合（50% 以上）
+/// （Claude Code 等の下部 UI・ヒント・一部領域だけの書き換えによる偽陽性を防ぎ、
+/// 画面全体がスクロールする実出力のみを検知する）
+const WAITING_MIN_CHANGED_PERCENT: usize = 50;
 /// DEC Mode 2026 (Synchronized Output) で描画ホールドを許可する最大時間（固まり防止）
 const SYNC_OUTPUT_MAX_HOLD: Duration = Duration::from_secs(1);
 
@@ -661,17 +662,18 @@ impl TerminalPane {
             let should_notify = self.should_notify_background_completion(now);
             self.had_background_output = false;
             self.work_indicator_started_at = None;
-            // 確認時点から変化した行数がしきい値未満なら（カーソル点滅・ステータス行やヒント 1〜2 行の
-            // 微細な再描画など）、人間目線で有意な変化がないため黄色（入力待ち）にしない。
+            // 確認時点から変化した行数がビューポート全体の 50% 未満なら（下部 UI・ステータス行・
+            // ヒント等の一部書き換え）、画面全体が動いていないため黄色（入力待ち）にしない。
             // ただし実行中インジケータを伴う長時間処理の完了（should_notify）は 1 行以上の変化で通知する。
             let cur_lines = self.current_line_hashes();
             let changed_lines = count_changed_lines(&self.last_seen_line_hashes, &cur_lines);
-            let min_changed = if should_notify {
-                1
+            let total_rows = usize::from(self.rows).max(1);
+            let has_significant_change = if should_notify {
+                changed_lines >= 1
             } else {
-                WAITING_MIN_CHANGED_LINES.min(usize::from(self.rows).max(1))
+                changed_lines * 100 >= total_rows * WAITING_MIN_CHANGED_PERCENT
             };
-            if changed_lines < min_changed {
+            if !has_significant_change {
                 return false;
             }
             if !self.is_waiting_input {

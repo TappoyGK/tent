@@ -893,9 +893,9 @@ fn test_minor_footer_hint_change_does_not_trigger_waiting_input_but_real_reply_d
     pane.created_at = Instant::now() - STARTUP_GRACE_PERIOD - Duration::from_secs(1);
     pane.mark_screen_seen();
 
-    // 1. 最下段のステータス行・ヒント 1〜2 行だけの書き換えでは黄色（入力待ち）にならないこと
+    // 1. 下部 UI（ステータス行・入力枠・ヒント等 4 行 = 12 行中 33%）だけの書き換えでは黄色にならないこと
     pane.feed_pty_bytes(
-        b"\x1b[10;1Hnew task? /clear\x1b[12;1Hauto mode on - 1 agent",
+        b"\x1b[9;1H--------\x1b[10;1Hnew task? /clear\x1b[11;1H> \x1b[12;1Hauto mode on - 1 agent",
         false,
         true,
         "1",
@@ -904,9 +904,9 @@ fn test_minor_footer_hint_change_does_not_trigger_waiting_input_but_real_reply_d
     assert!(!pane.update_waiting_state(t1, false, Some("1")));
     assert!(!pane.is_waiting_input);
 
-    // 2. 3 行以上の実出力（AI の返答等）があれば黄色（入力待ち）になること
+    // 2. 画面の 50% 以上（12 行中 6 行以上）が動く実出力があれば黄色（入力待ち）になること
     pane.feed_pty_bytes(
-        b"\x1b[2;1HReply line 1\x1b[3;1HReply line 2\x1b[4;1HReply line 3",
+        b"\x1b[2;1HReply 1\x1b[3;1HReply 2\x1b[4;1HReply 3\x1b[5;1HReply 4\x1b[6;1HReply 5\x1b[7;1HReply 6",
         false,
         true,
         "1",
