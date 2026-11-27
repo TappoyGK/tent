@@ -103,8 +103,11 @@ pub struct TerminalPane {
     pub has_notification: bool,
     pub had_background_output: bool,
     pub background_output_started_at: Option<Instant>,
-    /// ユーザーによるコマンド送信（Enter）または OSC 133;C で明示的に開始されたジョブの開始時刻
-    pub active_job_started_at: Option<Instant>,
+    /// OSC 133;C で明示的に開始されたコマンドの開始時刻（133;D または 133;A でクリア）
+    pub osc133_job_started_at: Option<Instant>,
+    /// チャンク境界を跨ぐ OSC 133 マーカー検出用の直近末尾バッファ（最大 6 バイト）
+    osc133_tail: [u8; 6],
+    osc133_tail_len: u8,
     pub is_waiting_input: bool,
     last_seen_screen_hash: u64,
     last_notification_sent: Option<Instant>,
@@ -178,7 +181,9 @@ impl TerminalPane {
             has_notification: false,
             had_background_output: false,
             background_output_started_at: None,
-            active_job_started_at: None,
+            osc133_job_started_at: None,
+            osc133_tail: [0; 6],
+            osc133_tail_len: 0,
             is_waiting_input: false,
             last_seen_screen_hash: 0,
             last_notification_sent: None,
@@ -243,7 +248,9 @@ impl TerminalPane {
             has_notification: false,
             had_background_output: false,
             background_output_started_at: None,
-            active_job_started_at: None,
+            osc133_job_started_at: None,
+            osc133_tail: [0; 6],
+            osc133_tail_len: 0,
             is_waiting_input: false,
             last_seen_screen_hash: 0,
             last_notification_sent: None,
@@ -261,9 +268,6 @@ impl TerminalPane {
 
     pub fn write_input(&mut self, bytes: &[u8]) {
         if !bytes.is_empty() {
-            if bytes.contains(&b'\r') || bytes.contains(&b'\n') {
-                self.active_job_started_at = Some(Instant::now());
-            }
             self.daemon.send_input(self.id, bytes.to_vec());
         }
     }
@@ -398,10 +402,7 @@ impl TerminalPane {
             return;
         }
         let now = Instant::now();
-        let (saw_osc133_start, saw_osc133_done) = scan_osc_133_markers(bytes);
-        if saw_osc133_start {
-            self.active_job_started_at = Some(now);
-        }
+        let osc133_completed_long = self.process_osc_133_markers(bytes, now);
         self.terminal.vt_write(bytes);
         let in_startup_grace = now.duration_since(self.created_at) < STARTUP_GRACE_PERIOD;
         let is_resize_redraw = self
@@ -422,20 +423,15 @@ impl TerminalPane {
             // リサイズ猶予中の再描画は未確認出力とみなさず基準ハッシュを更新する
             self.mark_screen_seen();
         }
-        if saw_osc133_done {
-            let job_long = self.active_job_started_at.take().is_some_and(|s| {
-                now.saturating_duration_since(s) >= BACKGROUND_NOTIFY_MIN_DURATION
-            });
-            if !is_active && !in_startup_grace && job_long {
-                self.is_waiting_input = true;
-                self.had_background_output = false;
-                self.background_output_started_at = None;
-                let title = format!("TenT [{}] {}", slot_label, self.folder_name);
-                self.try_send_os_notification(
-                    title,
-                    "コマンドが完了し入力待ちになりました".to_string(),
-                );
-            }
+        if osc133_completed_long && !is_active && !in_startup_grace {
+            self.is_waiting_input = true;
+            self.had_background_output = false;
+            self.background_output_started_at = None;
+            let title = format!("TenT [{}] {}", slot_label, self.folder_name);
+            self.try_send_os_notification(
+                title,
+                "コマンドが完了し入力待ちになりました".to_string(),
+            );
         }
         self.minimap_dirty = true;
         self.generation = self.generation.wrapping_add(1);
@@ -603,16 +599,13 @@ impl TerminalPane {
             || lower.contains("esc to cancel")
     }
 
-    /// 裏スロットでの実行時間が通知しきい値以上だったか判定する
+    /// 裏スロットでの連続出力バースト（または実行中インジケータ表示を跨いだ処理）が
+    /// 通知しきい値以上だったか判定する
     pub(crate) fn should_notify_background_completion(&self, now: Instant) -> bool {
         let end = self.last_output_instant.unwrap_or(now);
-        let continuous_long = self.background_output_started_at.is_some_and(|start| {
+        self.background_output_started_at.is_some_and(|start| {
             end.saturating_duration_since(start) >= BACKGROUND_NOTIFY_MIN_DURATION
-        });
-        let explicit_job_long = self.active_job_started_at.is_some_and(|start| {
-            end.saturating_duration_since(start) >= BACKGROUND_NOTIFY_MIN_DURATION
-        });
-        continuous_long || explicit_job_long
+        })
     }
 
     /// 裏タブで出力が止まったときに「AI入力待ち」へ遷移させ、一定時間以上動いていた場合は OS 通知する
@@ -632,6 +625,7 @@ impl TerminalPane {
             .is_some_and(|t| now.duration_since(t) >= WAITING_IDLE_THRESHOLD);
         if self.had_background_output && idle_long_enough {
             // Codex / Claude Code 等が思考中・ツール実行中（esc to interrupt 表示中）なら入力待ちにしない
+            // （実行中インジケータ表示中は background_output_started_at も維持する）
             if self.has_active_work_indicator() {
                 return false;
             }
@@ -646,16 +640,12 @@ impl TerminalPane {
             }
             if !self.is_waiting_input {
                 self.is_waiting_input = true;
-                if should_notify {
-                    // 完了通知を発火した時点で明示的ジョブの開始時刻も消費する
-                    self.active_job_started_at = None;
-                    if let Some(label) = slot_label {
-                        let title = format!("TenT [{}] {}", label, self.folder_name);
-                        self.try_send_os_notification(
-                            title,
-                            "出力が完了し入力待ちになりました".to_string(),
-                        );
-                    }
+                if should_notify && let Some(label) = slot_label {
+                    let title = format!("TenT [{}] {}", label, self.folder_name);
+                    self.try_send_os_notification(
+                        title,
+                        "出力が完了し入力待ちになりました".to_string(),
+                    );
                 }
                 return true;
             }
@@ -672,20 +662,72 @@ impl TerminalPane {
     pub fn url_at_cell(&mut self, col: u16, row: u16) -> Option<UrlMatch> {
         find_url_at_cell(&self.terminal, self.cols, col, row)
     }
-}
 
-/// OSC 133 シェル統合のコマンド開始（`133;C`）およびコマンド終了（`133;D`）マーカーを検出する
-fn scan_osc_133_markers(bytes: &[u8]) -> (bool, bool) {
-    let mut saw_start = false;
-    let mut saw_done = false;
-    for w in bytes.windows(7) {
+    /// OSC 133 シェル統合マーカー（`133;A` / `133;C` / `133;D`）をチャンク境界を跨いで検出・処理する。
+    /// 通知しきい値以上実行されたコマンドの終了（`133;D`）を検出した場合は `true` を返す。
+    fn process_osc_133_markers(&mut self, bytes: &[u8], now: Instant) -> bool {
+        const MARKER_LEN: usize = 7; // b"\x1b]133;X"
+        const TAIL_CAP: usize = MARKER_LEN - 1;
+
+        let mut completed_long = false;
+        let tail_len = usize::from(self.osc133_tail_len);
+
+        // 1. 前回末尾（最大 6B）+ 今回先頭（最大 6B）で境界を跨ぐ 7B ウィンドウを走査
+        if tail_len > 0 {
+            let mut bridge = [0u8; TAIL_CAP * 2];
+            bridge[..tail_len].copy_from_slice(&self.osc133_tail[..tail_len]);
+            let head_len = bytes.len().min(TAIL_CAP);
+            bridge[tail_len..tail_len + head_len].copy_from_slice(&bytes[..head_len]);
+            let total = tail_len + head_len;
+            if total >= MARKER_LEN {
+                for w in bridge[..total].windows(MARKER_LEN) {
+                    if self.handle_osc_133_window(w, now) {
+                        completed_long = true;
+                    }
+                }
+            }
+        }
+
+        // 2. 今回のバイト列内部の 7B ウィンドウを走査
+        for w in bytes.windows(MARKER_LEN) {
+            if self.handle_osc_133_window(w, now) {
+                completed_long = true;
+            }
+        }
+
+        // 3. 次回チャンク用に直近最大 6B を保持
+        if bytes.len() >= TAIL_CAP {
+            self.osc133_tail
+                .copy_from_slice(&bytes[bytes.len() - TAIL_CAP..]);
+            self.osc133_tail_len = TAIL_CAP as u8;
+        } else {
+            let mut combined = [0u8; TAIL_CAP * 2];
+            combined[..tail_len].copy_from_slice(&self.osc133_tail[..tail_len]);
+            combined[tail_len..tail_len + bytes.len()].copy_from_slice(bytes);
+            let total = tail_len + bytes.len();
+            let keep = total.min(TAIL_CAP);
+            self.osc133_tail[..keep].copy_from_slice(&combined[total - keep..total]);
+            self.osc133_tail_len = keep as u8;
+        }
+
+        completed_long
+    }
+
+    fn handle_osc_133_window(&mut self, w: &[u8], now: Instant) -> bool {
         if w == b"\x1b]133;C" {
-            saw_start = true;
+            self.osc133_job_started_at = Some(now);
+            false
         } else if w == b"\x1b]133;D" {
-            saw_done = true;
+            self.osc133_job_started_at.take().is_some_and(|start| {
+                now.saturating_duration_since(start) >= BACKGROUND_NOTIFY_MIN_DURATION
+            })
+        } else if w == b"\x1b]133;A" {
+            self.osc133_job_started_at = None;
+            false
+        } else {
+            false
         }
     }
-    (saw_start, saw_done)
 }
 
 pub fn extract_folder_name(path: &Path) -> String {

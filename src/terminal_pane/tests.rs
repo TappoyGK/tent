@@ -369,7 +369,7 @@ fn test_clear_screen_and_scrollback_clears_viewport_and_history_across_resync() 
 }
 
 #[test]
-fn test_background_completion_notification_survives_silent_gap() {
+fn test_osc133_split_chunks_notify_long_job_and_ignore_short_job() {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
@@ -389,39 +389,170 @@ fn test_background_completion_notification_survives_silent_gap() {
         DaemonClient::dummy_for_test(),
     )
     .unwrap();
+    let now = Instant::now();
+    pane.created_at = now - STARTUP_GRACE_PERIOD - Duration::from_secs(1);
+    pane.mark_screen_seen();
+
+    // 1. チャンク境界を跨ぐ OSC 133;C でジョブ開始が検出されること
+    pane.feed_pty_bytes(b"out\x1b", false, true, "1");
+    assert_eq!(pane.osc133_job_started_at, None);
+    pane.feed_pty_bytes(b"]133;C\x07building...\r\n", false, true, "1");
+    assert!(pane.osc133_job_started_at.is_some());
+
+    // 2. 途中の無出力区間（4秒アイドル）で連続バースト開始時刻はリセットされるが、
+    //    OSC 133 のジョブ開始時刻は保持され、誤通知も出ないこと
+    let t0 = pane.osc133_job_started_at.unwrap();
+    pane.last_output_instant = Some(t0);
+    assert!(pane.update_waiting_state(t0 + WAITING_IDLE_THRESHOLD, false, Some("1")));
+    assert_eq!(pane.background_output_started_at, None);
+    assert_eq!(pane.osc133_job_started_at, Some(t0));
+    assert!(pane.last_notification_sent.is_none());
+
+    // 3. 10秒経過した状態にして、チャンク境界を跨ぐ OSC 133;D で完了通知が発火すること
+    pane.osc133_job_started_at =
+        Some(Instant::now() - BACKGROUND_NOTIFY_MIN_DURATION - Duration::from_secs(5));
+    pane.feed_pty_bytes(b"done\x1b]133", false, true, "1");
+    assert!(pane.last_notification_sent.is_none());
+    pane.feed_pty_bytes(b";D\x07$ ", false, true, "1");
+    assert!(pane.last_notification_sent.is_some());
+    assert_eq!(pane.osc133_job_started_at, None);
+    assert!(pane.is_waiting_input);
+
+    // 4. 短いコマンド（< 5s）では OSC 133;D で通知されず開始時刻がクリアされること
+    pane.last_notification_sent = None;
+    pane.feed_pty_bytes(
+        b"\x1b]133;C\x07ls\r\nfoo\r\n\x1b]133;D\x07$ ",
+        false,
+        true,
+        "1",
+    );
+    assert!(pane.last_notification_sent.is_none());
+    assert_eq!(pane.osc133_job_started_at, None);
+}
+
+#[test]
+fn test_work_indicator_survives_silent_gap_and_notifies_on_completion() {
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    use super::{
+        BACKGROUND_NOTIFY_MIN_DURATION, STARTUP_GRACE_PERIOD, TerminalPane, WAITING_IDLE_THRESHOLD,
+    };
+    use crate::daemon::{DaemonClient, ReplayedPane};
+
+    let mut pane = TerminalPane::attach_from_replay(
+        ReplayedPane {
+            pane_id: 1,
+            cols: 50,
+            rows: 6,
+            cwd: PathBuf::from("/tmp"),
+            replay_bytes: b"ready> ".to_vec(),
+        },
+        DaemonClient::dummy_for_test(),
+    )
+    .unwrap();
     let t0 = Instant::now();
     pane.created_at = t0 - STARTUP_GRACE_PERIOD - Duration::from_secs(1);
     pane.mark_screen_seen();
 
-    // 1. t=0: ユーザーがコマンドを送信（明示的ジョブ開始）し、開始メッセージが出力される
-    pane.active_job_started_at = Some(t0);
-    pane.terminal.vt_write(b"\r\nbuilding...");
+    // 1. t=0: AI エージェントが処理中インジケータを出して思考開始
+    pane.terminal.vt_write(b"\r\nWorking... (esc to interrupt)");
     pane.had_background_output = true;
     pane.background_output_started_at = Some(t0);
     pane.last_output_instant = Some(t0);
 
-    // 2. t=4s: 計算中の無出力区間で update_waiting_state が発火
-    //    （連続バースト開始時刻はリセットされるが、明示的ジョブ開始時刻は保持されること）
+    // 2. t=4s: 思考中の無音区間でもインジケータ表示中は開始時刻をリセットしないこと
     let t4 = t0 + WAITING_IDLE_THRESHOLD;
-    assert!(pane.update_waiting_state(t4, false, None));
-    assert!(pane.is_waiting_input);
-    assert_eq!(pane.background_output_started_at, None);
-    assert_eq!(pane.active_job_started_at, Some(t0));
+    assert!(!pane.update_waiting_state(t4, false, None));
+    assert!(!pane.is_waiting_input);
+    assert_eq!(pane.background_output_started_at, Some(t0));
 
-    // 3. t=10s: 計算完了メッセージ出力
+    // 3. t=10s: インジケータが消えて完了メッセージを出力
     let t10 = t0 + BACKGROUND_NOTIFY_MIN_DURATION + Duration::from_secs(5);
-    pane.terminal.vt_write(b"\r\ndone!");
-    pane.is_waiting_input = false;
+    pane.terminal
+        .vt_write(b"\x1b[2J\x1b[HAll tasks done!\r\n> ");
     pane.had_background_output = true;
-    pane.background_output_started_at.get_or_insert(t10);
     pane.last_output_instant = Some(t10);
 
-    // 4. t=14s: 完了後のアイドル遷移で通知対象（>= 5s）と判定され、開始時刻が消費されること
+    // 4. t=14s: アイドル遷移で長時間処理完了（>= 5s）として通知対象になること
     let t14 = t10 + WAITING_IDLE_THRESHOLD;
     assert!(pane.should_notify_background_completion(t14));
     assert!(pane.update_waiting_state(t14, false, None));
     assert!(pane.is_waiting_input);
-    assert_eq!(pane.active_job_started_at, None);
+    assert_eq!(pane.background_output_started_at, None);
+}
+
+#[test]
+fn test_enter_started_tail_f_does_not_trigger_false_completion_notification() {
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    use super::{STARTUP_GRACE_PERIOD, TerminalPane, WAITING_IDLE_THRESHOLD};
+    use crate::daemon::{DaemonClient, ReplayedPane};
+
+    let mut pane = TerminalPane::attach_from_replay(
+        ReplayedPane {
+            pane_id: 1,
+            cols: 60,
+            rows: 6,
+            cwd: PathBuf::from("/tmp"),
+            replay_bytes: b"$ ".to_vec(),
+        },
+        DaemonClient::dummy_for_test(),
+    )
+    .unwrap();
+    let now = Instant::now();
+    pane.created_at = now - STARTUP_GRACE_PERIOD - Duration::from_secs(1);
+    pane.mark_screen_seen();
+
+    // アクティブで Enter により tail -f を起動
+    pane.write_input(b"tail -f app.log\r");
+    pane.feed_pty_bytes(b"tail -f app.log\r\n[00:00] start\r\n", true, true, "1");
+    pane.mark_screen_seen();
+
+    // 60秒後に裏スロットで 1 行だけログが届き、4.1 秒アイドルになっても完了通知しないこと
+    pane.feed_pty_bytes(b"[01:00] heartbeat\r\n", false, true, "1");
+    let after_idle = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
+    assert!(!pane.should_notify_background_completion(after_idle));
+    assert!(pane.update_waiting_state(after_idle, false, Some("1")));
+    assert!(pane.last_notification_sent.is_none());
+}
+
+#[test]
+fn test_active_short_command_enter_does_not_trigger_later_background_notification() {
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    use super::{STARTUP_GRACE_PERIOD, TerminalPane, WAITING_IDLE_THRESHOLD};
+    use crate::daemon::{DaemonClient, ReplayedPane};
+
+    let mut pane = TerminalPane::attach_from_replay(
+        ReplayedPane {
+            pane_id: 1,
+            cols: 60,
+            rows: 6,
+            cwd: PathBuf::from("/tmp"),
+            replay_bytes: b"$ ".to_vec(),
+        },
+        DaemonClient::dummy_for_test(),
+    )
+    .unwrap();
+    let now = Instant::now();
+    pane.created_at = now - STARTUP_GRACE_PERIOD - Duration::from_secs(1);
+    pane.mark_screen_seen();
+
+    // アクティブで短いコマンドを実行して完了・アイドルに戻る
+    pane.write_input(b"ls\r");
+    pane.feed_pty_bytes(b"ls\r\nfoo bar\r\n$ ", true, true, "1");
+    pane.update_waiting_state(Instant::now() + WAITING_IDLE_THRESHOLD, true, Some("1"));
+    pane.mark_screen_seen();
+
+    // 後から裏スロットに回した状態で 1 行だけ無関係な出力が届いても完了通知しないこと
+    pane.feed_pty_bytes(b"\r\n[1]+ Done  sleep 1\r\n$ ", false, true, "1");
+    let after_idle = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
+    assert!(!pane.should_notify_background_completion(after_idle));
+    assert!(pane.update_waiting_state(after_idle, false, Some("1")));
+    assert!(pane.last_notification_sent.is_none());
 }
 
 #[test]
@@ -446,8 +577,6 @@ fn test_independent_periodic_short_logs_do_not_trigger_completion_notification()
     let t0 = Instant::now();
     pane.created_at = t0 - STARTUP_GRACE_PERIOD - Duration::from_secs(1);
     pane.mark_screen_seen();
-    // 新規ジョブ送信なし（すでに稼働中の tail -f を別タブで放置している状態）
-    pane.active_job_started_at = None;
 
     // 1. t=0: 1行目の短いログ
     pane.terminal.vt_write(b"\r\n[00:00] heartbeat 1");
