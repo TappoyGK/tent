@@ -26,10 +26,6 @@ impl FooterColumn {
     pub(super) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
-
-    pub(super) fn has_latest(&self) -> bool {
-        self.entries.iter().any(|e| e.is_latest)
-    }
 }
 
 /// メイン領域の各ペイン矩形と最終更新時刻 `(timestamp_micros, "HH:MM")` から、
@@ -174,27 +170,6 @@ impl Renderer {
 
         let columns = compute_footer_columns(&pane_timestamps);
 
-        // 最新更新ペインを含む列は背景と上端アクセントラインを強調表示する
-        for col in &columns {
-            if col.has_latest() {
-                let x0 = col.x.max(footer.x);
-                let x1 = (col.x + col.w).min(footer.right());
-                if x1 > x0 {
-                    let w = x1 - x0;
-                    self.push_rect(
-                        rects,
-                        Rect::new(x0, footer.y, w, footer.h),
-                        [0.16, 0.14, 0.10, 1.0],
-                    );
-                    self.push_rect(
-                        rects,
-                        Rect::new(x0, footer.y, w, (1.5 * scale_factor).max(1.5)),
-                        [0.94, 0.77, 0.22, 0.90],
-                    );
-                }
-            }
-        }
-
         // 2 列以上ある場合は列境界にさりげない縦セパレータを描画
         for col in columns.iter().skip(1) {
             let sep_x = (col.x - pane_gap * 0.5).max(footer.x);
@@ -230,7 +205,7 @@ impl Renderer {
         let latest_attrs = Attrs::new()
             .family(Family::Name("Menlo"))
             .weight(Weight::BOLD)
-            .color(Color::rgb(0xf8, 0xcc, 0x56));
+            .color(Color::rgb(0xe8, 0xee, 0xf7));
         let sep_attrs = Attrs::new()
             .family(Family::Name("Menlo"))
             .color(Color::rgb(0x5c, 0x66, 0x7a));
