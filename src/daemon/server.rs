@@ -486,7 +486,6 @@ fn spawn_daemon_pane(
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
     let mut cmd = CommandBuilder::new(&shell);
-    cmd.arg("-l");
     if cwd.is_dir() {
         cmd.cwd(&cwd);
     } else if let Some(home) = std::env::var_os("HOME") {
@@ -509,19 +508,27 @@ fn spawn_daemon_pane(
         let existing_zdotdir = std::env::var("ZDOTDIR").ok();
         let existing_env = std::env::var("ENV").ok();
         let existing_xdg = std::env::var("XDG_DATA_DIRS").ok();
+        let bash_major = if Path::new(&shell).file_name().and_then(|s| s.to_str()) == Some("bash") {
+            detect_bash_major_version(&shell)
+        } else {
+            None
+        };
         let launch = build_shell_integration_launch(
             &shell,
             &res_dir,
             existing_zdotdir.as_deref(),
             existing_env.as_deref(),
             existing_xdg.as_deref(),
+            bash_major,
         );
-        for arg in launch.extra_args {
+        for arg in launch.args {
             cmd.arg(arg);
         }
         for (k, v) in launch.envs {
             cmd.env(k, v);
         }
+    } else {
+        cmd.arg("-l");
     }
 
     let Ok(mut child) = pair.slave.spawn_command(cmd) else {
@@ -613,28 +620,51 @@ fn spawn_daemon_pane(
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct ShellIntegrationLaunch {
-    pub(super) extra_args: Vec<String>,
+    pub(super) args: Vec<String>,
     pub(super) envs: Vec<(String, String)>,
 }
 
-/// Ghostty 同梱のシェル統合スクリプト（OSC 133 / OSC 7）を透過的に注入するための
-/// 追加引数・環境変数を生成する。
+/// `bash --version` の出力（例: `GNU bash, version 5.2.37(1)-release ...`）からメジャーバージョンを取得する
+pub(super) fn parse_bash_major_version(version_output: &str) -> Option<u32> {
+    let first_line = version_output.lines().next()?;
+    let after = first_line.split("version ").nth(1)?;
+    let major_str = after.split('.').next()?;
+    major_str.parse::<u32>().ok()
+}
+
+pub(super) fn detect_bash_major_version(shell: &str) -> Option<u32> {
+    let out = std::process::Command::new(shell)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    parse_bash_major_version(&stdout)
+}
+
+/// Ghostty 同梱のシェル統合スクリプト（OSC 133）を透過的に注入するための
+/// 起動引数（順序付き）と環境変数を生成する。
 pub(super) fn build_shell_integration_launch(
     shell: &str,
     res_dir: &Path,
     existing_zdotdir: Option<&str>,
     existing_env: Option<&str>,
     existing_xdg_data_dirs: Option<&str>,
+    bash_major_version: Option<u32>,
 ) -> ShellIntegrationLaunch {
     let shell_name = Path::new(shell)
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(shell);
-    let mut launch = ShellIntegrationLaunch::default();
-    launch.envs.push((
-        "GHOSTTY_RESOURCES_DIR".to_string(),
-        res_dir.to_string_lossy().into_owned(),
-    ));
+    let mut launch = ShellIntegrationLaunch {
+        args: vec!["-l".to_string()],
+        envs: vec![(
+            "GHOSTTY_RESOURCES_DIR".to_string(),
+            res_dir.to_string_lossy().into_owned(),
+        )],
+    };
     let si_dir = res_dir.join("shell-integration");
 
     match shell_name {
@@ -653,9 +683,11 @@ pub(super) fn build_shell_integration_launch(
             }
         }
         "bash" => {
+            // Ghostty の bash シェル統合は bash 4.0 以上が必須（macOS 標準の 3.2 では未対応）。
+            // また bash の仕様上 `--posix` は `-l` より前に置く必要がある。
             let bash_script = si_dir.join("bash").join("ghostty.bash");
-            if bash_script.is_file() {
-                launch.extra_args.push("--posix".to_string());
+            if bash_major_version.is_some_and(|v| v >= 4) && bash_script.is_file() {
+                launch.args = vec!["--posix".to_string(), "-l".to_string()];
                 launch
                     .envs
                     .push(("GHOSTTY_BASH_INJECT".to_string(), "1".to_string()));

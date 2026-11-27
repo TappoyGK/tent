@@ -333,14 +333,36 @@ fn test_normalize_post_handshake_event_converts_legacy_replay_to_resync() {
 
 #[test]
 fn test_build_shell_integration_launch_for_zsh_bash_fish() {
-    use super::server::build_shell_integration_launch;
+    use super::server::{
+        build_shell_integration_launch, detect_bash_major_version, parse_bash_major_version,
+    };
+
+    assert_eq!(
+        parse_bash_major_version("GNU bash, version 3.2.57(1)-release (arm64-apple-darwin25)\n"),
+        Some(3)
+    );
+    assert_eq!(
+        parse_bash_major_version("GNU bash, version 5.2.37(1)-release (aarch64-apple-darwin23)\n"),
+        Some(5)
+    );
+    assert_eq!(parse_bash_major_version("unexpected"), None);
+    // macOS 標準の /bin/bash が存在する環境ではバージョン取得できること
+    if std::path::Path::new("/bin/bash").is_file() {
+        assert!(detect_bash_major_version("/bin/bash").is_some());
+    }
 
     let res_dir = ghostty_vt::shell_integration::resources_dir().unwrap();
 
-    // zsh: 既存 ZDOTDIR を退避しつつ shell-integration/zsh を注入
-    let zsh =
-        build_shell_integration_launch("/bin/zsh", &res_dir, Some("/custom/zdot"), None, None);
-    assert!(zsh.extra_args.is_empty());
+    // zsh: `-l` のまま既存 ZDOTDIR を退避しつつ shell-integration/zsh を注入
+    let zsh = build_shell_integration_launch(
+        "/bin/zsh",
+        &res_dir,
+        Some("/custom/zdot"),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(zsh.args, vec!["-l"]);
     assert!(
         zsh.envs
             .iter()
@@ -352,34 +374,52 @@ fn test_build_shell_integration_launch_for_zsh_bash_fish() {
             .any(|(k, v)| k == "ZDOTDIR" && v.ends_with("shell-integration/zsh"))
     );
 
-    // bash: --posix + GHOSTTY_BASH_INJECT=1 + 既存 ENV 退避 + ENV=ghostty.bash
-    let bash = build_shell_integration_launch("/bin/bash", &res_dir, None, Some("/my/env"), None);
-    assert_eq!(bash.extra_args, vec!["--posix"]);
+    // bash 5.x: `--posix` が `-l` より前に配置され、GHOSTTY_BASH_INJECT=1 + 既存 ENV 退避 + ENV=ghostty.bash
+    let bash5 = build_shell_integration_launch(
+        "/opt/homebrew/bin/bash",
+        &res_dir,
+        None,
+        Some("/my/env"),
+        None,
+        Some(5),
+    );
+    assert_eq!(bash5.args, vec!["--posix", "-l"]);
     assert!(
-        bash.envs
+        bash5
+            .envs
             .iter()
             .any(|(k, v)| k == "GHOSTTY_BASH_INJECT" && v == "1")
     );
     assert!(
-        bash.envs
+        bash5
+            .envs
             .iter()
             .any(|(k, v)| k == "GHOSTTY_BASH_ENV" && v == "/my/env")
     );
     assert!(
-        bash.envs
+        bash5
+            .envs
             .iter()
             .any(|(k, v)| k == "ENV" && v.ends_with("shell-integration/bash/ghostty.bash"))
     );
 
-    // fish: XDG_DATA_DIRS の先頭に shell-integration/fish を連結
+    // bash 3.2 (macOS 標準): 未対応のため注入せず通常の `-l` のみで起動すること
+    let bash3 =
+        build_shell_integration_launch("/bin/bash", &res_dir, None, Some("/my/env"), None, Some(3));
+    assert_eq!(bash3.args, vec!["-l"]);
+    assert!(!bash3.envs.iter().any(|(k, _)| k == "GHOSTTY_BASH_INJECT"));
+    assert!(!bash3.envs.iter().any(|(k, _)| k == "ENV"));
+
+    // fish: `-l` のまま XDG_DATA_DIRS の先頭に shell-integration/fish を連結
     let fish = build_shell_integration_launch(
         "/opt/homebrew/bin/fish",
         &res_dir,
         None,
         None,
         Some("/usr/share"),
+        None,
     );
-    assert!(fish.extra_args.is_empty());
+    assert_eq!(fish.args, vec!["-l"]);
     assert!(fish.envs.iter().any(|(k, v)| {
         k == "XDG_DATA_DIRS" && v.contains("shell-integration/fish:") && v.ends_with(":/usr/share")
     }));
