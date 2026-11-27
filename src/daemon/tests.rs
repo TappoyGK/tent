@@ -333,20 +333,9 @@ fn test_normalize_post_handshake_event_converts_legacy_replay_to_resync() {
 
 #[test]
 fn test_build_shell_integration_launch_for_zsh_bash_fish() {
-    use super::server::{
-        build_shell_integration_launch, detect_bash_major_version, parse_bash_major_version,
-    };
+    use super::server::{build_shell_integration_launch, detect_bash_major_version};
 
-    assert_eq!(
-        parse_bash_major_version("GNU bash, version 3.2.57(1)-release (arm64-apple-darwin25)\n"),
-        Some(3)
-    );
-    assert_eq!(
-        parse_bash_major_version("GNU bash, version 5.2.37(1)-release (aarch64-apple-darwin23)\n"),
-        Some(5)
-    );
-    assert_eq!(parse_bash_major_version("unexpected"), None);
-    // macOS 標準の /bin/bash が存在する環境ではバージョン取得できること
+    // macOS 標準の /bin/bash が存在する環境ではロケール非依存でバージョン取得できること
     if std::path::Path::new("/bin/bash").is_file() {
         assert!(detect_bash_major_version("/bin/bash").is_some());
     }

@@ -624,24 +624,23 @@ pub(super) struct ShellIntegrationLaunch {
     pub(super) envs: Vec<(String, String)>,
 }
 
-/// `bash --version` の出力（例: `GNU bash, version 5.2.37(1)-release ...`）からメジャーバージョンを取得する
-pub(super) fn parse_bash_major_version(version_output: &str) -> Option<u32> {
-    let first_line = version_output.lines().next()?;
-    let after = first_line.split("version ").nth(1)?;
-    let major_str = after.split('.').next()?;
-    major_str.parse::<u32>().ok()
-}
-
+/// ロケールやユーザー設定に依存せず bash のメジャーバージョン（`BASH_VERSINFO[0]`）を取得する
 pub(super) fn detect_bash_major_version(shell: &str) -> Option<u32> {
     let out = std::process::Command::new(shell)
-        .arg("--version")
+        .env("LC_ALL", "C")
+        .args([
+            "--noprofile",
+            "--norc",
+            "-c",
+            "printf '%s' \"${BASH_VERSINFO[0]}\"",
+        ])
         .output()
         .ok()?;
     if !out.status.success() {
         return None;
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    parse_bash_major_version(&stdout)
+    stdout.trim().parse::<u32>().ok()
 }
 
 /// Ghostty 同梱のシェル統合スクリプト（OSC 133）を透過的に注入するための
