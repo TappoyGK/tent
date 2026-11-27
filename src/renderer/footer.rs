@@ -44,8 +44,11 @@ pub(super) fn compute_footer_columns(panes: &[(Rect, Option<(i64, String)>)]) ->
         .map(|(r, _)| r.bottom())
         .fold(f32::NEG_INFINITY, f32::max);
 
-    // ターミナルペインが 2 つ以上あり、最大タイムスタンプが一意なときだけ最新強調を有効化
+    // ターミナルペインが 2 つ以上あり、表示時刻（HH:MM）がすべて同じではなく、
+    // かつ最大タイムスタンプが一意なときだけ最新強調を有効化
     let mut valid_count = 0usize;
+    let mut first_label: Option<&str> = None;
+    let mut has_distinct_labels = false;
     let mut max_ts: Option<i64> = None;
     let mut max_ts_count = 0usize;
     for (_, ts_opt) in panes {
@@ -53,6 +56,11 @@ pub(super) fn compute_footer_columns(panes: &[(Rect, Option<(i64, String)>)]) ->
             && !label.is_empty()
         {
             valid_count += 1;
+            match first_label {
+                None => first_label = Some(label.as_str()),
+                Some(first) if first != label.as_str() => has_distinct_labels = true,
+                _ => {}
+            }
             match max_ts {
                 None => {
                     max_ts = Some(*micros);
@@ -69,7 +77,7 @@ pub(super) fn compute_footer_columns(panes: &[(Rect, Option<(i64, String)>)]) ->
             }
         }
     }
-    let highlight_ts = if valid_count >= 2 && max_ts_count == 1 {
+    let highlight_ts = if valid_count >= 2 && has_distinct_labels && max_ts_count == 1 {
         max_ts
     } else {
         None
@@ -348,7 +356,7 @@ mod tests {
             ]
         );
 
-        // 3. 同じ分表示（15:10）でもマイクロ秒差で後から更新されたペインが強調されること
+        // 3. すべてのペインが同じ表示時刻（15:10）のときはマイクロ秒差があっても強調しないこと
         let same_minute = vec![
             (Rect::new(0.0, 0.0, 200.0, 404.0), ts(1_000_000, "15:10")),
             (Rect::new(204.0, 0.0, 200.0, 404.0), ts(1_000_005, "15:10")),
@@ -364,7 +372,7 @@ mod tests {
                 FooterColumn {
                     x: 204.0,
                     w: 200.0,
-                    entries: vec![entry("15:10", true)],
+                    entries: vec![entry("15:10", false)],
                 },
             ]
         );
