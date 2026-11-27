@@ -633,3 +633,187 @@ fn test_independent_periodic_short_logs_do_not_trigger_completion_notification()
     assert!(pane.update_waiting_state(t64, false, Some("1")));
     assert!(pane.last_notification_sent.is_none());
 }
+
+#[test]
+fn test_word_bounds_at_screen_ascii_punctuation_and_wide_chars() {
+    use super::selection::{extract_selection_from_screen, word_bounds_at_screen};
+
+    let mut term = Terminal::new(TerminalOptions {
+        cols: 40,
+        rows: 4,
+        ..Default::default()
+    })
+    .unwrap();
+    term.vt_write(b"foo_bar(baz) \xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e test");
+
+    // 英数字 + '_' の単語
+    let (s1, e1) = word_bounds_at_screen(&term, 40, 2, 0);
+    assert_eq!(
+        extract_selection_from_screen(&term, 40, (s1, 0), (e1, 0)),
+        "foo_bar"
+    );
+
+    // 記号 '('
+    let (s2, e2) = word_bounds_at_screen(&term, 40, 7, 0);
+    assert_eq!(
+        extract_selection_from_screen(&term, 40, (s2, 0), (e2, 0)),
+        "("
+    );
+
+    // 全角文字「日本語」の右側 SpacerTail セルをクリックしても単語全体が選択されること
+    // "foo_bar(baz) " は 13 セル → "日" は col 13..14, "本" は 15..16, "語" は 17..18
+    let (s3, e3) = word_bounds_at_screen(&term, 40, 14, 0);
+    assert_eq!((s3, e3), (13, 18));
+    assert_eq!(
+        extract_selection_from_screen(&term, 40, (s3, 0), (e3, 0)),
+        "日本語"
+    );
+}
+
+#[test]
+fn test_line_bounds_at_screen_includes_soft_wrapped_lines() {
+    use super::selection::{extract_selection_from_screen, line_bounds_at_screen};
+
+    let mut term = Terminal::new(TerminalOptions {
+        cols: 5,
+        rows: 5,
+        ..Default::default()
+    })
+    .unwrap();
+    // 1行目: "first" (改行あり), 2〜4行目: "abcdefghijkl" (5文字幅で3行にソフトラップ)
+    term.vt_write(b"first\r\nabcdefghijkl\r\nlast");
+
+    // ソフトラップ中段（row=2）をクリックすると論理行全体（row=1..=3）が選択されること
+    let (start, end) = line_bounds_at_screen(&term, 5, 2);
+    assert_eq!(start, (0, 1));
+    assert_eq!(end, (4, 3));
+    assert_eq!(
+        extract_selection_from_screen(&term, 5, start, end),
+        "abcdefghijkl"
+    );
+
+    // 通常行（row=0）は 1 行のみ
+    let (s0, e0) = line_bounds_at_screen(&term, 5, 0);
+    assert_eq!(s0, (0, 0));
+    assert_eq!(e0, (4, 0));
+    assert_eq!(extract_selection_from_screen(&term, 5, s0, e0), "first");
+}
+
+#[test]
+fn test_screen_selection_across_scrollback_and_viewport_projection() {
+    use ghostty_vt::terminal::ScrollViewport;
+
+    use super::selection::{
+        extract_selection_from_screen, screen_selection_to_viewport, viewport_top_screen_row,
+    };
+
+    let mut term = Terminal::new(TerminalOptions {
+        cols: 20,
+        rows: 4,
+        ..Default::default()
+    })
+    .unwrap();
+    for i in 1..=12 {
+        term.vt_write(format!("line{i:02}\r\n").as_bytes());
+    }
+
+    // 最下部（active）でのビューポート先頭 screen_row を確認
+    let bottom_top = viewport_top_screen_row(&term);
+    assert!(bottom_top > 0);
+
+    // 上へ 5 行スクロールバックしても Screen 絶対座標の選択がズレずに抽出・投影できること
+    term.scroll_viewport(ScrollViewport::Delta(-5));
+    let scrolled_top = viewport_top_screen_row(&term);
+    assert!(scrolled_top < bottom_top);
+
+    let sel_start = (0u16, scrolled_top);
+    let sel_end = (5u16, bottom_top + 1);
+    let extracted = extract_selection_from_screen(&term, 20, sel_start, sel_end);
+    assert!(extracted.lines().count() >= 6);
+
+    // 現在のビューポートへ投影すると上端 (0, 0) から下端 (19, 3) にクリップされること
+    let proj = screen_selection_to_viewport(sel_start, sel_end, scrolled_top, 20, 4);
+    assert_eq!(proj, Some(((0, 0), (19, 3))));
+
+    // 完全に画面外の範囲は None を返すこと
+    let offscreen = screen_selection_to_viewport((0, 0), (5, 0), bottom_top, 20, 4);
+    assert_eq!(offscreen, None);
+}
+
+#[test]
+fn test_tracked_selection_survives_scrollback_pruning_and_clears_on_csi_3j() {
+    use std::path::PathBuf;
+
+    use super::TerminalPane;
+    use crate::daemon::{DaemonClient, ReplayedPane};
+
+    let mut pane = TerminalPane::attach_from_replay(
+        ReplayedPane {
+            pane_id: 1,
+            cols: 12,
+            rows: 3,
+            cwd: PathBuf::from("/tmp"),
+            replay_bytes: Vec::new(),
+        },
+        DaemonClient::dummy_for_test(),
+    )
+    .unwrap();
+    // スクロールバック上限を最小にしてページ単位の先頭パージを確実に発生させる
+    pane.terminal.set_scrollback_max_bytes(Some(1)).unwrap();
+
+    // まず十分な行数を流してパージ閾値付近まで溜める
+    let mut line_no: u32 = 0;
+    let mut batch = String::new();
+    for _ in 0..10_000 {
+        line_no += 1;
+        batch.push_str(&format!("L{line_no:06}\r\n"));
+    }
+    pane.terminal.vt_write(batch.as_bytes());
+
+    // 1. 末尾付近の行（パージ後も残る位置）と、先頭 (0, 0)（パージで消える位置）にピンを立てる
+    let vp_top = pane.viewport_top_screen_row();
+    let tail_row = vp_top.saturating_sub(2);
+    let tail_a = pane.track_screen_point((0, tail_row)).unwrap();
+    let tail_b = pane.track_screen_point((6, tail_row)).unwrap();
+    let head_pin = pane.track_screen_point((0, 0)).unwrap();
+
+    let original_tail = pane.extract_tracked_selection_text(&tail_a, &tail_b);
+    assert!(original_tail.starts_with('L'));
+    let before_tail_y = pane.resolve_tracked_point(&tail_a).unwrap().1;
+
+    // 実際にスクロールバック先頭がパージされる（head_pin が None になり tail_a の y が減少する）まで流す
+    let mut pruned = false;
+    for _ in 0..30 {
+        batch.clear();
+        for _ in 0..1_000 {
+            line_no += 1;
+            batch.push_str(&format!("L{line_no:06}\r\n"));
+        }
+        pane.terminal.vt_write(batch.as_bytes());
+        if pane.resolve_tracked_point(&head_pin).is_none() {
+            pruned = true;
+            break;
+        }
+    }
+    assert!(pruned, "scrollback head pruning must have occurred");
+
+    // 2. パージで座標が前へ詰まっても、残存行のピンは元の内容を指し続けること
+    let after_tail_y = pane.resolve_tracked_point(&tail_a).unwrap().1;
+    assert!(after_tail_y < before_tail_y);
+    assert_eq!(
+        pane.extract_tracked_selection_text(&tail_a, &tail_b),
+        original_tail
+    );
+
+    // 3. 片方の端（head_pin）だけがパージされた場合、先頭 (0, 0) へ寄せて残存部分の選択が保たれること
+    let clamped_range = pane.resolve_tracked_selection_range(&head_pin, &tail_b);
+    assert_eq!(clamped_range, Some(((0, 0), (6, after_tail_y))));
+    let partial_text = pane.extract_tracked_selection_text(&head_pin, &tail_b);
+    assert!(partial_text.ends_with(&original_tail));
+
+    // 4. CSI 3 J（スクロールバック消去）で両方消えた場合は別内容を指さず無効になること
+    pane.terminal.vt_write(b"\x1b[3J");
+    assert_eq!(pane.resolve_tracked_selection_range(&tail_a, &tail_b), None);
+    assert_eq!(pane.tracked_selection_to_viewport(&tail_a, &tail_b), None);
+    assert_eq!(pane.extract_tracked_selection_text(&tail_a, &tail_b), "");
+}

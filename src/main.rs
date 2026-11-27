@@ -30,7 +30,7 @@ use crate::layout::{AppLayout, Rect, SidebarState};
 use crate::renderer::Renderer;
 use crate::slot::Workspace;
 use crate::state::{SavedState, WindowGeometry};
-use crate::terminal_pane::{AppEvent, PaneId, UrlMatch};
+use crate::terminal_pane::{AppEvent, PaneId, TrackedGridRef, UrlMatch};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const CWD_POLL_INTERVAL: Duration = Duration::from_millis(1000);
@@ -38,6 +38,22 @@ const BATTERY_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const RESTORE_STEP_INTERVAL: Duration = Duration::from_millis(350);
 const PTY_DRAIN_BUDGET: Duration = Duration::from_millis(8);
+const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(400);
+const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(50);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionMode {
+    Char,
+    Word,
+    Line,
+}
+
+struct ClickTracker {
+    time: Instant,
+    pane_id: PaneId,
+    pos: (f32, f32),
+    count: u8,
+}
 
 struct SlotDragState {
     source_slot: usize,
@@ -49,9 +65,30 @@ struct SlotDragState {
 struct SelectionState {
     pane_id: PaneId,
     pane_rect: Rect,
-    start: (u16, u16),
-    end: (u16, u16),
+    mode: SelectionMode,
+    anchor_start: TrackedGridRef,
+    anchor_end: TrackedGridRef,
+    start: TrackedGridRef,
+    end: TrackedGridRef,
     active: bool,
+    has_dragged: bool,
+}
+
+/// ドラッグ選択中のカーソル Y 座標がペインの上下端より外に出たとき、自動スクロール行数（負=上, 正=下）を返す
+pub(crate) fn selection_autoscroll_delta(py: f32, pane_rect: Rect, cell_h: f32) -> isize {
+    if pane_rect.h <= 1.0 {
+        return 0;
+    }
+    let ch = cell_h.max(1.0);
+    if py < pane_rect.y {
+        let overshoot = ((pane_rect.y - py) / ch).floor().max(0.0) as isize;
+        -(1 + overshoot).min(4)
+    } else if py > pane_rect.bottom() {
+        let overshoot = ((py - pane_rect.bottom()) / ch).floor().max(0.0) as isize;
+        (1 + overshoot).min(4)
+    } else {
+        0
+    }
 }
 
 struct UrlBarEdit {
@@ -193,6 +230,8 @@ struct TentApp {
 
     slot_drag: Option<SlotDragState>,
     selection: Option<SelectionState>,
+    last_click: Option<ClickTracker>,
+    last_autoscroll: Instant,
     hovered_url: Option<(PaneId, UrlMatch)>,
     url_bar_edit: Option<UrlBarEdit>,
     show_help: bool,
@@ -240,6 +279,8 @@ impl TentApp {
             scroll_accum_px: 0.0,
             slot_drag: None,
             selection: None,
+            last_click: None,
+            last_autoscroll: now - AUTOSCROLL_INTERVAL,
             hovered_url: None,
             url_bar_edit: None,
             show_help: false,
@@ -455,7 +496,28 @@ impl TentApp {
                 .unwrap_or(now);
             wake_at = wake_at.min(next_sand);
         }
+        if self.can_autoscroll_selection() {
+            wake_at = wake_at.min((self.last_autoscroll + AUTOSCROLL_INTERVAL).max(now));
+        }
         event_loop.set_control_flow(ControlFlow::WaitUntil(wake_at));
+    }
+
+    fn can_autoscroll_selection(&self) -> bool {
+        let Some(sel) = &self.selection else {
+            return false;
+        };
+        if !sel.active || !sel.has_dragged {
+            return false;
+        }
+        let cell_h = self.renderer.as_ref().map(|r| r.cell_h).unwrap_or(20.0);
+        if selection_autoscroll_delta(self.cursor_pos.1, sel.pane_rect, cell_h) == 0 {
+            return false;
+        }
+        self.workspace
+            .as_ref()
+            .and_then(|ws| ws.active_slot_ref().root.as_ref())
+            .and_then(|root| root.terminal_pane(sel.pane_id))
+            .is_some_and(|pane| !pane.is_alt_screen())
     }
 
     fn pixel_to_cell(&self, pane_rect: Rect, px: f32, py: f32) -> (u16, u16) {
@@ -465,6 +527,75 @@ impl TentApp {
         let col = ((px - pane_rect.x) / renderer.cell_w).floor().max(0.0) as u16;
         let row = ((py - pane_rect.y) / renderer.cell_h).floor().max(0.0) as u16;
         (col, row)
+    }
+
+    pub(crate) fn extend_selection_to_cursor(&mut self, px: f32, py: f32) -> bool {
+        let Some(sel) = self.selection.as_ref() else {
+            return false;
+        };
+        if !sel.active {
+            return false;
+        }
+        let pid = sel.pane_id;
+        let rect = sel.pane_rect;
+        let mode = sel.mode;
+        let vp_cell = self.pixel_to_cell(rect, px, py);
+
+        let computed = self
+            .workspace
+            .as_ref()
+            .and_then(|ws| ws.active_slot_ref().root.as_ref())
+            .and_then(|root| root.terminal_pane(pid))
+            .and_then(|pane| {
+                let (anchor_start, anchor_end) =
+                    pane.resolve_tracked_selection_range(&sel.anchor_start, &sel.anchor_end)?;
+                let cur_range_old = pane.resolve_tracked_selection_range(&sel.start, &sel.end);
+                let (col, srow) = pane.viewport_cell_to_screen(vp_cell);
+                let (new_start, new_end) = match mode {
+                    SelectionMode::Char => (anchor_start, (col, srow)),
+                    SelectionMode::Word => {
+                        let (ws, we) = pane.word_bounds_at_screen(col, srow);
+                        let cur_start = (ws, srow);
+                        let cur_end = (we, srow);
+                        if (cur_start.1, cur_start.0) < (anchor_start.1, anchor_start.0) {
+                            (cur_start, anchor_end)
+                        } else {
+                            (anchor_start, cur_end)
+                        }
+                    }
+                    SelectionMode::Line => {
+                        let (ls, le) = pane.line_bounds_at_screen(srow);
+                        if ls.1 < anchor_start.1 {
+                            (ls, anchor_end)
+                        } else {
+                            (anchor_start, le)
+                        }
+                    }
+                };
+                if cur_range_old == Some((new_start, new_end)) {
+                    return Some(None);
+                }
+                let start_pin = pane.track_screen_point(new_start)?;
+                let end_pin = pane.track_screen_point(new_end)?;
+                Some(Some((start_pin, end_pin)))
+            });
+
+        match computed {
+            Some(Some((new_start, new_end))) => {
+                if let Some(sel_mut) = self.selection.as_mut() {
+                    sel_mut.start = new_start;
+                    sel_mut.end = new_end;
+                    return true;
+                }
+                false
+            }
+            Some(None) => false,
+            None => {
+                // アンカーがスクロールバックパージや CSI 3 J で消滅した場合は選択を解除
+                self.selection = None;
+                true
+            }
+        }
     }
 
     fn update_url_hover(&mut self) {
@@ -886,6 +1017,39 @@ impl ApplicationHandler<AppEvent> for TentApp {
             }
         }
 
+        // ドラッグ選択中のペイン上下端オートスクロール（ペイン外へのドラッグ時のみ）
+        if self.can_autoscroll_selection()
+            && now.duration_since(self.last_autoscroll) >= AUTOSCROLL_INTERVAL
+        {
+            self.last_autoscroll = now;
+            if let Some(sel) = &self.selection {
+                let pid = sel.pane_id;
+                let cell_h = self.renderer.as_ref().map(|r| r.cell_h).unwrap_or(20.0);
+                let delta = selection_autoscroll_delta(self.cursor_pos.1, sel.pane_rect, cell_h);
+                let mut moved = false;
+                if delta != 0
+                    && let Some(ws) = self.workspace.as_mut()
+                    && let Some(root) = ws.active_slot_mut().root.as_mut()
+                    && let Some(pane) = root.terminal_pane_mut(pid)
+                    && !pane.is_alt_screen()
+                {
+                    let before_top = pane.viewport_top_screen_row();
+                    pane.terminal
+                        .scroll_viewport(ghostty_vt::terminal::ScrollViewport::Delta(delta));
+                    let after_top = pane.viewport_top_screen_row();
+                    if after_top != before_top {
+                        pane.mark_dirty();
+                        moved = true;
+                    }
+                }
+                if moved {
+                    let (px, py) = self.cursor_pos;
+                    let _ = self.extend_selection_to_cursor(px, py);
+                    need_redraw = true;
+                }
+            }
+        }
+
         if need_redraw {
             self.request_redraw_now();
         }
@@ -986,5 +1150,28 @@ mod tests {
         assert_eq!(StatusTimerState::minutes_from_x(rect, 212.0, false), 5); // 4分 → 5分
         assert_eq!(StatusTimerState::minutes_from_x(rect, 188.0, false), 15); // 16分 → 15分
         assert_eq!(StatusTimerState::minutes_from_x(rect, 132.0, false), 45); // 44分 → 45分
+    }
+
+    #[test]
+    fn test_selection_autoscroll_delta() {
+        let pane = Rect::new(0.0, 100.0, 400.0, 300.0); // y: 100..400
+        let cell_h = 20.0;
+
+        // ペイン内部（最上行の上半分・最下行の下半分を含む）ではスクロールしない
+        assert_eq!(selection_autoscroll_delta(100.0, pane, cell_h), 0);
+        assert_eq!(selection_autoscroll_delta(105.0, pane, cell_h), 0);
+        assert_eq!(selection_autoscroll_delta(250.0, pane, cell_h), 0);
+        assert_eq!(selection_autoscroll_delta(395.0, pane, cell_h), 0);
+        assert_eq!(selection_autoscroll_delta(400.0, pane, cell_h), 0);
+
+        // ペイン上端の外は負方向（上スクロール）
+        assert_eq!(selection_autoscroll_delta(95.0, pane, cell_h), -1);
+        assert!(selection_autoscroll_delta(60.0, pane, cell_h) < -1);
+        assert_eq!(selection_autoscroll_delta(-500.0, pane, cell_h), -4);
+
+        // ペイン下端の外は正方向（下スクロール）
+        assert_eq!(selection_autoscroll_delta(405.0, pane, cell_h), 1);
+        assert!(selection_autoscroll_delta(440.0, pane, cell_h) > 1);
+        assert_eq!(selection_autoscroll_delta(1000.0, pane, cell_h), 4);
     }
 }

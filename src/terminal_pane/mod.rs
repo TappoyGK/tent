@@ -11,15 +11,20 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Local};
 use ghostty_vt::paste;
 use ghostty_vt::render::{CellIterator, RowIterator};
+pub use ghostty_vt::screen::TrackedGridRef;
 use ghostty_vt::style::RgbColor;
-use ghostty_vt::terminal::Mode;
+use ghostty_vt::terminal::{Mode, Point, PointCoordinate, PointSpace};
 use ghostty_vt::{Event as VtEvent, RenderState, Terminal, TerminalOptions};
 
 use crate::daemon::{DaemonClient, ReplayedPane};
 use crate::macos;
 
 pub use selection::UrlMatch;
-use selection::{extract_selection_from_terminal, find_url_at_cell};
+use selection::{
+    extract_selection_from_screen, extract_selection_from_terminal, find_url_at_cell,
+    line_bounds_at_screen, screen_selection_to_viewport, viewport_top_screen_row,
+    word_bounds_at_screen,
+};
 pub use snapshot::{MainScreenSnapshot, MinimapSnapshot};
 pub type PaneId = u64;
 
@@ -657,9 +662,108 @@ impl TerminalPane {
         false
     }
 
-    /// 指定のセル範囲 (col, row) から選択テキストを抽出する（Cmd+C コピー用）
+    /// 指定のセル範囲 (col, row) から選択テキストを抽出する（ビューポート座標版）
+    #[cfg(test)]
     pub fn extract_selection_text(&mut self, a: (u16, u16), b: (u16, u16)) -> String {
         extract_selection_from_terminal(&self.terminal, self.cols, self.rows, a, b)
+    }
+
+    /// 現在のビューポート先頭行の `Screen` 絶対行番号を返す
+    pub fn viewport_top_screen_row(&self) -> u32 {
+        viewport_top_screen_row(&self.terminal)
+    }
+
+    /// ビューポートセル `(col, vp_row)` をスクロールバック込みの `Screen` 絶対座標へ変換する
+    pub fn viewport_cell_to_screen(&self, cell: (u16, u16)) -> (u16, u32) {
+        let vp_top = viewport_top_screen_row(&self.terminal);
+        let col = cell.0.min(self.cols.saturating_sub(1));
+        let row = cell.1.min(self.rows.saturating_sub(1));
+        (col, vp_top.saturating_add(u32::from(row)))
+    }
+
+    /// `Screen` 絶対座標 `(col, screen_row)` に対する追跡ピン（`TrackedGridRef`）を生成する。
+    /// スクロールバック先頭パージやリフローに自動追従し、消滅した場合は無効になる。
+    pub fn track_screen_point(&self, pt: (u16, u32)) -> Option<TrackedGridRef> {
+        self.terminal
+            .track_grid_ref(Point::Screen(PointCoordinate { x: pt.0, y: pt.1 }))
+            .ok()
+    }
+
+    /// 追跡ピンを現在の `Screen` 絶対座標へ解決する（パージや `CSI 3 J` で消滅していれば `None`）
+    pub fn resolve_tracked_point(&self, pin: &TrackedGridRef) -> Option<(u16, u32)> {
+        let gr = pin.snapshot(&self.terminal).ok()??;
+        let coord = self
+            .terminal
+            .point_from_grid_ref(&gr, PointSpace::Screen)
+            .ok()??;
+        Some((coord.x, coord.y))
+    }
+
+    /// 追跡ピン 2 点から選択範囲 `(start, end)` を解決する。
+    /// 片方の端だけがスクロールバック先頭パージ等で消えた場合は、消えた端を先頭 `(0, 0)` へ寄せて
+    /// 残存部分の選択を保持する。両方消滅した場合のみ `None` を返す。
+    pub fn resolve_tracked_selection_range(
+        &self,
+        a: &TrackedGridRef,
+        b: &TrackedGridRef,
+    ) -> Option<((u16, u32), (u16, u32))> {
+        match (self.resolve_tracked_point(a), self.resolve_tracked_point(b)) {
+            (Some(pa), Some(pb)) => Some((pa, pb)),
+            (None, Some(pb)) => Some(((0, 0), pb)),
+            (Some(pa), None) => Some((pa, (0, 0))),
+            (None, None) => None,
+        }
+    }
+
+    /// 追跡ピンで指定された選択範囲からテキストを抽出する（両方消滅時は空文字列）
+    pub fn extract_tracked_selection_text(&self, a: &TrackedGridRef, b: &TrackedGridRef) -> String {
+        let Some((pa, pb)) = self.resolve_tracked_selection_range(a, b) else {
+            return String::new();
+        };
+        self.extract_screen_selection_text(pa, pb)
+    }
+
+    /// 追跡ピンで指定された選択範囲を現在のビューポート範囲へ投影する（ハイライト描画用）
+    #[cfg(test)]
+    pub fn tracked_selection_to_viewport(
+        &self,
+        a: &TrackedGridRef,
+        b: &TrackedGridRef,
+    ) -> Option<((u16, u16), (u16, u16))> {
+        let (pa, pb) = self.resolve_tracked_selection_range(a, b)?;
+        self.screen_selection_to_viewport(pa, pb)
+    }
+
+    /// `Screen` 絶対座標 `(col, screen_row)` の単語範囲 `(start_col, end_col)` を返す
+    pub fn word_bounds_at_screen(&self, col: u16, screen_row: u32) -> (u16, u16) {
+        word_bounds_at_screen(&self.terminal, self.cols, col, screen_row)
+    }
+
+    /// `Screen` 絶対座標 `screen_row` を含む論理行（ソフトラップ連結）全体の範囲を返す
+    pub fn line_bounds_at_screen(&self, screen_row: u32) -> ((u16, u32), (u16, u32)) {
+        line_bounds_at_screen(&self.terminal, self.cols, screen_row)
+    }
+
+    /// `Screen` 絶対座標の範囲から選択テキストを抽出する（Cmd+C コピー・スクロールバック跨ぎ対応）
+    pub fn extract_screen_selection_text(&self, a: (u16, u32), b: (u16, u32)) -> String {
+        extract_selection_from_screen(&self.terminal, self.cols, a, b)
+    }
+
+    /// `Screen` 絶対座標の選択範囲を現在のビューポート範囲へ投影する（ハイライト描画用）
+    pub fn screen_selection_to_viewport(
+        &self,
+        a: (u16, u32),
+        b: (u16, u32),
+    ) -> Option<((u16, u16), (u16, u16))> {
+        let vp_top = viewport_top_screen_row(&self.terminal);
+        screen_selection_to_viewport(a, b, vp_top, self.cols, self.rows)
+    }
+
+    /// 代替画面（vim / less / tmux 等）が表示中か返す
+    pub fn is_alt_screen(&self) -> bool {
+        self.terminal.mode(Mode::ALT_SCREEN_SAVE).unwrap_or(false)
+            || self.terminal.mode(Mode::ALT_SCREEN).unwrap_or(false)
+            || self.terminal.mode(Mode::ALT_SCREEN_LEGACY).unwrap_or(false)
     }
 
     /// 指定のビューポートセル (col, row) にある URL（OSC 8 ハイパーリンクまたは http/https）を返す
