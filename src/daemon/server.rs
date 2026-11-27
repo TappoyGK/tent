@@ -624,18 +624,25 @@ pub(super) struct ShellIntegrationLaunch {
     pub(super) envs: Vec<(String, String)>,
 }
 
-/// ロケールやユーザー設定に依存せず bash のメジャーバージョン（`BASH_VERSINFO[0]`）を取得する
-pub(super) fn detect_bash_major_version(shell: &str) -> Option<u32> {
-    let out = std::process::Command::new(shell)
+/// bash のメジャーバージョン（`BASH_VERSINFO[0]`）取得用コマンドへ
+/// ロケール・`BASH_ENV`・`ENV` を無効化する設定を適用する
+pub(super) fn configure_bash_version_command(cmd: &mut std::process::Command) {
+    cmd.env_remove("BASH_ENV")
+        .env_remove("ENV")
         .env("LC_ALL", "C")
         .args([
             "--noprofile",
             "--norc",
             "-c",
             "printf '%s' \"${BASH_VERSINFO[0]}\"",
-        ])
-        .output()
-        .ok()?;
+        ]);
+}
+
+/// ロケールやユーザー設定（`BASH_ENV` / `ENV` / rc）に依存せず bash のメジャーバージョンを取得する
+pub(super) fn detect_bash_major_version(shell: &str) -> Option<u32> {
+    let mut cmd = std::process::Command::new(shell);
+    configure_bash_version_command(&mut cmd);
+    let out = cmd.output().ok()?;
     if !out.status.success() {
         return None;
     }

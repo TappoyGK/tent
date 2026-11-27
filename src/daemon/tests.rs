@@ -333,11 +333,45 @@ fn test_normalize_post_handshake_event_converts_legacy_replay_to_resync() {
 
 #[test]
 fn test_build_shell_integration_launch_for_zsh_bash_fish() {
-    use super::server::{build_shell_integration_launch, detect_bash_major_version};
+    use super::server::{
+        build_shell_integration_launch, configure_bash_version_command, detect_bash_major_version,
+    };
 
-    // macOS 標準の /bin/bash が存在する環境ではロケール非依存でバージョン取得できること
+    // macOS 標準の /bin/bash が存在する環境では、BASH_ENV / ENV / 日本語ロケールが設定されていても
+    // 利用者スクリプトを実行せず数値のメジャーバージョンだけを取得できること
     if std::path::Path::new("/bin/bash").is_file() {
         assert!(detect_bash_major_version("/bin/bash").is_some());
+
+        let tmp = std::env::temp_dir().join(format!("tent-benv-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let marker = tmp.join("ran");
+        let benv = tmp.join("benv.sh");
+        let _ = std::fs::remove_file(&marker);
+        std::fs::write(
+            &benv,
+            format!("echo RAN > \"{}\"\necho noisy\n", marker.display()),
+        )
+        .unwrap();
+
+        let mut cmd = std::process::Command::new("/bin/bash");
+        cmd.env("BASH_ENV", &benv)
+            .env("ENV", &benv)
+            .env("LANG", "ja_JP.UTF-8")
+            .env("LC_ALL", "ja_JP.UTF-8");
+        configure_bash_version_command(&mut cmd);
+        let out = cmd.output().unwrap();
+        assert!(out.status.success());
+        assert!(
+            !marker.exists(),
+            "BASH_ENV script must not be executed during version detection"
+        );
+        let major = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<u32>()
+            .ok();
+        assert!(major.is_some());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     let res_dir = ghostty_vt::shell_integration::resources_dir().unwrap();
