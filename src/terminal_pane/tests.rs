@@ -403,7 +403,7 @@ fn test_osc133_split_chunks_notify_long_job_and_ignore_short_job() {
     //    OSC 133 のジョブ開始時刻は保持され、誤通知も出ないこと
     let t0 = pane.osc133_job_started_at.unwrap();
     pane.last_output_instant = Some(t0);
-    let _ = pane.update_waiting_state(t0 + WAITING_IDLE_THRESHOLD, false, Some("1"));
+    assert!(pane.update_waiting_state(t0 + WAITING_IDLE_THRESHOLD, false, Some("1")));
     assert_eq!(pane.osc133_job_started_at, Some(t0));
     assert!(pane.last_notification_sent.is_none());
     pane.feed_pty_bytes(b"\x1b]133;A\x07remote$ ", false, true, "1");
@@ -551,11 +551,11 @@ fn test_enter_started_tail_f_does_not_trigger_false_completion_notification() {
     pane.feed_pty_bytes(b"tail -f app.log\r\n[00:00] start\r\n", true, true, "1");
     pane.mark_screen_seen();
 
-    // 60秒後に裏スロットで 1 行だけログが届き、4.1 秒アイドルになっても完了通知・黄色点灯しないこと
+    // 60秒後に裏スロットで 1 行だけログが届き、4.1 秒アイドルになっても完了通知しないこと
     pane.feed_pty_bytes(b"[01:00] heartbeat\r\n", false, true, "1");
     let after_idle = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
     assert!(!pane.should_notify_background_completion(after_idle));
-    assert!(!pane.update_waiting_state(after_idle, false, Some("1")));
+    assert!(pane.update_waiting_state(after_idle, false, Some("1")));
     assert!(pane.last_notification_sent.is_none());
 }
 
@@ -592,7 +592,7 @@ fn test_active_short_command_enter_does_not_trigger_later_background_notificatio
     pane.feed_pty_bytes(b"\r\n[1]+ Done  sleep 1\r\n$ ", false, true, "1");
     let after_idle = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
     assert!(!pane.should_notify_background_completion(after_idle));
-    let _ = pane.update_waiting_state(after_idle, false, Some("1"));
+    assert!(pane.update_waiting_state(after_idle, false, Some("1")));
     assert!(pane.last_notification_sent.is_none());
 }
 
@@ -622,10 +622,10 @@ fn test_independent_periodic_short_logs_do_not_trigger_completion_notification()
     // 1. t=0: 1行目の短いログ
     pane.feed_pty_bytes(b"\r\n[00:00] heartbeat 1", false, true, "1");
 
-    // 2. t=4s: アイドル判定（1行の短いログは黄色にも通知対象にもならない）
+    // 2. t=4s: アイドル判定（通知対象外）
     let t4 = t0 + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
     assert!(!pane.should_notify_background_completion(t4));
-    assert!(!pane.update_waiting_state(t4, false, Some("1")));
+    assert!(pane.update_waiting_state(t4, false, Some("1")));
     assert!(pane.last_notification_sent.is_none());
 
     // 3. t=60s: 1分後に独立した別の1行が届く
@@ -634,7 +634,7 @@ fn test_independent_periodic_short_logs_do_not_trigger_completion_notification()
     // 4. t=64s: 1行目と合算されず、短い独立出力として通知対象外であること
     let t64 = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
     assert!(!pane.should_notify_background_completion(t64));
-    assert!(!pane.update_waiting_state(t64, false, Some("1")));
+    assert!(pane.update_waiting_state(t64, false, Some("1")));
     assert!(pane.last_notification_sent.is_none());
 }
 
@@ -879,13 +879,19 @@ fn test_minor_footer_hint_change_does_not_trigger_waiting_input_but_real_reply_d
     use super::{STARTUP_GRACE_PERIOD, TerminalPane, WAITING_IDLE_THRESHOLD};
     use crate::daemon::{DaemonClient, ReplayedPane};
 
+    // 全 12 行が埋まった TUI 画面を準備
+    let initial = (1..=8)
+        .map(|i| format!("Body line {i}"))
+        .collect::<Vec<_>>()
+        .join("\r\n")
+        + "\r\n--------\r\nhint old\r\n> \r\nauto mode on";
     let mut pane = TerminalPane::attach_from_replay(
         ReplayedPane {
             pane_id: 1,
             cols: 60,
             rows: 12,
             cwd: PathBuf::from("/tmp"),
-            replay_bytes: b"Main reply body\r\n\x1b[11;1H> \x1b[12;1Hauto mode on".to_vec(),
+            replay_bytes: initial.into_bytes(),
         },
         DaemonClient::dummy_for_test(),
     )
@@ -893,9 +899,9 @@ fn test_minor_footer_hint_change_does_not_trigger_waiting_input_but_real_reply_d
     pane.created_at = Instant::now() - STARTUP_GRACE_PERIOD - Duration::from_secs(1);
     pane.mark_screen_seen();
 
-    // 1. 下部 UI（ステータス行・入力枠・ヒント等 4 行 = 12 行中 33%）だけの書き換えでは黄色にならないこと
+    // 1. 既存非空行のうち下部 UI（4 行 = 33%）だけのその場書き換えでは黄色にならないこと
     pane.feed_pty_bytes(
-        b"\x1b[9;1H--------\x1b[10;1Hnew task? /clear\x1b[11;1H> \x1b[12;1Hauto mode on - 1 agent",
+        b"\x1b[9;1H========\x1b[10;1Hnew task? /clear\x1b[11;1H> _\x1b[12;1Hauto mode on - 1 agent",
         false,
         true,
         "1",
@@ -913,5 +919,57 @@ fn test_minor_footer_hint_change_does_not_trigger_waiting_input_but_real_reply_d
     );
     let t2 = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
     assert!(pane.update_waiting_state(t2, false, Some("1")));
+    assert!(pane.is_waiting_input);
+
+    // 3. 空き行がある画面（clear 直後など）への 1 行新規追記は黄色になること
+    pane.terminal.vt_write(b"\x1b[2J\x1b[H$ sleep 9\r\n");
+    pane.is_waiting_input = false;
+    pane.had_background_output = false;
+    pane.mark_screen_seen();
+    pane.last_output_instant = None;
+    pane.feed_pty_bytes(b"done\r\n$ ", false, true, "1");
+    let t3 = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
+    assert!(pane.update_waiting_state(t3, false, Some("1")));
+    assert!(pane.is_waiting_input);
+}
+
+#[test]
+fn test_scrolled_up_viewport_still_updates_output_timestamp_and_waiting_state() {
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    use ghostty_vt::terminal::ScrollViewport;
+
+    use super::{STARTUP_GRACE_PERIOD, TerminalPane, WAITING_IDLE_THRESHOLD};
+    use crate::daemon::{DaemonClient, ReplayedPane};
+
+    let mut initial = String::new();
+    for i in 1..=60 {
+        initial.push_str(&format!("line{i:02}\r\n"));
+    }
+    let mut pane = TerminalPane::attach_from_replay(
+        ReplayedPane {
+            pane_id: 1,
+            cols: 40,
+            rows: 10,
+            cwd: PathBuf::from("/tmp"),
+            replay_bytes: initial.into_bytes(),
+        },
+        DaemonClient::dummy_for_test(),
+    )
+    .unwrap();
+    pane.created_at = Instant::now() - STARTUP_GRACE_PERIOD - Duration::from_secs(1);
+
+    // 上へ 20 行スクロールバックして確認した状態にする
+    pane.terminal.scroll_viewport(ScrollViewport::Delta(-20));
+    pane.mark_screen_seen();
+    pane.last_output_instant = None;
+
+    // ビューポート外（アクティブ画面）に新規出力が届いても時刻・出力中・入力待ちが更新されること
+    pane.feed_pty_bytes(b"new1\r\nnew2\r\n$ ", false, true, "1");
+    assert!(pane.last_output_instant.is_some());
+    assert!(pane.had_background_output);
+    let after_idle = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
+    assert!(pane.update_waiting_state(after_idle, false, Some("1")));
     assert!(pane.is_waiting_input);
 }

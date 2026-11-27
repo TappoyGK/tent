@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Local};
 use ghostty_vt::paste;
 use ghostty_vt::render::{CellIterator, RowIterator};
+use ghostty_vt::screen::CellWide;
 pub use ghostty_vt::screen::TrackedGridRef;
 use ghostty_vt::style::RgbColor;
 use ghostty_vt::terminal::{Mode, Point, PointCoordinate, PointSpace};
@@ -34,10 +35,11 @@ const RESIZE_GRACE_PERIOD: Duration = Duration::from_secs(1);
 const WAITING_IDLE_THRESHOLD: Duration = Duration::from_secs(4);
 /// 裏スロットでの完了・入力待ち OS 通知を出すための最小実行時間（短時間ノイズ抑制）
 const BACKGROUND_NOTIFY_MIN_DURATION: Duration = Duration::from_secs(5);
-/// 裏スロットを「入力待ち（黄色）」にするために必要なビューポート最小変化割合（50% 以上）
-/// （Claude Code 等の下部 UI・ヒント・一部領域だけの書き換えによる偽陽性を防ぎ、
-/// 画面全体がスクロールする実出力のみを検知する）
+/// 裏スロットを「入力待ち（黄色）」にするために必要な、既存非空行の最小書き換え割合（50% 以上）
+/// （空行への新規追記は 1 行でも有意とみなし、Claude Code 等の下部 UI・ヒント等の一部書き換えのみ抑止する）
 const WAITING_MIN_CHANGED_PERCENT: usize = 50;
+/// 連続出力中に全行ハッシュ比較を省略する短時間ウィンドウ（高スループット維持用）
+const ACTIVE_OUTPUT_FAST_PATH: Duration = Duration::from_millis(50);
 /// DEC Mode 2026 (Synchronized Output) で描画ホールドを許可する最大時間（固まり防止）
 const SYNC_OUTPUT_MAX_HOLD: Duration = Duration::from_secs(1);
 
@@ -119,7 +121,10 @@ pub struct TerminalPane {
     osc133_tail: [u8; 6],
     osc133_tail_len: u8,
     pub is_waiting_input: bool,
-    last_seen_line_hashes: Vec<u64>,
+    last_seen_line_hashes: Vec<Option<u64>>,
+    last_seen_total_rows: usize,
+    last_active_line_hashes: Vec<Option<u64>>,
+    active_lines_dirty: bool,
     last_notification_sent: Option<Instant>,
     pub minimap: MinimapSnapshot,
     minimap_dirty: bool,
@@ -196,6 +201,9 @@ impl TerminalPane {
             osc133_tail_len: 0,
             is_waiting_input: false,
             last_seen_line_hashes: Vec::new(),
+            last_seen_total_rows: 0,
+            last_active_line_hashes: Vec::new(),
+            active_lines_dirty: true,
             last_notification_sent: None,
             minimap: MinimapSnapshot {
                 cols,
@@ -263,6 +271,9 @@ impl TerminalPane {
             osc133_tail_len: 0,
             is_waiting_input: false,
             last_seen_line_hashes: Vec::new(),
+            last_seen_total_rows: 0,
+            last_active_line_hashes: Vec::new(),
+            active_lines_dirty: true,
             last_notification_sent: None,
             minimap: MinimapSnapshot {
                 cols,
@@ -381,10 +392,15 @@ impl TerminalPane {
                     self.last_cell_px.1,
                 );
             }
-            let before_lines = self.current_line_hashes();
+            let before_total_rows = self.terminal.total_rows().unwrap_or(0);
+            let before_lines = self.current_active_line_hashes();
             self.terminal = decoded;
             self.update_cwd_from_daemon(replayed.cwd);
-            if self.current_line_hashes() != before_lines {
+            let after_total_rows = self.terminal.total_rows().unwrap_or(0);
+            let after_lines = self.current_active_line_hashes();
+            self.last_active_line_hashes = after_lines.clone();
+            self.active_lines_dirty = false;
+            if after_total_rows != before_total_rows || after_lines != before_lines {
                 self.last_output_at = Local::now();
                 self.last_output_instant = Some(Instant::now());
             }
@@ -416,10 +432,28 @@ impl TerminalPane {
         }
         let now = Instant::now();
         let osc133_completed_long = self.process_osc_133_markers(bytes, now);
-        let before_lines = self.current_line_hashes();
+        let prev_total_rows = self.terminal.total_rows().unwrap_or(0);
+        let fast_streaming = self
+            .last_output_instant
+            .is_some_and(|t| now.duration_since(t) < ACTIVE_OUTPUT_FAST_PATH)
+            && bytes.iter().any(|&b| b >= 0x20 && b != 0x7f);
+        if !fast_streaming && self.active_lines_dirty {
+            self.last_active_line_hashes = self.current_active_line_hashes();
+            self.active_lines_dirty = false;
+        }
         self.terminal.vt_write(bytes);
-        let after_lines = self.current_line_hashes();
-        let visual_changed = before_lines != after_lines;
+        let new_total_rows = self.terminal.total_rows().unwrap_or(0);
+        let visual_changed = if new_total_rows != prev_total_rows || fast_streaming {
+            self.active_lines_dirty = true;
+            true
+        } else {
+            let after_lines = self.current_active_line_hashes();
+            let changed = after_lines != self.last_active_line_hashes;
+            if changed {
+                self.last_active_line_hashes = after_lines;
+            }
+            changed
+        };
         let in_startup_grace = now.duration_since(self.created_at) < STARTUP_GRACE_PERIOD;
         let is_resize_redraw = self
             .last_resize_instant
@@ -559,13 +593,15 @@ impl TerminalPane {
         }
         // リサイズ時点で未確認の変化がなかった場合は、リサイズによる折り返し変化を
         // 「未確認の出力」と誤認しないよう基準ハッシュを新サイズへ追従させる
-        let screen_was_unseen_clean =
-            count_changed_lines(&self.last_seen_line_hashes, &self.current_line_hashes()) == 0;
+        let screen_was_unseen_clean = self.last_seen_total_rows
+            == self.terminal.total_rows().unwrap_or(0)
+            && self.current_active_line_hashes() == self.last_seen_line_hashes;
         self.cols = cols;
         self.rows = rows;
         self.last_cell_px = (cell_w_px, cell_h_px);
         self.last_resize_instant = Some(Instant::now());
         let _ = self.terminal.resize(cols, rows, cell_w_px, cell_h_px);
+        self.active_lines_dirty = true;
         if screen_was_unseen_clean {
             self.mark_screen_seen();
         }
@@ -579,32 +615,26 @@ impl TerminalPane {
             .is_some_and(|t| now.duration_since(t) < Duration::from_secs(2))
     }
 
-    /// 現在のビューポート各行の可視テキストハッシュ配列を計算する
-    /// （同一内容再描画やステータス行 1〜2 行だけの微細変化で偽陽性になるのを防ぐため）
-    pub fn current_line_hashes(&self) -> Vec<u64> {
+    /// 現在のアクティブ画面（`Point::Active`）各行の可視テキストハッシュ配列をヒープ確保なしで計算する。
+    /// 空行は `None`、非空行は `Some(hash)`。スクロールバック閲覧中でも最新出力を正確に検知できる。
+    pub fn current_active_line_hashes(&self) -> Vec<Option<u64>> {
         if self.rows == 0 || self.cols == 0 {
             return Vec::new();
         }
-        let max_col = self.cols.saturating_sub(1);
         let mut hashes = Vec::with_capacity(usize::from(self.rows));
         for row in 0..self.rows {
-            let line = extract_selection_from_terminal(
-                &self.terminal,
-                self.cols,
-                self.rows,
-                (0, row),
-                (max_col, row),
-            );
-            let mut hasher = DefaultHasher::new();
-            line.hash(&mut hasher);
-            hashes.push(hasher.finish());
+            hashes.push(hash_active_line(&self.terminal, self.cols, row));
         }
         hashes
     }
 
-    /// ユーザーがこのペインを確認した時点の各行ハッシュを記憶する
+    /// ユーザーがこのペインを確認した時点の各行ハッシュと総行数を記憶する
     pub fn mark_screen_seen(&mut self) {
-        self.last_seen_line_hashes = self.current_line_hashes();
+        let lines = self.current_active_line_hashes();
+        self.last_seen_line_hashes = lines.clone();
+        self.last_seen_total_rows = self.terminal.total_rows().unwrap_or(0);
+        self.last_active_line_hashes = lines;
+        self.active_lines_dirty = false;
     }
 
     /// ビューポート内に AI エージェントの実行中インジケータ（`esc to interrupt` 等）が表示中か判定する
@@ -662,16 +692,22 @@ impl TerminalPane {
             let should_notify = self.should_notify_background_completion(now);
             self.had_background_output = false;
             self.work_indicator_started_at = None;
-            // 確認時点から変化した行数がビューポート全体の 50% 未満なら（下部 UI・ステータス行・
-            // ヒント等の一部書き換え）、画面全体が動いていないため黄色（入力待ち）にしない。
-            // ただし実行中インジケータを伴う長時間処理の完了（should_notify）は 1 行以上の変化で通知する。
-            let cur_lines = self.current_line_hashes();
-            let changed_lines = count_changed_lines(&self.last_seen_line_hashes, &cur_lines);
-            let total_rows = usize::from(self.rows).max(1);
+            // 確認時点からの変化を以下の 2 軸で判定する:
+            // 1) 前は空行だった行への新規追記（またはスクロールによる総行数増加）: 1 行でも有意
+            // 2) 既存の非空行のその場書き換え: 画面全体の 50% 以上が動いたときのみ有意
+            //    （Claude Code 等の下部 UI・ヒント・ステータス行だけの書き換えを抑止）
+            let cur_lines = self.current_active_line_hashes();
+            let cur_total_rows = self.terminal.total_rows().unwrap_or(0);
+            let (changed_lines, appended_lines, occupied_lines) =
+                diff_line_hashes(&self.last_seen_line_hashes, &cur_lines);
+            let denom = occupied_lines.max(1);
+            let scrolled_new = cur_total_rows > self.last_seen_total_rows;
             let has_significant_change = if should_notify {
-                changed_lines >= 1
+                changed_lines >= 1 || scrolled_new
             } else {
-                changed_lines * 100 >= total_rows * WAITING_MIN_CHANGED_PERCENT
+                appended_lines >= 1
+                    || scrolled_new
+                    || changed_lines * 100 >= denom * WAITING_MIN_CHANGED_PERCENT
             };
             if !has_significant_change {
                 return false;
@@ -864,16 +900,78 @@ impl TerminalPane {
     }
 }
 
-/// 2 つの行ハッシュ配列を比較し、内容が異なる行数（長さ差を含む）を返す
-fn count_changed_lines(prev: &[u64], cur: &[u64]) -> usize {
-    let common = prev.len().min(cur.len());
-    let mut diff = prev.len().abs_diff(cur.len());
-    for i in 0..common {
-        if prev[i] != cur[i] {
-            diff += 1;
+/// アクティブ画面の 1 行をヒープ確保なしでハッシュ化する（空行なら `None`）
+fn hash_active_line(terminal: &Terminal, cols: u16, row: u16) -> Option<u64> {
+    let mut hasher = DefaultHasher::new();
+    let mut grapheme_buf = ['\0'; 16];
+    let mut pending_spaces: u16 = 0;
+    let mut has_non_space = false;
+
+    for col in 0..cols {
+        let Ok(gr) = terminal.grid_ref(Point::Active(PointCoordinate {
+            x: col,
+            y: u32::from(row),
+        })) else {
+            pending_spaces = pending_spaces.saturating_add(1);
+            continue;
+        };
+        let wide = gr
+            .cell()
+            .ok()
+            .and_then(|c| c.wide().ok())
+            .unwrap_or(CellWide::Narrow);
+        if matches!(wide, CellWide::SpacerTail | CellWide::SpacerHead) {
+            continue;
+        }
+        let len = gr.graphemes(&mut grapheme_buf).unwrap_or(0);
+        let is_space = len == 0 || (len == 1 && grapheme_buf[0] == ' ');
+        if is_space {
+            pending_spaces = pending_spaces.saturating_add(1);
+        } else {
+            if pending_spaces > 0 {
+                0u32.hash(&mut hasher);
+                pending_spaces.hash(&mut hasher);
+                pending_spaces = 0;
+            }
+            for &ch in &grapheme_buf[..len] {
+                ch.hash(&mut hasher);
+            }
+            has_non_space = true;
         }
     }
-    diff
+
+    has_non_space.then(|| hasher.finish())
+}
+
+/// 2 つの行ハッシュ配列を比較し、`(変化した総行数, 空行から非空行へ追記された行数, 非空行数)` を返す
+fn diff_line_hashes(prev: &[Option<u64>], cur: &[Option<u64>]) -> (usize, usize, usize) {
+    let common = prev.len().min(cur.len());
+    let mut changed = prev.len().abs_diff(cur.len());
+    let mut appended = 0;
+    let mut occupied = 0;
+    for i in 0..common {
+        if prev[i].is_some() || cur[i].is_some() {
+            occupied += 1;
+        }
+        if prev[i] != cur[i] {
+            changed += 1;
+            if prev[i].is_none() && cur[i].is_some() {
+                appended += 1;
+            }
+        }
+    }
+    for item in cur.iter().skip(common) {
+        if item.is_some() {
+            occupied += 1;
+            appended += 1;
+        }
+    }
+    for item in prev.iter().skip(common) {
+        if item.is_some() {
+            occupied += 1;
+        }
+    }
+    (changed, appended, occupied)
 }
 
 pub fn extract_folder_name(path: &Path) -> String {
