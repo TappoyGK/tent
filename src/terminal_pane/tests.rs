@@ -403,7 +403,7 @@ fn test_osc133_split_chunks_notify_long_job_and_ignore_short_job() {
     //    OSC 133 のジョブ開始時刻は保持され、誤通知も出ないこと
     let t0 = pane.osc133_job_started_at.unwrap();
     pane.last_output_instant = Some(t0);
-    assert!(pane.update_waiting_state(t0 + WAITING_IDLE_THRESHOLD, false, Some("1")));
+    let _ = pane.update_waiting_state(t0 + WAITING_IDLE_THRESHOLD, false, Some("1"));
     assert_eq!(pane.osc133_job_started_at, Some(t0));
     assert!(pane.last_notification_sent.is_none());
     pane.feed_pty_bytes(b"\x1b]133;A\x07remote$ ", false, true, "1");
@@ -511,8 +511,12 @@ fn test_continuous_output_pause_without_completion_boundary_does_not_notify() {
     pane.mark_screen_seen();
 
     // 出力が続いたあとに 4.1 秒出力が止まっても、完了境界がなければ OS 通知しないこと
-    pane.feed_pty_bytes(b"Compiling a\r\n", false, true, "1");
-    pane.feed_pty_bytes(b"Compiling b\r\n", false, true, "1");
+    pane.feed_pty_bytes(
+        b"Compiling a\r\nCompiling b\r\nCompiling c\r\n",
+        false,
+        true,
+        "1",
+    );
     let after_idle = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
     assert!(!pane.should_notify_background_completion(after_idle));
     assert!(pane.update_waiting_state(after_idle, false, Some("1")));
@@ -547,11 +551,11 @@ fn test_enter_started_tail_f_does_not_trigger_false_completion_notification() {
     pane.feed_pty_bytes(b"tail -f app.log\r\n[00:00] start\r\n", true, true, "1");
     pane.mark_screen_seen();
 
-    // 60秒後に裏スロットで 1 行だけログが届き、4.1 秒アイドルになっても完了通知しないこと
+    // 60秒後に裏スロットで 1 行だけログが届き、4.1 秒アイドルになっても完了通知・黄色点灯しないこと
     pane.feed_pty_bytes(b"[01:00] heartbeat\r\n", false, true, "1");
     let after_idle = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
     assert!(!pane.should_notify_background_completion(after_idle));
-    assert!(pane.update_waiting_state(after_idle, false, Some("1")));
+    assert!(!pane.update_waiting_state(after_idle, false, Some("1")));
     assert!(pane.last_notification_sent.is_none());
 }
 
@@ -588,7 +592,7 @@ fn test_active_short_command_enter_does_not_trigger_later_background_notificatio
     pane.feed_pty_bytes(b"\r\n[1]+ Done  sleep 1\r\n$ ", false, true, "1");
     let after_idle = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
     assert!(!pane.should_notify_background_completion(after_idle));
-    assert!(pane.update_waiting_state(after_idle, false, Some("1")));
+    let _ = pane.update_waiting_state(after_idle, false, Some("1"));
     assert!(pane.last_notification_sent.is_none());
 }
 
@@ -618,10 +622,10 @@ fn test_independent_periodic_short_logs_do_not_trigger_completion_notification()
     // 1. t=0: 1行目の短いログ
     pane.feed_pty_bytes(b"\r\n[00:00] heartbeat 1", false, true, "1");
 
-    // 2. t=4s: アイドル判定（通知対象外）
+    // 2. t=4s: アイドル判定（1行の短いログは黄色にも通知対象にもならない）
     let t4 = t0 + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
     assert!(!pane.should_notify_background_completion(t4));
-    assert!(pane.update_waiting_state(t4, false, Some("1")));
+    assert!(!pane.update_waiting_state(t4, false, Some("1")));
     assert!(pane.last_notification_sent.is_none());
 
     // 3. t=60s: 1分後に独立した別の1行が届く
@@ -630,7 +634,7 @@ fn test_independent_periodic_short_logs_do_not_trigger_completion_notification()
     // 4. t=64s: 1行目と合算されず、短い独立出力として通知対象外であること
     let t64 = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
     assert!(!pane.should_notify_background_completion(t64));
-    assert!(pane.update_waiting_state(t64, false, Some("1")));
+    assert!(!pane.update_waiting_state(t64, false, Some("1")));
     assert!(pane.last_notification_sent.is_none());
 }
 
@@ -816,4 +820,98 @@ fn test_tracked_selection_survives_scrollback_pruning_and_clears_on_csi_3j() {
     assert_eq!(pane.resolve_tracked_selection_range(&tail_a, &tail_b), None);
     assert_eq!(pane.tracked_selection_to_viewport(&tail_a, &tail_b), None);
     assert_eq!(pane.extract_tracked_selection_text(&tail_a, &tail_b), "");
+}
+
+#[test]
+fn test_invisible_pty_redraw_does_not_update_timestamp_or_active_state() {
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    use super::{STARTUP_GRACE_PERIOD, TerminalPane};
+    use crate::daemon::{DaemonClient, ReplayedPane};
+
+    let mut pane = TerminalPane::attach_from_replay(
+        ReplayedPane {
+            pane_id: 1,
+            cols: 60,
+            rows: 10,
+            cwd: PathBuf::from("/tmp"),
+            replay_bytes: b"done 18:39\r\n> ".to_vec(),
+        },
+        DaemonClient::dummy_for_test(),
+    )
+    .unwrap();
+    pane.created_at = Instant::now() - STARTUP_GRACE_PERIOD - Duration::from_secs(1);
+    pane.mark_screen_seen();
+    let old_ts = pane.last_output_at - chrono::TimeDelta::minutes(90);
+    pane.last_output_at = old_ts;
+    pane.last_output_instant = None;
+
+    // 1. タイトル更新・カーソル表示切替・同一内容の再描画では時刻も出力中フラグも更新されないこと
+    pane.feed_pty_bytes(
+        b"\x1b]0;Claude Code\x07\x1b[?25l\x1b[?25h",
+        false,
+        true,
+        "1",
+    );
+    pane.feed_pty_bytes(
+        b"\x1b[?2026h\x1b[1;1Hdone 18:39\x1b[?2026l",
+        false,
+        true,
+        "1",
+    );
+    assert_eq!(pane.last_output_at, old_ts);
+    assert_eq!(pane.last_output_instant, None);
+    assert!(!pane.had_background_output);
+
+    // 2. 実際に可視テキストが変わる出力が来たら時刻と出力中フラグが更新されること
+    pane.feed_pty_bytes(b"\r\nnew response line", false, true, "1");
+    assert!(pane.last_output_at > old_ts);
+    assert!(pane.last_output_instant.is_some());
+    assert!(pane.had_background_output);
+}
+
+#[test]
+fn test_minor_footer_hint_change_does_not_trigger_waiting_input_but_real_reply_does() {
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    use super::{STARTUP_GRACE_PERIOD, TerminalPane, WAITING_IDLE_THRESHOLD};
+    use crate::daemon::{DaemonClient, ReplayedPane};
+
+    let mut pane = TerminalPane::attach_from_replay(
+        ReplayedPane {
+            pane_id: 1,
+            cols: 60,
+            rows: 12,
+            cwd: PathBuf::from("/tmp"),
+            replay_bytes: b"Main reply body\r\n\x1b[11;1H> \x1b[12;1Hauto mode on".to_vec(),
+        },
+        DaemonClient::dummy_for_test(),
+    )
+    .unwrap();
+    pane.created_at = Instant::now() - STARTUP_GRACE_PERIOD - Duration::from_secs(1);
+    pane.mark_screen_seen();
+
+    // 1. 最下段のステータス行・ヒント 1〜2 行だけの書き換えでは黄色（入力待ち）にならないこと
+    pane.feed_pty_bytes(
+        b"\x1b[10;1Hnew task? /clear\x1b[12;1Hauto mode on - 1 agent",
+        false,
+        true,
+        "1",
+    );
+    let t1 = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
+    assert!(!pane.update_waiting_state(t1, false, Some("1")));
+    assert!(!pane.is_waiting_input);
+
+    // 2. 3 行以上の実出力（AI の返答等）があれば黄色（入力待ち）になること
+    pane.feed_pty_bytes(
+        b"\x1b[2;1HReply line 1\x1b[3;1HReply line 2\x1b[4;1HReply line 3",
+        false,
+        true,
+        "1",
+    );
+    let t2 = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
+    assert!(pane.update_waiting_state(t2, false, Some("1")));
+    assert!(pane.is_waiting_input);
 }

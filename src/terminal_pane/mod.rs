@@ -34,6 +34,9 @@ const RESIZE_GRACE_PERIOD: Duration = Duration::from_secs(1);
 const WAITING_IDLE_THRESHOLD: Duration = Duration::from_secs(4);
 /// 裏スロットでの完了・入力待ち OS 通知を出すための最小実行時間（短時間ノイズ抑制）
 const BACKGROUND_NOTIFY_MIN_DURATION: Duration = Duration::from_secs(5);
+/// 裏スロットを「入力待ち（黄色）」にするために必要な最小変化行数
+/// （Claude Code 等のアイドル時ステータス行・ヒント 1〜2 行だけの書き換えによる偽陽性を防ぐ）
+const WAITING_MIN_CHANGED_LINES: usize = 3;
 /// DEC Mode 2026 (Synchronized Output) で描画ホールドを許可する最大時間（固まり防止）
 const SYNC_OUTPUT_MAX_HOLD: Duration = Duration::from_secs(1);
 
@@ -115,7 +118,7 @@ pub struct TerminalPane {
     osc133_tail: [u8; 6],
     osc133_tail_len: u8,
     pub is_waiting_input: bool,
-    last_seen_screen_hash: u64,
+    last_seen_line_hashes: Vec<u64>,
     last_notification_sent: Option<Instant>,
     pub minimap: MinimapSnapshot,
     minimap_dirty: bool,
@@ -191,7 +194,7 @@ impl TerminalPane {
             osc133_tail: [0; 6],
             osc133_tail_len: 0,
             is_waiting_input: false,
-            last_seen_screen_hash: 0,
+            last_seen_line_hashes: Vec::new(),
             last_notification_sent: None,
             minimap: MinimapSnapshot {
                 cols,
@@ -258,7 +261,7 @@ impl TerminalPane {
             osc133_tail: [0; 6],
             osc133_tail_len: 0,
             is_waiting_input: false,
-            last_seen_screen_hash: 0,
+            last_seen_line_hashes: Vec::new(),
             last_notification_sent: None,
             minimap: MinimapSnapshot {
                 cols,
@@ -377,10 +380,13 @@ impl TerminalPane {
                     self.last_cell_px.1,
                 );
             }
+            let before_lines = self.current_line_hashes();
             self.terminal = decoded;
             self.update_cwd_from_daemon(replayed.cwd);
-            self.last_output_at = Local::now();
-            self.last_output_instant = Some(Instant::now());
+            if self.current_line_hashes() != before_lines {
+                self.last_output_at = Local::now();
+                self.last_output_instant = Some(Instant::now());
+            }
             self.mark_dirty();
         }
     }
@@ -409,22 +415,29 @@ impl TerminalPane {
         }
         let now = Instant::now();
         let osc133_completed_long = self.process_osc_133_markers(bytes, now);
+        let before_lines = self.current_line_hashes();
         self.terminal.vt_write(bytes);
+        let after_lines = self.current_line_hashes();
+        let visual_changed = before_lines != after_lines;
         let in_startup_grace = now.duration_since(self.created_at) < STARTUP_GRACE_PERIOD;
         let is_resize_redraw = self
             .last_resize_instant
             .is_some_and(|t| now.duration_since(t) < RESIZE_GRACE_PERIOD);
         if !is_resize_redraw {
-            self.last_output_at = Local::now();
-            self.last_output_instant = Some(now);
-            self.is_waiting_input = false;
-            // 処理が再開して新規出力が流れた場合は古い通知フラグを解除する
-            // （同一チャンク内に新規通知・BEL が含まれていれば後段で再点灯する）
-            self.has_notification = false;
-            if !is_active && !in_startup_grace {
-                self.had_background_output = true;
-                if self.has_active_work_indicator() {
-                    self.work_indicator_started_at.get_or_insert(now);
+            // 画面上の可視テキストが実際に変わったときだけ最終更新時刻・出力中状態を更新する
+            // （カーソル点滅・OSCタイトル更新・同一内容のMode 2026再描画による偽陽性を防ぐ）
+            if visual_changed {
+                self.last_output_at = Local::now();
+                self.last_output_instant = Some(now);
+                self.is_waiting_input = false;
+                // 処理が再開して新規出力が流れた場合は古い通知フラグを解除する
+                // （同一チャンク内に新規通知・BEL が含まれていれば後段で再点灯する）
+                self.has_notification = false;
+                if !is_active && !in_startup_grace {
+                    self.had_background_output = true;
+                    if self.has_active_work_indicator() {
+                        self.work_indicator_started_at.get_or_insert(now);
+                    }
                 }
             }
         } else if !self.had_background_output {
@@ -545,7 +558,8 @@ impl TerminalPane {
         }
         // リサイズ時点で未確認の変化がなかった場合は、リサイズによる折り返し変化を
         // 「未確認の出力」と誤認しないよう基準ハッシュを新サイズへ追従させる
-        let screen_was_unseen_clean = self.current_screen_hash() == self.last_seen_screen_hash;
+        let screen_was_unseen_clean =
+            count_changed_lines(&self.last_seen_line_hashes, &self.current_line_hashes()) == 0;
         self.cols = cols;
         self.rows = rows;
         self.last_cell_px = (cell_w_px, cell_h_px);
@@ -564,27 +578,32 @@ impl TerminalPane {
             .is_some_and(|t| now.duration_since(t) < Duration::from_secs(2))
     }
 
-    /// 現在のビューポート上の可視テキスト全体のハッシュを計算する
-    /// （カーソル点滅や同一内容の再描画で「入力待ち」が誤復活するのを防ぐため）
-    pub fn current_screen_hash(&mut self) -> u64 {
+    /// 現在のビューポート各行の可視テキストハッシュ配列を計算する
+    /// （同一内容再描画やステータス行 1〜2 行だけの微細変化で偽陽性になるのを防ぐため）
+    pub fn current_line_hashes(&self) -> Vec<u64> {
         if self.rows == 0 || self.cols == 0 {
-            return 0;
+            return Vec::new();
         }
-        let text = extract_selection_from_terminal(
-            &self.terminal,
-            self.cols,
-            self.rows,
-            (0, 0),
-            (self.cols.saturating_sub(1), self.rows.saturating_sub(1)),
-        );
-        let mut hasher = DefaultHasher::new();
-        text.hash(&mut hasher);
-        hasher.finish()
+        let max_col = self.cols.saturating_sub(1);
+        let mut hashes = Vec::with_capacity(usize::from(self.rows));
+        for row in 0..self.rows {
+            let line = extract_selection_from_terminal(
+                &self.terminal,
+                self.cols,
+                self.rows,
+                (0, row),
+                (max_col, row),
+            );
+            let mut hasher = DefaultHasher::new();
+            line.hash(&mut hasher);
+            hashes.push(hasher.finish());
+        }
+        hashes
     }
 
-    /// ユーザーがこのペインを確認した時点の画面内容を記憶する
+    /// ユーザーがこのペインを確認した時点の各行ハッシュを記憶する
     pub fn mark_screen_seen(&mut self) {
-        self.last_seen_screen_hash = self.current_screen_hash();
+        self.last_seen_line_hashes = self.current_line_hashes();
     }
 
     /// ビューポート内に AI エージェントの実行中インジケータ（`esc to interrupt` 等）が表示中か判定する
@@ -642,9 +661,17 @@ impl TerminalPane {
             let should_notify = self.should_notify_background_completion(now);
             self.had_background_output = false;
             self.work_indicator_started_at = None;
-            // 最後に確認した時点から可視テキストが一切変わっていなければ（カーソル点滅・同一再描画等）黄色にしない
-            let cur_hash = self.current_screen_hash();
-            if cur_hash == self.last_seen_screen_hash {
+            // 確認時点から変化した行数がしきい値未満なら（カーソル点滅・ステータス行やヒント 1〜2 行の
+            // 微細な再描画など）、人間目線で有意な変化がないため黄色（入力待ち）にしない。
+            // ただし実行中インジケータを伴う長時間処理の完了（should_notify）は 1 行以上の変化で通知する。
+            let cur_lines = self.current_line_hashes();
+            let changed_lines = count_changed_lines(&self.last_seen_line_hashes, &cur_lines);
+            let min_changed = if should_notify {
+                1
+            } else {
+                WAITING_MIN_CHANGED_LINES.min(usize::from(self.rows).max(1))
+            };
+            if changed_lines < min_changed {
                 return false;
             }
             if !self.is_waiting_input {
@@ -833,6 +860,18 @@ impl TerminalPane {
             false
         }
     }
+}
+
+/// 2 つの行ハッシュ配列を比較し、内容が異なる行数（長さ差を含む）を返す
+fn count_changed_lines(prev: &[u64], cur: &[u64]) -> usize {
+    let common = prev.len().min(cur.len());
+    let mut diff = prev.len().abs_diff(cur.len());
+    for i in 0..common {
+        if prev[i] != cur[i] {
+            diff += 1;
+        }
+    }
+    diff
 }
 
 pub fn extract_folder_name(path: &Path) -> String {
