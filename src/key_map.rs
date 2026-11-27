@@ -25,17 +25,18 @@ pub enum AppShortcut {
     SplitHorizontal, // Cmd+Shift+D (上下分割: iTerm2互換)
     ClosePane,       // Cmd+W
     FocusPane(FocusDir),
-    ToggleBrowser,  // Cmd+B (スロットのターミナル⇔ブラウザ切替)
-    SplitBrowser,   // Cmd+Shift+B (ブラウザペインを左右分割で追加)
-    FocusUrlBar,    // Cmd+L (URLバーにフォーカス)
-    ReloadBrowser,  // Cmd+R (ブラウザ再読み込み)
-    BrowserBack,    // Cmd+Left / スワイプ戻る
-    BrowserForward, // Cmd+Right / スワイプ進む
-    RestartApp,     // Cmd+Opt+R (TenT 本体再起動)
-    ToggleHelp,     // Cmd+/ / Cmd+? (ショートカットヘルプ)
-    Copy,           // Cmd+C
-    Paste,          // Cmd+V
-    ClearScreen,    // Cmd+K (画面・スクロールバッククリア)
+    ResizePane(FocusDir), // Cmd+Ctrl+Arrow (分割ペイン境界リサイズ)
+    ToggleBrowser,        // Cmd+B (スロットのターミナル⇔ブラウザ切替)
+    SplitBrowser,         // Cmd+Shift+B (ブラウザペインを左右分割で追加)
+    FocusUrlBar,          // Cmd+L (URLバーにフォーカス)
+    ReloadBrowser,        // Cmd+R (ブラウザ再読み込み)
+    BrowserBack,          // Cmd+Left / スワイプ戻る
+    BrowserForward,       // Cmd+Right / スワイプ進む
+    RestartApp,           // Cmd+Opt+R (TenT 本体再起動)
+    ToggleHelp,           // Cmd+/ / Cmd+? (ショートカットヘルプ)
+    Copy,                 // Cmd+C
+    Paste,                // Cmd+V
+    ClearScreen,          // Cmd+K (画面・スクロールバッククリア)
 }
 
 /// Cmd+1..9/0、Cmd+Opt+1/2、Cmd+\、iTerm2互換ペイン操作、ブラウザ操作、Cmd+C/V を判定する
@@ -43,12 +44,25 @@ pub fn match_app_shortcut(event: &KeyEvent, mods: ModifiersState) -> Option<AppS
     if event.state != ElementState::Pressed {
         return None;
     }
-    if !mods.super_key() || mods.control_key() {
+    if !mods.super_key() {
         return None;
     }
     let PhysicalKey::Code(code) = event.physical_key else {
         return None;
     };
+
+    if mods.control_key() {
+        if mods.shift_key() || mods.alt_key() {
+            return None;
+        }
+        return match code {
+            KeyCode::ArrowLeft => Some(AppShortcut::ResizePane(FocusDir::Left)),
+            KeyCode::ArrowRight => Some(AppShortcut::ResizePane(FocusDir::Right)),
+            KeyCode::ArrowUp => Some(AppShortcut::ResizePane(FocusDir::Up)),
+            KeyCode::ArrowDown => Some(AppShortcut::ResizePane(FocusDir::Down)),
+            _ => None,
+        };
+    }
 
     if mods.shift_key() && !mods.alt_key() {
         return match code {

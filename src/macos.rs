@@ -376,16 +376,25 @@ pub fn install_app_icon() {
 #[cfg(not(target_os = "macos"))]
 pub fn install_app_icon() {}
 
-#[cfg(target_os = "macos")]
-static TERMINAL_POINTER_CURSOR: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// アプリ側で指定するカーソル種別（`WinitView::resetCursorRects` 差し替え用）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AppCursorKind {
+    Default = 0,
+    Pointer = 1,
+    EwResize = 2,
+    NsResize = 3,
+}
 
-/// ターミナル領域で `Cmd+Hover` URL ポインタカーソルを使うか更新する
-pub fn set_terminal_pointer_cursor(pointer: bool) {
+#[cfg(target_os = "macos")]
+static APP_CURSOR_KIND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// `WinitView::resetCursorRects` で使用するカーソル種別を更新する
+pub fn set_app_cursor_kind(kind: AppCursorKind) {
     #[cfg(target_os = "macos")]
-    TERMINAL_POINTER_CURSOR.store(pointer, std::sync::atomic::Ordering::Relaxed);
+    APP_CURSOR_KIND.store(kind as u8, std::sync::atomic::Ordering::Relaxed);
     #[cfg(not(target_os = "macos"))]
-    let _ = pointer;
+    let _ = kind;
 }
 
 /// 2D 軸平行矩形 `bounds` から複数の除外矩形 `cuts` を差し引いた非重複矩形群を返す
@@ -470,17 +479,18 @@ pub fn install_cursor_rect_passthrough(window: &winit::window::Window) {
             }
         }
 
-        // 注: winit の resetCursorRects を直接差し替えるため、現状 TenT が使用する
-        // Pointer / Default の 2 状態のみを TERMINAL_POINTER_CURSOR で反映している。
+        // 注: winit の resetCursorRects を直接差し替えるため、TenT が使用する
+        // Default / Pointer / EwResize / NsResize を APP_CURSOR_KIND で反映している。
         // 今後ほかのカーソルアイコンや set_cursor_visible(false) を使う場合はここも合わせて拡張する。
         let Some(cursor_cls) = AnyClass::get(c"NSCursor") else {
             return;
         };
         let cursor: *mut AnyObject =
-            if TERMINAL_POINTER_CURSOR.load(std::sync::atomic::Ordering::Relaxed) {
-                unsafe { msg_send![cursor_cls, pointingHandCursor] }
-            } else {
-                unsafe { msg_send![cursor_cls, arrowCursor] }
+            match APP_CURSOR_KIND.load(std::sync::atomic::Ordering::Relaxed) {
+                1 => unsafe { msg_send![cursor_cls, pointingHandCursor] },
+                2 => unsafe { msg_send![cursor_cls, resizeLeftRightCursor] },
+                3 => unsafe { msg_send![cursor_cls, resizeUpDownCursor] },
+                _ => unsafe { msg_send![cursor_cls, arrowCursor] },
             };
         if cursor.is_null() {
             return;
