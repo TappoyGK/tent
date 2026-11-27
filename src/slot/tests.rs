@@ -78,3 +78,96 @@ fn test_session_restore_never_duplicates_browser_pane_ids() {
         "browser pane IDs must be unique across slots: {ids:?}"
     );
 }
+
+#[test]
+fn test_pane_divider_hit_test_drag_resize_keyboard_resize_and_persistence() {
+    use crate::browser::BrowserPaneMeta;
+    use crate::slot::{Pane, PaneNode, SplitAxis, ratio_from_pointer};
+    use crate::state::SavedPaneTree;
+
+    // 左 (id=1) と右 (上 id=2, 下 id=3) の入れ子分割木を構築
+    let mut tree = PaneNode::Split {
+        axis: SplitAxis::Vertical,
+        ratio: 0.5,
+        first: Box::new(PaneNode::Leaf(Pane::Browser(Box::new(BrowserPaneMeta {
+            id: 1,
+            url: "https://a.example".to_string(),
+            title: String::new(),
+            is_playing_audio: false,
+        })))),
+        second: Box::new(PaneNode::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: 0.5,
+            first: Box::new(PaneNode::Leaf(Pane::Browser(Box::new(BrowserPaneMeta {
+                id: 2,
+                url: "https://b.example".to_string(),
+                title: String::new(),
+                is_playing_audio: false,
+            })))),
+            second: Box::new(PaneNode::Leaf(Pane::Browser(Box::new(BrowserPaneMeta {
+                id: 3,
+                url: "https://c.example".to_string(),
+                title: String::new(),
+                is_playing_audio: false,
+            })))),
+        }),
+    };
+
+    let area = Rect::new(0.0, 0.0, 1006.0, 606.0);
+    let gap = 6.0;
+
+    // 1. ルート垂直境界線（x = 500..506, 中心 503）へのヒットテスト
+    let v_div = tree
+        .hit_test_divider(area, gap, 5.0, 503.0, 300.0)
+        .expect("vertical divider hit");
+    assert_eq!(v_div.axis, SplitAxis::Vertical);
+    assert!(v_div.path.is_empty());
+
+    // 2. 右側内の水平境界線（y = 300..306, 中心 303）へのヒットテスト
+    let h_div = tree
+        .hit_test_divider(area, gap, 5.0, 750.0, 303.0)
+        .expect("horizontal divider hit");
+    assert_eq!(h_div.axis, SplitAxis::Horizontal);
+    assert_eq!(h_div.path, vec![true]);
+
+    // 3. ドラッグによる比率算出＆更新（範囲クランプ 0.1..=0.9）
+    let new_v = ratio_from_pointer(v_div.axis, v_div.parent_rect, gap, 303.0, 300.0);
+    assert!((new_v - 0.3).abs() < 0.01);
+    assert!(tree.set_split_ratio(&v_div.path, new_v));
+    assert_eq!(
+        ratio_from_pointer(v_div.axis, v_div.parent_rect, gap, -50.0, 300.0),
+        0.1
+    );
+    assert_eq!(
+        ratio_from_pointer(v_div.axis, v_div.parent_rect, gap, 2000.0, 300.0),
+        0.9
+    );
+
+    // 4. キーボード操作による比率調整（id=2 に最も近い Horizontal 分割を +0.1 調整）
+    assert!(tree.resize_pane_axis(2, SplitAxis::Horizontal, 0.1));
+    // id=2 に最も近い Vertical 分割（ルート）を +0.05 調整
+    assert!(tree.resize_pane_axis(2, SplitAxis::Vertical, 0.05));
+
+    // 5. state.conf 形式（SavedPaneTree::encode / decode）で比率が保存・復元されること
+    let encoded = tree.to_saved_tree().encode();
+    let decoded = SavedPaneTree::decode(&encoded).expect("decode saved tree");
+    match decoded {
+        SavedPaneTree::Split {
+            axis: SplitAxis::Vertical,
+            ratio: r_v,
+            second,
+            ..
+        } => {
+            assert!((r_v - 0.35).abs() < 0.01);
+            match *second {
+                SavedPaneTree::Split {
+                    axis: SplitAxis::Horizontal,
+                    ratio: r_h,
+                    ..
+                } => assert!((r_h - 0.6).abs() < 0.01),
+                other => panic!("expected horizontal split, got {other:?}"),
+            }
+        }
+        other => panic!("expected vertical split, got {other:?}"),
+    }
+}

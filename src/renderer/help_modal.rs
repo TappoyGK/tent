@@ -112,6 +112,7 @@ impl Renderer {
                     "  Cmd+W            ペイン / ブラウザを閉じる\n",
                     "  Cmd+[ / Cmd+]    前後のペインへ移動\n",
                     "  Cmd+Opt+Arrow    方向指定でペイン移動\n",
+                    "  Cmd+Ctrl+Arrow   分割ペイン境界をリサイズ\n",
                 );
                 let right_text = concat!(
                     "[ Browser ]\n",

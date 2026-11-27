@@ -15,6 +15,30 @@ pub enum SplitAxis {
     Horizontal,
 }
 
+/// 分割ペイン間の境界線情報（マウスホバー・ドラッグリサイズ用）
+#[derive(Clone, Debug)]
+pub struct SplitDivider {
+    /// ルートから対象 `PaneNode::Split` までの経路（false = first, true = second）
+    pub path: Vec<bool>,
+    pub axis: SplitAxis,
+    /// 対象 `Split` ノードが占有する親領域矩形
+    pub parent_rect: Rect,
+}
+
+/// ドラッグ中のポインタ座標から分割比率（`0.1..=0.9`）を算出する
+pub fn ratio_from_pointer(axis: SplitAxis, parent_rect: Rect, gap: f32, px: f32, py: f32) -> f32 {
+    match axis {
+        SplitAxis::Vertical => {
+            let avail = (parent_rect.w - gap).max(2.0);
+            ((px - parent_rect.x - gap * 0.5) / avail).clamp(0.1, 0.9)
+        }
+        SplitAxis::Horizontal => {
+            let avail = (parent_rect.h - gap).max(2.0);
+            ((py - parent_rect.y - gap * 0.5) / avail).clamp(0.1, 0.9)
+        }
+    }
+}
+
 /// スロットの表示モード（ペイン分割ビュー ⇔ スロット専用フルブラウザ）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SlotViewMode {
@@ -202,6 +226,175 @@ impl PaneNode {
                 };
                 first.compute_rects(r1, gap, out);
                 second.compute_rects(r2, gap, out);
+            }
+        }
+    }
+
+    /// 指定座標 `(px, py)` が分割境界線（幅 `hit_half_thickness * 2`）上にあれば該当境界情報を返す
+    pub fn hit_test_divider(
+        &self,
+        area: Rect,
+        gap: f32,
+        hit_half_thickness: f32,
+        px: f32,
+        py: f32,
+    ) -> Option<SplitDivider> {
+        let mut path = Vec::new();
+        self.hit_test_divider_inner(area, gap, hit_half_thickness, px, py, &mut path)
+    }
+
+    fn hit_test_divider_inner(
+        &self,
+        area: Rect,
+        gap: f32,
+        hit_half_thickness: f32,
+        px: f32,
+        py: f32,
+        path: &mut Vec<bool>,
+    ) -> Option<SplitDivider> {
+        let PaneNode::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } = self
+        else {
+            return None;
+        };
+
+        let half = hit_half_thickness.max(gap * 0.5);
+        let (r1, r2, hit_rect) = match axis {
+            SplitAxis::Vertical => {
+                let avail = (area.w - gap).max(2.0);
+                let w1 = (avail * *ratio).max(1.0);
+                let w2 = (avail - w1).max(1.0);
+                let center_x = area.x + w1 + gap * 0.5;
+                (
+                    Rect::new(area.x, area.y, w1, area.h),
+                    Rect::new(area.x + w1 + gap, area.y, w2, area.h),
+                    Rect::new(center_x - half, area.y, half * 2.0, area.h),
+                )
+            }
+            SplitAxis::Horizontal => {
+                let avail = (area.h - gap).max(2.0);
+                let h1 = (avail * *ratio).max(1.0);
+                let h2 = (avail - h1).max(1.0);
+                let center_y = area.y + h1 + gap * 0.5;
+                (
+                    Rect::new(area.x, area.y, area.w, h1),
+                    Rect::new(area.x, area.y + h1 + gap, area.w, h2),
+                    Rect::new(area.x, center_y - half, area.w, half * 2.0),
+                )
+            }
+        };
+
+        if hit_rect.contains(px, py) {
+            return Some(SplitDivider {
+                path: path.clone(),
+                axis: *axis,
+                parent_rect: area,
+            });
+        }
+
+        path.push(false);
+        if let Some(found) = first.hit_test_divider_inner(r1, gap, hit_half_thickness, px, py, path)
+        {
+            return Some(found);
+        }
+        path.pop();
+
+        path.push(true);
+        let found = second.hit_test_divider_inner(r2, gap, hit_half_thickness, px, py, path);
+        path.pop();
+        found
+    }
+
+    /// 経路 `path` で指定された `Split` ノードの比率を `ratio`（`0.1..=0.9`）へ更新する
+    pub fn set_split_ratio(&mut self, path: &[bool], ratio: f32) -> bool {
+        let clamped = ratio.clamp(0.1, 0.9);
+        match (self, path.split_first()) {
+            (PaneNode::Split { ratio: r, .. }, None) => {
+                if (*r - clamped).abs() > 1e-4 {
+                    *r = clamped;
+                    true
+                } else {
+                    false
+                }
+            }
+            (PaneNode::Split { first, second, .. }, Some((go_second, rest))) => {
+                if *go_second {
+                    second.set_split_ratio(rest, clamped)
+                } else {
+                    first.set_split_ratio(rest, clamped)
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// `target_id` を含む最も内側の指定軸 `Split` ノードの比率を `delta` 分だけ調整する
+    pub fn resize_pane_axis(&mut self, target_id: PaneId, axis: SplitAxis, delta: f32) -> bool {
+        let mut path = Vec::new();
+        let Some(target_split_path) = self.find_nearest_split_path(target_id, axis, &mut path)
+        else {
+            return false;
+        };
+        let mut node: &mut PaneNode = self;
+        for go_second in target_split_path {
+            match node {
+                PaneNode::Split { first, second, .. } => {
+                    node = if go_second { second } else { first };
+                }
+                PaneNode::Leaf(_) => return false,
+            }
+        }
+        if let PaneNode::Split { ratio, .. } = node {
+            let next = (*ratio + delta).clamp(0.1, 0.9);
+            if (*ratio - next).abs() > 1e-4 {
+                *ratio = next;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn find_nearest_split_path(
+        &self,
+        target_id: PaneId,
+        target_axis: SplitAxis,
+        cur_path: &mut Vec<bool>,
+    ) -> Option<Vec<bool>> {
+        match self {
+            PaneNode::Leaf(_) => None,
+            PaneNode::Split {
+                axis,
+                first,
+                second,
+                ..
+            } => {
+                let in_first = first.pane(target_id).is_some();
+                let in_second = !in_first && second.pane(target_id).is_some();
+                if !in_first && !in_second {
+                    return None;
+                }
+                let child_res = if in_first {
+                    cur_path.push(false);
+                    let r = first.find_nearest_split_path(target_id, target_axis, cur_path);
+                    cur_path.pop();
+                    r
+                } else {
+                    cur_path.push(true);
+                    let r = second.find_nearest_split_path(target_id, target_axis, cur_path);
+                    cur_path.pop();
+                    r
+                };
+                if child_res.is_some() {
+                    child_res
+                } else if *axis == target_axis {
+                    Some(cur_path.clone())
+                } else {
+                    None
+                }
             }
         }
     }

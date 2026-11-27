@@ -11,9 +11,10 @@ use crate::key_map::{AppShortcut, encode_key_event, match_app_shortcut};
 use crate::layout::{SidebarHit, StatusBarHit};
 use crate::macos;
 use crate::renderer::{RenderOverlays, SelectionOverlay, UrlHoverOverlay};
-use crate::slot::Workspace;
+use crate::slot::{Workspace, ratio_from_pointer};
 use crate::{
-    ClickTracker, MULTI_CLICK_INTERVAL, SelectionMode, SelectionState, SlotDragState, TentApp,
+    ClickTracker, DividerDragState, MULTI_CLICK_INTERVAL, SelectionMode, SelectionState,
+    SlotDragState, TentApp,
 };
 
 impl TentApp {
@@ -37,14 +38,58 @@ impl TentApp {
                 let px = position.x as f32;
                 let py = position.y as f32;
                 self.cursor_pos = (px, py);
+
+                // 分割ペイン境界線のドラッグリサイズ中
+                if let Some(drag) = self.divider_drag.as_ref() {
+                    let path = drag.path.clone();
+                    let axis = drag.axis;
+                    let parent_rect = drag.parent_rect;
+                    let gap = self.pane_gap();
+                    let ratio = ratio_from_pointer(axis, parent_rect, gap, px, py);
+                    let changed = self
+                        .workspace
+                        .as_mut()
+                        .is_some_and(|ws| ws.set_active_split_ratio(&path, ratio));
+                    if changed {
+                        self.sync_browsers();
+                        self.request_redraw_now();
+                    }
+                    return;
+                }
+
                 self.update_url_hover();
 
-                // Focus-follows-mouse: 分割ペイン上にカーソルが乗ったら即フォーカス切替
+                // 分割ペイン境界線ホバー時のリサイズカーソル表示
                 let is_selecting = self.selection.as_ref().is_some_and(|s| s.active);
+                let next_divider = if !self.show_help
+                    && self.slot_drag.is_none()
+                    && !self.status_timer.dragging
+                    && !is_selecting
+                {
+                    let scale = self
+                        .window
+                        .as_ref()
+                        .map(|w| w.scale_factor() as f32)
+                        .unwrap_or(1.0);
+                    let hit_half = (self.pane_gap() * 0.5).max(5.0 * scale);
+                    self.workspace
+                        .as_ref()
+                        .and_then(|ws| ws.hit_test_divider(px, py, hit_half))
+                        .map(|d| d.axis)
+                } else {
+                    None
+                };
+                if self.hovered_divider != next_divider {
+                    self.hovered_divider = next_divider;
+                    self.update_cursor_icon();
+                }
+
+                // Focus-follows-mouse: 分割ペイン上にカーソルが乗ったら即フォーカス切替
                 if self.window_focused
                     && !self.show_help
                     && self.slot_drag.is_none()
                     && !is_selecting
+                    && self.hovered_divider.is_none()
                     && self.url_bar_edit.is_none()
                 {
                     let needs_focus = self.workspace.as_ref().is_some_and(|ws| {
@@ -277,6 +322,25 @@ impl TentApp {
                         });
                     }
                     None => {
+                        // 分割ペイン境界線のドラッグリサイズ開始判定
+                        let hit_half = (self.pane_gap() * 0.5).max(5.0 * scale);
+                        if let Some(div) = self
+                            .workspace
+                            .as_ref()
+                            .and_then(|ws| ws.hit_test_divider(px, py, hit_half))
+                        {
+                            self.selection = None;
+                            self.divider_drag = Some(DividerDragState {
+                                path: div.path,
+                                axis: div.axis,
+                                parent_rect: div.parent_rect,
+                            });
+                            self.hovered_divider = Some(div.axis);
+                            self.update_cursor_icon();
+                            self.request_redraw_now();
+                            return;
+                        }
+
                         if self.modifiers.super_key() {
                             self.update_url_hover();
                             if let Some((_, ref m)) = self.hovered_url {
@@ -376,6 +440,24 @@ impl TentApp {
                 button: MouseButton::Left,
                 ..
             } => {
+                if self.divider_drag.take().is_some() {
+                    let (px, py) = self.cursor_pos;
+                    let scale = self
+                        .window
+                        .as_ref()
+                        .map(|w| w.scale_factor() as f32)
+                        .unwrap_or(1.0);
+                    let hit_half = (self.pane_gap() * 0.5).max(5.0 * scale);
+                    self.hovered_divider = self
+                        .workspace
+                        .as_ref()
+                        .and_then(|ws| ws.hit_test_divider(px, py, hit_half))
+                        .map(|d| d.axis);
+                    self.save_state();
+                    self.update_cursor_icon();
+                    self.request_redraw_now();
+                    return;
+                }
                 if self.status_timer.dragging {
                     self.status_timer.dragging = false;
                     let mins = self.status_timer.drag_minutes;

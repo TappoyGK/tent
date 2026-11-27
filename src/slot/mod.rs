@@ -13,7 +13,7 @@ use crate::key_map::FocusDir;
 use crate::layout::Rect;
 use crate::terminal_pane::{PaneId, TerminalPane};
 
-pub use pane_tree::{Pane, PaneNode, SlotViewMode, SplitAxis};
+pub use pane_tree::{Pane, PaneNode, SlotViewMode, SplitAxis, SplitDivider, ratio_from_pointer};
 pub use slot_item::Slot;
 
 use pane_tree::{remove_node, select_next_pane, split_node_mut};
@@ -412,6 +412,71 @@ impl Workspace {
                 break;
             }
         }
+    }
+
+    /// アクティブスロットの分割境界線に対するヒットテスト
+    pub fn hit_test_divider(
+        &self,
+        px: f32,
+        py: f32,
+        hit_half_thickness: f32,
+    ) -> Option<SplitDivider> {
+        let slot = &self.slots[self.active_slot];
+        let tree = match slot.view_mode {
+            SlotViewMode::Panes => slot.root.as_ref(),
+            SlotViewMode::Browser => slot.browser_root.as_ref(),
+        }?;
+        tree.hit_test_divider(self.main_area, self.pane_gap, hit_half_thickness, px, py)
+    }
+
+    /// アクティブスロットの指定分割ノードの比率を更新し、ペインを再レイアウトする
+    pub fn set_active_split_ratio(&mut self, path: &[bool], ratio: f32) -> bool {
+        let (area, gap, cw, ch) = (self.main_area, self.pane_gap, self.cell_w, self.cell_h);
+        let slot = &mut self.slots[self.active_slot];
+        let changed = match slot.view_mode {
+            SlotViewMode::Panes => slot
+                .root
+                .as_mut()
+                .is_some_and(|r| r.set_split_ratio(path, ratio)),
+            SlotViewMode::Browser => slot
+                .browser_root
+                .as_mut()
+                .is_some_and(|r| r.set_split_ratio(path, ratio)),
+        };
+        if changed && slot.view_mode == SlotViewMode::Panes {
+            slot.resize_to_area(area, gap, cw, ch);
+        }
+        changed
+    }
+
+    /// フォーカス中ペインに最も近い該当軸の分割境界をキーボード操作で調整する
+    pub fn resize_focused_pane_dir(&mut self, dir: FocusDir, step: f32) -> bool {
+        let (axis, delta) = match dir {
+            FocusDir::Left => (SplitAxis::Vertical, -step),
+            FocusDir::Right => (SplitAxis::Vertical, step),
+            FocusDir::Up => (SplitAxis::Horizontal, -step),
+            FocusDir::Down => (SplitAxis::Horizontal, step),
+            FocusDir::Prev | FocusDir::Next => return false,
+        };
+        let (area, gap, cw, ch) = (self.main_area, self.pane_gap, self.cell_w, self.cell_h);
+        let slot = &mut self.slots[self.active_slot];
+        let Some(target_id) = slot.active_focused_pane() else {
+            return false;
+        };
+        let changed = match slot.view_mode {
+            SlotViewMode::Panes => slot
+                .root
+                .as_mut()
+                .is_some_and(|r| r.resize_pane_axis(target_id, axis, delta)),
+            SlotViewMode::Browser => slot
+                .browser_root
+                .as_mut()
+                .is_some_and(|r| r.resize_pane_axis(target_id, axis, delta)),
+        };
+        if changed && slot.view_mode == SlotViewMode::Panes {
+            slot.resize_to_area(area, gap, cw, ch);
+        }
+        changed
     }
 
     pub fn focus_pane_dir(&mut self, dir: FocusDir) {

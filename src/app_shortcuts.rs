@@ -180,6 +180,18 @@ impl TentApp {
                 self.sync_browsers();
                 self.request_redraw_now();
             }
+            AppShortcut::ResizePane(dir) => {
+                let changed = self
+                    .workspace
+                    .as_mut()
+                    .is_some_and(|ws| ws.resize_focused_pane_dir(dir, 0.05));
+                if changed {
+                    self.selection = None;
+                    self.sync_browsers();
+                    self.save_state();
+                    self.request_redraw_now();
+                }
+            }
             AppShortcut::ToggleBrowser => {
                 if let Some(ws) = self.workspace.as_mut() {
                     ws.toggle_active_slot_browser();

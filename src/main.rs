@@ -62,6 +62,12 @@ struct SlotDragState {
     hover_slot: Option<usize>,
 }
 
+struct DividerDragState {
+    path: Vec<bool>,
+    axis: crate::slot::SplitAxis,
+    parent_rect: Rect,
+}
+
 struct SelectionState {
     pane_id: PaneId,
     pane_rect: Rect,
@@ -229,6 +235,9 @@ struct TentApp {
     scroll_accum_px: f32,
 
     slot_drag: Option<SlotDragState>,
+    divider_drag: Option<DividerDragState>,
+    hovered_divider: Option<crate::slot::SplitAxis>,
+    cursor_kind: macos::AppCursorKind,
     selection: Option<SelectionState>,
     last_click: Option<ClickTracker>,
     last_autoscroll: Instant,
@@ -278,6 +287,9 @@ impl TentApp {
             last_ime_area: None,
             scroll_accum_px: 0.0,
             slot_drag: None,
+            divider_drag: None,
+            hovered_divider: None,
+            cursor_kind: macos::AppCursorKind::Default,
             selection: None,
             last_click: None,
             last_autoscroll: now - AUTOSCROLL_INTERVAL,
@@ -618,17 +630,36 @@ impl TentApp {
         };
 
         if self.hovered_url != next {
-            macos::set_terminal_pointer_cursor(next.is_some());
+            self.hovered_url = next;
+            self.update_cursor_icon();
+            self.request_redraw_now();
+        }
+    }
+
+    pub(crate) fn update_cursor_icon(&mut self) {
+        let axis = self
+            .divider_drag
+            .as_ref()
+            .map(|d| d.axis)
+            .or(self.hovered_divider);
+        let next_kind = match axis {
+            Some(crate::slot::SplitAxis::Vertical) => macos::AppCursorKind::EwResize,
+            Some(crate::slot::SplitAxis::Horizontal) => macos::AppCursorKind::NsResize,
+            None if self.hovered_url.is_some() => macos::AppCursorKind::Pointer,
+            None => macos::AppCursorKind::Default,
+        };
+        if self.cursor_kind != next_kind {
+            self.cursor_kind = next_kind;
+            macos::set_app_cursor_kind(next_kind);
             if let Some(window) = &self.window {
-                let icon = if next.is_some() {
-                    CursorIcon::Pointer
-                } else {
-                    CursorIcon::Default
+                let icon = match next_kind {
+                    macos::AppCursorKind::Default => CursorIcon::Default,
+                    macos::AppCursorKind::Pointer => CursorIcon::Pointer,
+                    macos::AppCursorKind::EwResize => CursorIcon::EwResize,
+                    macos::AppCursorKind::NsResize => CursorIcon::NsResize,
                 };
                 window.set_cursor(icon);
             }
-            self.hovered_url = next;
-            self.request_redraw_now();
         }
     }
 }
