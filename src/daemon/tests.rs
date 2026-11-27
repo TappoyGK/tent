@@ -330,3 +330,57 @@ fn test_normalize_post_handshake_event_converts_legacy_replay_to_resync() {
     let kept = normalize_post_handshake_event(DaemonEvent::Replay(rp), 3);
     assert!(matches!(kept, DaemonEvent::Replay(r) if r.pane_id == 5));
 }
+
+#[test]
+fn test_build_shell_integration_launch_for_zsh_bash_fish() {
+    use super::server::build_shell_integration_launch;
+
+    let res_dir = ghostty_vt::shell_integration::resources_dir().unwrap();
+
+    // zsh: 既存 ZDOTDIR を退避しつつ shell-integration/zsh を注入
+    let zsh =
+        build_shell_integration_launch("/bin/zsh", &res_dir, Some("/custom/zdot"), None, None);
+    assert!(zsh.extra_args.is_empty());
+    assert!(
+        zsh.envs
+            .iter()
+            .any(|(k, v)| k == "GHOSTTY_ZSH_ZDOTDIR" && v == "/custom/zdot")
+    );
+    assert!(
+        zsh.envs
+            .iter()
+            .any(|(k, v)| k == "ZDOTDIR" && v.ends_with("shell-integration/zsh"))
+    );
+
+    // bash: --posix + GHOSTTY_BASH_INJECT=1 + 既存 ENV 退避 + ENV=ghostty.bash
+    let bash = build_shell_integration_launch("/bin/bash", &res_dir, None, Some("/my/env"), None);
+    assert_eq!(bash.extra_args, vec!["--posix"]);
+    assert!(
+        bash.envs
+            .iter()
+            .any(|(k, v)| k == "GHOSTTY_BASH_INJECT" && v == "1")
+    );
+    assert!(
+        bash.envs
+            .iter()
+            .any(|(k, v)| k == "GHOSTTY_BASH_ENV" && v == "/my/env")
+    );
+    assert!(
+        bash.envs
+            .iter()
+            .any(|(k, v)| k == "ENV" && v.ends_with("shell-integration/bash/ghostty.bash"))
+    );
+
+    // fish: XDG_DATA_DIRS の先頭に shell-integration/fish を連結
+    let fish = build_shell_integration_launch(
+        "/opt/homebrew/bin/fish",
+        &res_dir,
+        None,
+        None,
+        Some("/usr/share"),
+    );
+    assert!(fish.extra_args.is_empty());
+    assert!(fish.envs.iter().any(|(k, v)| {
+        k == "XDG_DATA_DIRS" && v.contains("shell-integration/fish:") && v.ends_with(":/usr/share")
+    }));
+}

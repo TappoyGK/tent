@@ -399,14 +399,15 @@ fn test_osc133_split_chunks_notify_long_job_and_ignore_short_job() {
     pane.feed_pty_bytes(b"]133;C\x07building...\r\n", false, true, "1");
     assert!(pane.osc133_job_started_at.is_some());
 
-    // 2. 途中の無出力区間（4秒アイドル）で連続バースト開始時刻はリセットされるが、
+    // 2. 途中の無出力区間（4秒アイドル）や入れ子プロンプトの 133;A があっても
     //    OSC 133 のジョブ開始時刻は保持され、誤通知も出ないこと
     let t0 = pane.osc133_job_started_at.unwrap();
     pane.last_output_instant = Some(t0);
     assert!(pane.update_waiting_state(t0 + WAITING_IDLE_THRESHOLD, false, Some("1")));
-    assert_eq!(pane.background_output_started_at, None);
     assert_eq!(pane.osc133_job_started_at, Some(t0));
     assert!(pane.last_notification_sent.is_none());
+    pane.feed_pty_bytes(b"\x1b]133;A\x07remote$ ", false, true, "1");
+    assert_eq!(pane.osc133_job_started_at, Some(t0));
 
     // 3. 10秒経過した状態にして、チャンク境界を跨ぐ OSC 133;D で完了通知が発火すること
     pane.osc133_job_started_at =
@@ -431,7 +432,7 @@ fn test_osc133_split_chunks_notify_long_job_and_ignore_short_job() {
 }
 
 #[test]
-fn test_work_indicator_survives_silent_gap_and_notifies_on_completion() {
+fn test_active_work_indicator_notifies_on_completion_but_stale_text_does_not() {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
@@ -451,35 +452,71 @@ fn test_work_indicator_survives_silent_gap_and_notifies_on_completion() {
         DaemonClient::dummy_for_test(),
     )
     .unwrap();
-    let t0 = Instant::now();
-    pane.created_at = t0 - STARTUP_GRACE_PERIOD - Duration::from_secs(1);
+    let now = Instant::now();
+    pane.created_at = now - STARTUP_GRACE_PERIOD - Duration::from_secs(1);
     pane.mark_screen_seen();
 
-    // 1. t=0: AI エージェントが処理中インジケータを出して思考開始
-    pane.terminal.vt_write(b"\r\nWorking... (esc to interrupt)");
-    pane.had_background_output = true;
-    pane.background_output_started_at = Some(t0);
-    pane.last_output_instant = Some(t0);
+    // ケース A: 実行中インジケータが稼働し続け（5秒以上経過）、消えて完了したら通知されること
+    pane.feed_pty_bytes(b"\r\nWorking... (esc to interrupt)", false, true, "1");
+    assert!(pane.work_indicator_started_at.is_some());
+    pane.work_indicator_started_at =
+        Some(Instant::now() - BACKGROUND_NOTIFY_MIN_DURATION - Duration::from_secs(2));
+    pane.feed_pty_bytes(b"\x1b[2J\x1b[HAll tasks done!\r\n> ", false, true, "1");
+    let after_idle = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
+    assert!(pane.should_notify_background_completion(after_idle));
+    assert!(pane.update_waiting_state(after_idle, false, Some("1")));
+    assert!(pane.last_notification_sent.is_some());
+    assert_eq!(pane.work_indicator_started_at, None);
 
-    // 2. t=4s: 思考中の無音区間でもインジケータ表示中は開始時刻をリセットしないこと
-    let t4 = t0 + WAITING_IDLE_THRESHOLD;
-    assert!(!pane.update_waiting_state(t4, false, None));
-    assert!(!pane.is_waiting_input);
-    assert_eq!(pane.background_output_started_at, Some(t0));
+    // ケース B: 過去ログに (esc to interrupt) が残ったまま 4 秒以上出力が止まった場合、
+    //           開始時刻を引き継がず、後からスクロールアウトしても誤通知しないこと
+    pane.last_notification_sent = None;
+    pane.is_waiting_input = false;
+    pane.mark_screen_seen();
+    pane.feed_pty_bytes(b"old: (esc to interrupt)\r\n> ", false, true, "1");
+    pane.work_indicator_started_at = Some(Instant::now() - Duration::from_secs(600));
+    let idle1 = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
+    assert!(!pane.update_waiting_state(idle1, false, Some("1")));
+    assert_eq!(pane.work_indicator_started_at, None);
+    assert!(pane.last_notification_sent.is_none());
 
-    // 3. t=10s: インジケータが消えて完了メッセージを出力
-    let t10 = t0 + BACKGROUND_NOTIFY_MIN_DURATION + Duration::from_secs(5);
-    pane.terminal
-        .vt_write(b"\x1b[2J\x1b[HAll tasks done!\r\n> ");
-    pane.had_background_output = true;
-    pane.last_output_instant = Some(t10);
+    pane.feed_pty_bytes(b"a\r\nb\r\nc\r\nd\r\ne\r\nf\r\n> ", false, true, "1");
+    let idle2 = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
+    assert!(!pane.should_notify_background_completion(idle2));
+    assert!(pane.update_waiting_state(idle2, false, Some("1")));
+    assert!(pane.last_notification_sent.is_none());
+}
 
-    // 4. t=14s: アイドル遷移で長時間処理完了（>= 5s）として通知対象になること
-    let t14 = t10 + WAITING_IDLE_THRESHOLD;
-    assert!(pane.should_notify_background_completion(t14));
-    assert!(pane.update_waiting_state(t14, false, None));
-    assert!(pane.is_waiting_input);
-    assert_eq!(pane.background_output_started_at, None);
+#[test]
+fn test_continuous_output_pause_without_completion_boundary_does_not_notify() {
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    use super::{STARTUP_GRACE_PERIOD, TerminalPane, WAITING_IDLE_THRESHOLD};
+    use crate::daemon::{DaemonClient, ReplayedPane};
+
+    let mut pane = TerminalPane::attach_from_replay(
+        ReplayedPane {
+            pane_id: 1,
+            cols: 60,
+            rows: 6,
+            cwd: PathBuf::from("/tmp"),
+            replay_bytes: b"$ ".to_vec(),
+        },
+        DaemonClient::dummy_for_test(),
+    )
+    .unwrap();
+    let now = Instant::now();
+    pane.created_at = now - STARTUP_GRACE_PERIOD - Duration::from_secs(1);
+    pane.mark_screen_seen();
+
+    // 出力が続いたあとに 4.1 秒出力が止まっても、完了境界がなければ OS 通知しないこと
+    pane.feed_pty_bytes(b"Compiling a\r\n", false, true, "1");
+    pane.feed_pty_bytes(b"Compiling b\r\n", false, true, "1");
+    let after_idle = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
+    assert!(!pane.should_notify_background_completion(after_idle));
+    assert!(pane.update_waiting_state(after_idle, false, Some("1")));
+    assert!(pane.last_notification_sent.is_none());
 }
 
 #[test]
@@ -579,26 +616,20 @@ fn test_independent_periodic_short_logs_do_not_trigger_completion_notification()
     pane.mark_screen_seen();
 
     // 1. t=0: 1行目の短いログ
-    pane.terminal.vt_write(b"\r\n[00:00] heartbeat 1");
-    pane.had_background_output = true;
-    pane.background_output_started_at = Some(t0);
-    pane.last_output_instant = Some(t0);
+    pane.feed_pty_bytes(b"\r\n[00:00] heartbeat 1", false, true, "1");
 
-    // 2. t=4s: アイドル判定（5秒未満なので通知対象外、バースト開始時刻もリセットされる）
-    let t4 = t0 + WAITING_IDLE_THRESHOLD;
+    // 2. t=4s: アイドル判定（通知対象外）
+    let t4 = t0 + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
     assert!(!pane.should_notify_background_completion(t4));
-    assert!(pane.update_waiting_state(t4, false, None));
-    assert_eq!(pane.background_output_started_at, None);
+    assert!(pane.update_waiting_state(t4, false, Some("1")));
+    assert!(pane.last_notification_sent.is_none());
 
     // 3. t=60s: 1分後に独立した別の1行が届く
-    let t60 = t0 + Duration::from_secs(60);
-    pane.terminal.vt_write(b"\r\n[01:00] heartbeat 2");
-    pane.is_waiting_input = false;
-    pane.had_background_output = true;
-    pane.background_output_started_at.get_or_insert(t60);
-    pane.last_output_instant = Some(t60);
+    pane.feed_pty_bytes(b"\r\n[01:00] heartbeat 2", false, true, "1");
 
     // 4. t=64s: 1行目と合算されず、短い独立出力として通知対象外であること
-    let t64 = t60 + WAITING_IDLE_THRESHOLD;
+    let t64 = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
     assert!(!pane.should_notify_background_completion(t64));
+    assert!(pane.update_waiting_state(t64, false, Some("1")));
+    assert!(pane.last_notification_sent.is_none());
 }

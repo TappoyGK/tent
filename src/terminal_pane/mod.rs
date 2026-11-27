@@ -102,8 +102,9 @@ pub struct TerminalPane {
     sync_hold_since: Option<Instant>,
     pub has_notification: bool,
     pub had_background_output: bool,
-    pub background_output_started_at: Option<Instant>,
-    /// OSC 133;C で明示的に開始されたコマンドの開始時刻（133;D または 133;A でクリア）
+    /// 裏スロットで実行中インジケータ（`esc to interrupt` 等）を表示しながら出力が続いている開始時刻
+    pub work_indicator_started_at: Option<Instant>,
+    /// OSC 133;C で明示的に開始されたコマンドの開始時刻（133;D で消費）
     pub osc133_job_started_at: Option<Instant>,
     /// チャンク境界を跨ぐ OSC 133 マーカー検出用の直近末尾バッファ（最大 6 バイト）
     osc133_tail: [u8; 6],
@@ -180,7 +181,7 @@ impl TerminalPane {
             sync_hold_since: None,
             has_notification: false,
             had_background_output: false,
-            background_output_started_at: None,
+            work_indicator_started_at: None,
             osc133_job_started_at: None,
             osc133_tail: [0; 6],
             osc133_tail_len: 0,
@@ -247,7 +248,7 @@ impl TerminalPane {
             sync_hold_since: None,
             has_notification: false,
             had_background_output: false,
-            background_output_started_at: None,
+            work_indicator_started_at: None,
             osc133_job_started_at: None,
             osc133_tail: [0; 6],
             osc133_tail_len: 0,
@@ -417,7 +418,9 @@ impl TerminalPane {
             self.has_notification = false;
             if !is_active && !in_startup_grace {
                 self.had_background_output = true;
-                self.background_output_started_at.get_or_insert(now);
+                if self.has_active_work_indicator() {
+                    self.work_indicator_started_at.get_or_insert(now);
+                }
             }
         } else if !self.had_background_output {
             // リサイズ猶予中の再描画は未確認出力とみなさず基準ハッシュを更新する
@@ -426,7 +429,7 @@ impl TerminalPane {
         if osc133_completed_long && !is_active && !in_startup_grace {
             self.is_waiting_input = true;
             self.had_background_output = false;
-            self.background_output_started_at = None;
+            self.work_indicator_started_at = None;
             let title = format!("TenT [{}] {}", slot_label, self.folder_name);
             self.try_send_os_notification(
                 title,
@@ -580,7 +583,7 @@ impl TerminalPane {
     }
 
     /// ビューポート内に AI エージェントの実行中インジケータ（`esc to interrupt` 等）が表示中か判定する
-    fn has_active_work_indicator(&mut self) -> bool {
+    pub fn has_active_work_indicator(&mut self) -> bool {
         if self.rows == 0 || self.cols == 0 {
             return false;
         }
@@ -599,16 +602,17 @@ impl TerminalPane {
             || lower.contains("esc to cancel")
     }
 
-    /// 裏スロットでの連続出力バースト（または実行中インジケータ表示を跨いだ処理）が
-    /// 通知しきい値以上だったか判定する
+    /// 実行中インジケータ（AI エージェント等）を伴う裏スロット処理が
+    /// 通知しきい値以上続いてから完了したか判定する
     pub(crate) fn should_notify_background_completion(&self, now: Instant) -> bool {
         let end = self.last_output_instant.unwrap_or(now);
-        self.background_output_started_at.is_some_and(|start| {
+        self.work_indicator_started_at.is_some_and(|start| {
             end.saturating_duration_since(start) >= BACKGROUND_NOTIFY_MIN_DURATION
         })
     }
 
-    /// 裏タブで出力が止まったときに「AI入力待ち」へ遷移させ、一定時間以上動いていた場合は OS 通知する
+    /// 裏タブで出力が止まったときに「AI入力待ち」へ遷移させ、
+    /// 実行中インジケータを伴う長時間処理が完了した場合は OS 通知する
     pub fn update_waiting_state(
         &mut self,
         now: Instant,
@@ -617,22 +621,22 @@ impl TerminalPane {
     ) -> bool {
         if is_active {
             self.had_background_output = false;
-            self.background_output_started_at = None;
+            self.work_indicator_started_at = None;
             return false;
         }
         let idle_long_enough = self
             .last_output_instant
             .is_some_and(|t| now.duration_since(t) >= WAITING_IDLE_THRESHOLD);
         if self.had_background_output && idle_long_enough {
-            // Codex / Claude Code 等が思考中・ツール実行中（esc to interrupt 表示中）なら入力待ちにしない
-            // （実行中インジケータ表示中は background_output_started_at も維持する）
+            // Codex / Claude Code 等が処理中（esc to interrupt 表示中）なら入力待ちにしない。
+            // ただし 4 秒以上出力が止まっている場合は過去ログ残留と区別するため開始時刻は引き継がない。
             if self.has_active_work_indicator() {
+                self.work_indicator_started_at = None;
                 return false;
             }
             let should_notify = self.should_notify_background_completion(now);
             self.had_background_output = false;
-            // 連続出力バーストの開始時刻は毎回リセットし、独立した周期ログの合算を防ぐ
-            self.background_output_started_at = None;
+            self.work_indicator_started_at = None;
             // 最後に確認した時点から可視テキストが一切変わっていなければ（カーソル点滅・同一再描画等）黄色にしない
             let cur_hash = self.current_screen_hash();
             if cur_hash == self.last_seen_screen_hash {
@@ -721,9 +725,6 @@ impl TerminalPane {
             self.osc133_job_started_at.take().is_some_and(|start| {
                 now.saturating_duration_since(start) >= BACKGROUND_NOTIFY_MIN_DURATION
             })
-        } else if w == b"\x1b]133;A" {
-            self.osc133_job_started_at = None;
-            false
         } else {
             false
         }

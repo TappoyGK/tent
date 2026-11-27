@@ -506,7 +506,22 @@ fn spawn_daemon_pane(
         cmd.env("TERM", "xterm-ghostty");
     }
     if let Ok(res_dir) = ghostty_vt::shell_integration::resources_dir() {
-        cmd.env("GHOSTTY_RESOURCES_DIR", res_dir);
+        let existing_zdotdir = std::env::var("ZDOTDIR").ok();
+        let existing_env = std::env::var("ENV").ok();
+        let existing_xdg = std::env::var("XDG_DATA_DIRS").ok();
+        let launch = build_shell_integration_launch(
+            &shell,
+            &res_dir,
+            existing_zdotdir.as_deref(),
+            existing_env.as_deref(),
+            existing_xdg.as_deref(),
+        );
+        for arg in launch.extra_args {
+            cmd.arg(arg);
+        }
+        for (k, v) in launch.envs {
+            cmd.env(k, v);
+        }
     }
 
     let Ok(mut child) = pair.slave.spawn_command(cmd) else {
@@ -594,4 +609,82 @@ fn spawn_daemon_pane(
                 }
             }
         });
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct ShellIntegrationLaunch {
+    pub(super) extra_args: Vec<String>,
+    pub(super) envs: Vec<(String, String)>,
+}
+
+/// Ghostty 同梱のシェル統合スクリプト（OSC 133 / OSC 7）を透過的に注入するための
+/// 追加引数・環境変数を生成する。
+pub(super) fn build_shell_integration_launch(
+    shell: &str,
+    res_dir: &Path,
+    existing_zdotdir: Option<&str>,
+    existing_env: Option<&str>,
+    existing_xdg_data_dirs: Option<&str>,
+) -> ShellIntegrationLaunch {
+    let shell_name = Path::new(shell)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(shell);
+    let mut launch = ShellIntegrationLaunch::default();
+    launch.envs.push((
+        "GHOSTTY_RESOURCES_DIR".to_string(),
+        res_dir.to_string_lossy().into_owned(),
+    ));
+    let si_dir = res_dir.join("shell-integration");
+
+    match shell_name {
+        "zsh" => {
+            let zsh_dir = si_dir.join("zsh");
+            if zsh_dir.join(".zshenv").is_file() {
+                if let Some(prev) = existing_zdotdir {
+                    launch
+                        .envs
+                        .push(("GHOSTTY_ZSH_ZDOTDIR".to_string(), prev.to_string()));
+                }
+                launch.envs.push((
+                    "ZDOTDIR".to_string(),
+                    zsh_dir.to_string_lossy().into_owned(),
+                ));
+            }
+        }
+        "bash" => {
+            let bash_script = si_dir.join("bash").join("ghostty.bash");
+            if bash_script.is_file() {
+                launch.extra_args.push("--posix".to_string());
+                launch
+                    .envs
+                    .push(("GHOSTTY_BASH_INJECT".to_string(), "1".to_string()));
+                if let Some(prev) = existing_env
+                    && !prev.is_empty()
+                {
+                    launch
+                        .envs
+                        .push(("GHOSTTY_BASH_ENV".to_string(), prev.to_string()));
+                }
+                launch.envs.push((
+                    "ENV".to_string(),
+                    bash_script.to_string_lossy().into_owned(),
+                ));
+            }
+        }
+        "fish" => {
+            let fish_dir = si_dir.join("fish");
+            if fish_dir.is_dir() {
+                let fish_str = fish_dir.to_string_lossy();
+                let merged = match existing_xdg_data_dirs {
+                    Some(prev) if !prev.is_empty() => format!("{fish_str}:{prev}"),
+                    _ => fish_str.into_owned(),
+                };
+                launch.envs.push(("XDG_DATA_DIRS".to_string(), merged));
+            }
+        }
+        _ => {}
+    }
+
+    launch
 }
