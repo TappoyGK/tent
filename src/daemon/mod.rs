@@ -14,7 +14,7 @@ pub use client::{DaemonClient, stop_running_daemon};
 pub use server::run_daemon_server;
 
 /// デーモン通信プロトコルバージョン（スナップショット形式やメッセージ仕様変更時にインクリメント）
-pub const DAEMON_PROTOCOL_VERSION: u32 = 3;
+pub const DAEMON_PROTOCOL_VERSION: u32 = 4;
 
 /// デフォルトのデーモン Unix ドメインソケットパス
 pub fn default_socket_path() -> PathBuf {

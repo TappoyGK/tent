@@ -278,9 +278,10 @@ impl Workspace {
         let mut changed = false;
         for (idx, slot) in self.slots.iter_mut().enumerate() {
             let is_active = idx == active;
+            let slot_label = Slot::number_label(idx);
             if let Some(root) = &mut slot.root {
                 root.for_each_terminal_mut(&mut |p| {
-                    if p.update_waiting_state(now, is_active) {
+                    if p.update_waiting_state(now, is_active, Some(slot_label)) {
                         changed = true;
                     }
                 });

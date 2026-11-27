@@ -27,6 +27,8 @@ const NOTIFICATION_COOLDOWN: Duration = Duration::from_secs(1);
 const STARTUP_GRACE_PERIOD: Duration = Duration::from_secs(3);
 const RESIZE_GRACE_PERIOD: Duration = Duration::from_secs(1);
 const WAITING_IDLE_THRESHOLD: Duration = Duration::from_secs(4);
+/// 裏スロットでの完了・入力待ち OS 通知を出すための最小実行時間（短時間ノイズ抑制）
+const BACKGROUND_NOTIFY_MIN_DURATION: Duration = Duration::from_secs(5);
 /// DEC Mode 2026 (Synchronized Output) で描画ホールドを許可する最大時間（固まり防止）
 const SYNC_OUTPUT_MAX_HOLD: Duration = Duration::from_secs(1);
 
@@ -100,6 +102,13 @@ pub struct TerminalPane {
     sync_hold_since: Option<Instant>,
     pub has_notification: bool,
     pub had_background_output: bool,
+    /// 裏スロットで実行中インジケータ（`esc to interrupt` 等）を表示しながら出力が続いている開始時刻
+    pub work_indicator_started_at: Option<Instant>,
+    /// OSC 133;C で明示的に開始されたコマンドの開始時刻（133;D で消費）
+    pub osc133_job_started_at: Option<Instant>,
+    /// チャンク境界を跨ぐ OSC 133 マーカー検出用の直近末尾バッファ（最大 6 バイト）
+    osc133_tail: [u8; 6],
+    osc133_tail_len: u8,
     pub is_waiting_input: bool,
     last_seen_screen_hash: u64,
     last_notification_sent: Option<Instant>,
@@ -172,6 +181,10 @@ impl TerminalPane {
             sync_hold_since: None,
             has_notification: false,
             had_background_output: false,
+            work_indicator_started_at: None,
+            osc133_job_started_at: None,
+            osc133_tail: [0; 6],
+            osc133_tail_len: 0,
             is_waiting_input: false,
             last_seen_screen_hash: 0,
             last_notification_sent: None,
@@ -235,6 +248,10 @@ impl TerminalPane {
             sync_hold_since: None,
             has_notification: false,
             had_background_output: false,
+            work_indicator_started_at: None,
+            osc133_job_started_at: None,
+            osc133_tail: [0; 6],
+            osc133_tail_len: 0,
             is_waiting_input: false,
             last_seen_screen_hash: 0,
             last_notification_sent: None,
@@ -386,6 +403,7 @@ impl TerminalPane {
             return;
         }
         let now = Instant::now();
+        let osc133_completed_long = self.process_osc_133_markers(bytes, now);
         self.terminal.vt_write(bytes);
         let in_startup_grace = now.duration_since(self.created_at) < STARTUP_GRACE_PERIOD;
         let is_resize_redraw = self
@@ -400,10 +418,23 @@ impl TerminalPane {
             self.has_notification = false;
             if !is_active && !in_startup_grace {
                 self.had_background_output = true;
+                if self.has_active_work_indicator() {
+                    self.work_indicator_started_at.get_or_insert(now);
+                }
             }
         } else if !self.had_background_output {
             // リサイズ猶予中の再描画は未確認出力とみなさず基準ハッシュを更新する
             self.mark_screen_seen();
+        }
+        if osc133_completed_long && !is_active && !in_startup_grace {
+            self.is_waiting_input = true;
+            self.had_background_output = false;
+            self.work_indicator_started_at = None;
+            let title = format!("TenT [{}] {}", slot_label, self.folder_name);
+            self.try_send_os_notification(
+                title,
+                "コマンドが完了し入力待ちになりました".to_string(),
+            );
         }
         self.minimap_dirty = true;
         self.generation = self.generation.wrapping_add(1);
@@ -464,6 +495,28 @@ impl TerminalPane {
     pub fn mark_dirty(&mut self) {
         self.minimap_dirty = true;
         self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// 画面およびスクロールバックをクリアする（macOS 標準の Cmd+K 相当）。
+    /// プロトコル v4+ のデーモン接続時は明示的な Clear コマンドを送り、
+    /// PTY 出力と順序を保ったままデーモン・GUI 双方の画面とスクロールバックを消去する。
+    pub fn clear_screen_and_scrollback(&mut self) {
+        use ghostty_vt::terminal::ScrollViewport;
+
+        if self.daemon.supports_clear() {
+            self.daemon.clear_pane(self.id);
+        } else {
+            self.terminal.vt_write(b"\x1b[3J\x1b[2J\x1b[H");
+        }
+        self.terminal.scroll_viewport(ScrollViewport::Bottom);
+        // 通常スクリーン（シェル等）では Ctrl+L も送り、クリア後にプロンプトを再描画する
+        let is_alt = self.terminal.mode(Mode::ALT_SCREEN_SAVE).unwrap_or(false)
+            || self.terminal.mode(Mode::ALT_SCREEN).unwrap_or(false);
+        if !is_alt {
+            self.write_input(b"\x0c");
+        }
+        self.mark_screen_seen();
+        self.mark_dirty();
     }
 
     /// DEC Mode 2026（Synchronized Output）が有効で画面書き換え途中の場合は true を返す。
@@ -530,7 +583,7 @@ impl TerminalPane {
     }
 
     /// ビューポート内に AI エージェントの実行中インジケータ（`esc to interrupt` 等）が表示中か判定する
-    fn has_active_work_indicator(&mut self) -> bool {
+    pub fn has_active_work_indicator(&mut self) -> bool {
         if self.rows == 0 || self.cols == 0 {
             return false;
         }
@@ -549,21 +602,41 @@ impl TerminalPane {
             || lower.contains("esc to cancel")
     }
 
-    /// 裏タブで出力が止まったときに「AI入力待ち」へ遷移させる
-    pub fn update_waiting_state(&mut self, now: Instant, is_active: bool) -> bool {
+    /// 実行中インジケータ（AI エージェント等）を伴う裏スロット処理が
+    /// 通知しきい値以上続いてから完了したか判定する
+    pub(crate) fn should_notify_background_completion(&self, now: Instant) -> bool {
+        let end = self.last_output_instant.unwrap_or(now);
+        self.work_indicator_started_at.is_some_and(|start| {
+            end.saturating_duration_since(start) >= BACKGROUND_NOTIFY_MIN_DURATION
+        })
+    }
+
+    /// 裏タブで出力が止まったときに「AI入力待ち」へ遷移させ、
+    /// 実行中インジケータを伴う長時間処理が完了した場合は OS 通知する
+    pub fn update_waiting_state(
+        &mut self,
+        now: Instant,
+        is_active: bool,
+        slot_label: Option<&str>,
+    ) -> bool {
         if is_active {
             self.had_background_output = false;
+            self.work_indicator_started_at = None;
             return false;
         }
         let idle_long_enough = self
             .last_output_instant
             .is_some_and(|t| now.duration_since(t) >= WAITING_IDLE_THRESHOLD);
         if self.had_background_output && idle_long_enough {
-            // Codex / Claude Code 等が思考中・ツール実行中（esc to interrupt 表示中）なら入力待ちにしない
+            // Codex / Claude Code 等が処理中（esc to interrupt 表示中）なら入力待ちにしない。
+            // ただし 4 秒以上出力が止まっている場合は過去ログ残留と区別するため開始時刻は引き継がない。
             if self.has_active_work_indicator() {
+                self.work_indicator_started_at = None;
                 return false;
             }
+            let should_notify = self.should_notify_background_completion(now);
             self.had_background_output = false;
+            self.work_indicator_started_at = None;
             // 最後に確認した時点から可視テキストが一切変わっていなければ（カーソル点滅・同一再描画等）黄色にしない
             let cur_hash = self.current_screen_hash();
             if cur_hash == self.last_seen_screen_hash {
@@ -571,6 +644,13 @@ impl TerminalPane {
             }
             if !self.is_waiting_input {
                 self.is_waiting_input = true;
+                if should_notify && let Some(label) = slot_label {
+                    let title = format!("TenT [{}] {}", label, self.folder_name);
+                    self.try_send_os_notification(
+                        title,
+                        "出力が完了し入力待ちになりました".to_string(),
+                    );
+                }
                 return true;
             }
         }
@@ -585,6 +665,69 @@ impl TerminalPane {
     /// 指定のビューポートセル (col, row) にある URL（OSC 8 ハイパーリンクまたは http/https）を返す
     pub fn url_at_cell(&mut self, col: u16, row: u16) -> Option<UrlMatch> {
         find_url_at_cell(&self.terminal, self.cols, col, row)
+    }
+
+    /// OSC 133 シェル統合マーカー（`133;A` / `133;C` / `133;D`）をチャンク境界を跨いで検出・処理する。
+    /// 通知しきい値以上実行されたコマンドの終了（`133;D`）を検出した場合は `true` を返す。
+    fn process_osc_133_markers(&mut self, bytes: &[u8], now: Instant) -> bool {
+        const MARKER_LEN: usize = 7; // b"\x1b]133;X"
+        const TAIL_CAP: usize = MARKER_LEN - 1;
+
+        let mut completed_long = false;
+        let tail_len = usize::from(self.osc133_tail_len);
+
+        // 1. 前回末尾（最大 6B）+ 今回先頭（最大 6B）で境界を跨ぐ 7B ウィンドウを走査
+        if tail_len > 0 {
+            let mut bridge = [0u8; TAIL_CAP * 2];
+            bridge[..tail_len].copy_from_slice(&self.osc133_tail[..tail_len]);
+            let head_len = bytes.len().min(TAIL_CAP);
+            bridge[tail_len..tail_len + head_len].copy_from_slice(&bytes[..head_len]);
+            let total = tail_len + head_len;
+            if total >= MARKER_LEN {
+                for w in bridge[..total].windows(MARKER_LEN) {
+                    if self.handle_osc_133_window(w, now) {
+                        completed_long = true;
+                    }
+                }
+            }
+        }
+
+        // 2. 今回のバイト列内部の 7B ウィンドウを走査
+        for w in bytes.windows(MARKER_LEN) {
+            if self.handle_osc_133_window(w, now) {
+                completed_long = true;
+            }
+        }
+
+        // 3. 次回チャンク用に直近最大 6B を保持
+        if bytes.len() >= TAIL_CAP {
+            self.osc133_tail
+                .copy_from_slice(&bytes[bytes.len() - TAIL_CAP..]);
+            self.osc133_tail_len = TAIL_CAP as u8;
+        } else {
+            let mut combined = [0u8; TAIL_CAP * 2];
+            combined[..tail_len].copy_from_slice(&self.osc133_tail[..tail_len]);
+            combined[tail_len..tail_len + bytes.len()].copy_from_slice(bytes);
+            let total = tail_len + bytes.len();
+            let keep = total.min(TAIL_CAP);
+            self.osc133_tail[..keep].copy_from_slice(&combined[total - keep..total]);
+            self.osc133_tail_len = keep as u8;
+        }
+
+        completed_long
+    }
+
+    fn handle_osc_133_window(&mut self, w: &[u8], now: Instant) -> bool {
+        if w == b"\x1b]133;C" {
+            self.osc133_job_started_at = Some(now);
+            false
+        } else if w == b"\x1b]133;D" {
+            self.osc133_job_started_at.take().is_some_and(|start| {
+                now.saturating_duration_since(start) >= BACKGROUND_NOTIFY_MIN_DURATION
+            })
+        } else {
+            false
+        }
     }
 }
 

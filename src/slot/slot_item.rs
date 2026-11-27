@@ -185,6 +185,7 @@ impl Slot {
                 p.has_notification = false;
                 p.is_waiting_input = false;
                 p.had_background_output = false;
+                p.work_indicator_started_at = None;
                 p.mark_screen_seen();
             });
         }
@@ -196,6 +197,9 @@ impl Slot {
                 p.mark_screen_seen();
                 if p.is_actively_outputting(now) {
                     p.had_background_output = true;
+                    if p.has_active_work_indicator() {
+                        p.work_indicator_started_at.get_or_insert(now);
+                    }
                 }
             });
         }

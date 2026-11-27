@@ -28,6 +28,9 @@ pub(super) enum ClientMsg {
         pane_id: PaneId,
     },
     QueryCwds,
+    Clear {
+        pane_id: PaneId,
+    },
 }
 
 const TAG_HELLO: u8 = 0x01;
@@ -36,6 +39,7 @@ const TAG_INPUT: u8 = 0x03;
 const TAG_RESIZE: u8 = 0x04;
 const TAG_KILL: u8 = 0x05;
 const TAG_QUERY_CWDS: u8 = 0x06;
+const TAG_CLEAR: u8 = 0x07;
 
 const TAG_REPLAY: u8 = 0x81;
 const TAG_HELLO_DONE: u8 = 0x82;
@@ -114,6 +118,7 @@ pub(super) fn write_client_msg(w: &mut impl Write, msg: &ClientMsg) -> io::Resul
         }
         ClientMsg::Kill { pane_id } => write_frame(w, TAG_KILL, &pane_id.to_le_bytes()),
         ClientMsg::QueryCwds => write_frame(w, TAG_QUERY_CWDS, &[]),
+        ClientMsg::Clear { pane_id } => write_frame(w, TAG_CLEAR, &pane_id.to_le_bytes()),
     }
 }
 
@@ -155,6 +160,10 @@ pub(super) fn read_client_msg(r: &mut impl Read) -> io::Result<ClientMsg> {
             Ok(ClientMsg::Kill { pane_id })
         }
         TAG_QUERY_CWDS => Ok(ClientMsg::QueryCwds),
+        TAG_CLEAR if p.len() >= 8 => {
+            let pane_id = u64::from_le_bytes(p[0..8].try_into().unwrap());
+            Ok(ClientMsg::Clear { pane_id })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unknown client message",

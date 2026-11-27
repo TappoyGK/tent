@@ -330,3 +330,120 @@ fn test_normalize_post_handshake_event_converts_legacy_replay_to_resync() {
     let kept = normalize_post_handshake_event(DaemonEvent::Replay(rp), 3);
     assert!(matches!(kept, DaemonEvent::Replay(r) if r.pane_id == 5));
 }
+
+#[test]
+fn test_build_shell_integration_launch_for_zsh_bash_fish() {
+    use super::server::{
+        build_shell_integration_launch, configure_bash_version_command, detect_bash_major_version,
+    };
+
+    // macOS 標準の /bin/bash が存在する環境では、BASH_ENV / ENV / 日本語ロケールが設定されていても
+    // 利用者スクリプトを実行せず数値のメジャーバージョンだけを取得できること
+    if std::path::Path::new("/bin/bash").is_file() {
+        assert!(detect_bash_major_version("/bin/bash").is_some());
+
+        let tmp = std::env::temp_dir().join(format!("tent-benv-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let marker = tmp.join("ran");
+        let benv = tmp.join("benv.sh");
+        let _ = std::fs::remove_file(&marker);
+        std::fs::write(
+            &benv,
+            format!("echo RAN > \"{}\"\necho noisy\n", marker.display()),
+        )
+        .unwrap();
+
+        let mut cmd = std::process::Command::new("/bin/bash");
+        cmd.env("BASH_ENV", &benv)
+            .env("ENV", &benv)
+            .env("LANG", "ja_JP.UTF-8")
+            .env("LC_ALL", "ja_JP.UTF-8");
+        configure_bash_version_command(&mut cmd);
+        let out = cmd.output().unwrap();
+        assert!(out.status.success());
+        assert!(
+            !marker.exists(),
+            "BASH_ENV script must not be executed during version detection"
+        );
+        let major = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<u32>()
+            .ok();
+        assert!(major.is_some());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    let res_dir = ghostty_vt::shell_integration::resources_dir().unwrap();
+
+    // zsh: `-l` のまま既存 ZDOTDIR を退避しつつ shell-integration/zsh を注入
+    let zsh = build_shell_integration_launch(
+        "/bin/zsh",
+        &res_dir,
+        Some("/custom/zdot"),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(zsh.args, vec!["-l"]);
+    assert!(
+        zsh.envs
+            .iter()
+            .any(|(k, v)| k == "GHOSTTY_ZSH_ZDOTDIR" && v == "/custom/zdot")
+    );
+    assert!(
+        zsh.envs
+            .iter()
+            .any(|(k, v)| k == "ZDOTDIR" && v.ends_with("shell-integration/zsh"))
+    );
+
+    // bash 5.x: `--posix` が `-l` より前に配置され、GHOSTTY_BASH_INJECT=1 + 既存 ENV 退避 + ENV=ghostty.bash
+    let bash5 = build_shell_integration_launch(
+        "/opt/homebrew/bin/bash",
+        &res_dir,
+        None,
+        Some("/my/env"),
+        None,
+        Some(5),
+    );
+    assert_eq!(bash5.args, vec!["--posix", "-l"]);
+    assert!(
+        bash5
+            .envs
+            .iter()
+            .any(|(k, v)| k == "GHOSTTY_BASH_INJECT" && v == "1")
+    );
+    assert!(
+        bash5
+            .envs
+            .iter()
+            .any(|(k, v)| k == "GHOSTTY_BASH_ENV" && v == "/my/env")
+    );
+    assert!(
+        bash5
+            .envs
+            .iter()
+            .any(|(k, v)| k == "ENV" && v.ends_with("shell-integration/bash/ghostty.bash"))
+    );
+
+    // bash 3.2 (macOS 標準): 未対応のため注入せず通常の `-l` のみで起動すること
+    let bash3 =
+        build_shell_integration_launch("/bin/bash", &res_dir, None, Some("/my/env"), None, Some(3));
+    assert_eq!(bash3.args, vec!["-l"]);
+    assert!(!bash3.envs.iter().any(|(k, _)| k == "GHOSTTY_BASH_INJECT"));
+    assert!(!bash3.envs.iter().any(|(k, _)| k == "ENV"));
+
+    // fish: `-l` のまま XDG_DATA_DIRS の先頭に shell-integration/fish を連結
+    let fish = build_shell_integration_launch(
+        "/opt/homebrew/bin/fish",
+        &res_dir,
+        None,
+        None,
+        Some("/usr/share"),
+        None,
+    );
+    assert_eq!(fish.args, vec!["-l"]);
+    assert!(fish.envs.iter().any(|(k, v)| {
+        k == "XDG_DATA_DIRS" && v.contains("shell-integration/fish:") && v.ends_with(":/usr/share")
+    }));
+}
