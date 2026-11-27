@@ -185,4 +185,41 @@ fn test_pane_divider_hit_test_drag_resize_keyboard_resize_and_persistence() {
         }
         other => panic!("expected vertical split, got {other:?}"),
     }
+
+    // 6. 入れ子分割で内側の比率が偏っている状態で外側を動かしても、すべての葉が最小幅 160px を割らないこと
+    let mut nested = PaneNode::Split {
+        axis: SplitAxis::Vertical,
+        ratio: 0.3,
+        first: Box::new(PaneNode::Leaf(Pane::Browser(Box::new(BrowserPaneMeta {
+            id: 1,
+            url: "https://a.example".to_string(),
+            title: String::new(),
+            is_playing_audio: false,
+        })))),
+        second: Box::new(PaneNode::Split {
+            axis: SplitAxis::Vertical,
+            ratio: 0.5,
+            first: Box::new(PaneNode::Leaf(Pane::Browser(Box::new(BrowserPaneMeta {
+                id: 2,
+                url: "https://b.example".to_string(),
+                title: String::new(),
+                is_playing_audio: false,
+            })))),
+            second: Box::new(PaneNode::Leaf(Pane::Browser(Box::new(BrowserPaneMeta {
+                id: 3,
+                url: "https://c.example".to_string(),
+                title: String::new(),
+                is_playing_audio: false,
+            })))),
+        }),
+    };
+    let wide_area = Rect::new(0.0, 0.0, 1600.0, 400.0);
+    nested.set_split_ratio(&[true], 0.9, wide_area, 6.0, 160.0, 128.0);
+    nested.set_split_ratio(&[], 0.9, wide_area, 6.0, 160.0, 128.0);
+    let mut nested_rects = Vec::new();
+    nested.compute_rects(wide_area, 6.0, &mut nested_rects);
+    assert!(
+        nested_rects.iter().all(|(_, r)| r.w >= 160.0 - 0.5),
+        "all leaves must respect min width 160px: {nested_rects:?}"
+    );
 }

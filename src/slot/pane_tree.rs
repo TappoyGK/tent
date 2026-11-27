@@ -309,20 +309,23 @@ impl PaneNode {
         found
     }
 
-    /// 指定軸におけるこのサブツリーの最小必要サイズ（全葉が `min_leaf` 以上を保つための下限）を返す
+    /// 指定軸におけるこのサブツリーの最小必要サイズを返す。
+    /// 内側の分割が持つ現在の `ratio` を保ったまま、すべての葉が `min_leaf` 以上になるための
+    /// 必要十分下限を計算する。
     fn min_extent(&self, target_axis: SplitAxis, gap: f32, min_leaf: f32) -> f32 {
         match self {
             PaneNode::Leaf(_) => min_leaf,
             PaneNode::Split {
                 axis,
+                ratio,
                 first,
                 second,
-                ..
             } => {
                 let a = first.min_extent(target_axis, gap, min_leaf);
                 let b = second.min_extent(target_axis, gap, min_leaf);
                 if *axis == target_axis {
-                    a + gap + b
+                    let r = ratio.clamp(0.01, 0.99);
+                    gap + (a / r).max(b / (1.0 - r))
                 } else {
                     a.max(b)
                 }
@@ -330,6 +333,7 @@ impl PaneNode {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn clamp_split_ratio(
         axis: SplitAxis,
         first: &PaneNode,
@@ -337,6 +341,7 @@ impl PaneNode {
         parent_rect: Rect,
         gap: f32,
         min_leaf_size: (f32, f32),
+        current_ratio: f32,
         desired: f32,
     ) -> f32 {
         let (avail, min_leaf) = match axis {
@@ -350,8 +355,7 @@ impl PaneNode {
         if min_r <= max_r {
             desired.clamp(min_r, max_r)
         } else {
-            let total = (min_first + min_second).max(1.0);
-            (min_first / total).clamp(0.1, 0.9)
+            current_ratio
         }
     }
 
@@ -383,6 +387,7 @@ impl PaneNode {
                     area,
                     gap,
                     (min_leaf_w, min_leaf_h),
+                    *r,
                     ratio,
                 );
                 if (*r - clamped).abs() > 1e-4 {
@@ -503,6 +508,7 @@ impl PaneNode {
                 cur_area,
                 gap,
                 (min_leaf_w, min_leaf_h),
+                *ratio,
                 *ratio + delta,
             );
             if (*ratio - next).abs() > 1e-4 {
