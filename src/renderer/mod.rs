@@ -107,6 +107,8 @@ pub struct RenderOutcome {
     pub needs_redraw: bool,
 }
 
+type FooterCacheKey = (Vec<(String, bool)>, u32, u32);
+
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -170,7 +172,7 @@ pub struct Renderer {
 
     // メインパネル下端フッター（ペイン別最終更新時刻）用バッファ
     footer_buffers: Vec<Buffer>,
-    footer_cache_keys: Vec<(String, u32, u32)>,
+    footer_cache_keys: Vec<FooterCacheKey>,
 
     // ショートカットヘルプダイアログ用バッファ
     help_header_buffer: Buffer,
