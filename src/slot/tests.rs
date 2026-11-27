@@ -130,10 +130,12 @@ fn test_pane_divider_hit_test_drag_resize_keyboard_resize_and_persistence() {
     assert_eq!(h_div.axis, SplitAxis::Horizontal);
     assert_eq!(h_div.path, vec![true]);
 
-    // 3. ドラッグによる比率算出＆更新（範囲クランプ 0.1..=0.9）
+    // 3. ドラッグによる比率算出＆更新（最小ペインサイズ 160x80 を守りつつクランプ）
+    let min_w = 160.0;
+    let min_h = 80.0;
     let new_v = ratio_from_pointer(v_div.axis, v_div.parent_rect, gap, 303.0, 300.0);
     assert!((new_v - 0.3).abs() < 0.01);
-    assert!(tree.set_split_ratio(&v_div.path, new_v));
+    assert!(tree.set_split_ratio(&v_div.path, new_v, area, gap, min_w, min_h));
     assert_eq!(
         ratio_from_pointer(v_div.axis, v_div.parent_rect, gap, -50.0, 300.0),
         0.1
@@ -143,12 +145,25 @@ fn test_pane_divider_hit_test_drag_resize_keyboard_resize_and_persistence() {
         0.9
     );
 
-    // 4. キーボード操作による比率調整（id=2 に最も近い Horizontal 分割を +0.1 調整）
-    assert!(tree.resize_pane_axis(2, SplitAxis::Horizontal, 0.1));
-    // id=2 に最も近い Vertical 分割（ルート）を +0.05 調整
-    assert!(tree.resize_pane_axis(2, SplitAxis::Vertical, 0.05));
+    // 極端に小さい比率 0.1 を指定しても最小幅 160px 未満にならないこと
+    assert!(tree.set_split_ratio(&v_div.path, 0.1, area, gap, min_w, min_h));
+    let mut clamped_rects = Vec::new();
+    tree.compute_rects(area, gap, &mut clamped_rects);
+    assert!(clamped_rects.iter().all(|(_, r)| r.w >= min_w - 0.5));
+    // テスト用に 0.3 へ戻す
+    assert!(tree.set_split_ratio(&v_div.path, 0.3, area, gap, min_w, min_h));
 
-    // 5. state.conf 形式（SavedPaneTree::encode / decode）で比率が保存・復元されること
+    // 4. キーボード操作による比率調整（id=2 に最も近い Horizontal 分割を +0.1 調整）
+    assert!(tree.resize_pane_axis(2, SplitAxis::Horizontal, 0.1, area, gap, min_w, min_h));
+    // id=2 に最も近い Vertical 分割（ルート）を +0.05 調整
+    assert!(tree.resize_pane_axis(2, SplitAxis::Vertical, 0.05, area, gap, min_w, min_h));
+
+    // 5. state.conf 形式（SavedPaneTree::encode / decode）で比率が保存・復元され、NaN は 0.5 になること
+    let nan_decoded = SavedPaneTree::decode("S(V,NaN,B(1,u),B(2,u))").expect("decode NaN");
+    assert!(matches!(
+        nan_decoded,
+        SavedPaneTree::Split { ratio, .. } if (ratio - 0.5).abs() < 1e-4
+    ));
     let encoded = tree.to_saved_tree().encode();
     let decoded = SavedPaneTree::decode(&encoded).expect("decode saved tree");
     match decoded {

@@ -432,16 +432,18 @@ impl Workspace {
     /// アクティブスロットの指定分割ノードの比率を更新し、ペインを再レイアウトする
     pub fn set_active_split_ratio(&mut self, path: &[bool], ratio: f32) -> bool {
         let (area, gap, cw, ch) = (self.main_area, self.pane_gap, self.cell_w, self.cell_h);
+        let min_w = cw * 10.0;
+        let min_h = ch * 4.0;
         let slot = &mut self.slots[self.active_slot];
         let changed = match slot.view_mode {
             SlotViewMode::Panes => slot
                 .root
                 .as_mut()
-                .is_some_and(|r| r.set_split_ratio(path, ratio)),
+                .is_some_and(|r| r.set_split_ratio(path, ratio, area, gap, min_w, min_h)),
             SlotViewMode::Browser => slot
                 .browser_root
                 .as_mut()
-                .is_some_and(|r| r.set_split_ratio(path, ratio)),
+                .is_some_and(|r| r.set_split_ratio(path, ratio, area, gap, min_w, min_h)),
         };
         if changed && slot.view_mode == SlotViewMode::Panes {
             slot.resize_to_area(area, gap, cw, ch);
@@ -459,19 +461,19 @@ impl Workspace {
             FocusDir::Prev | FocusDir::Next => return false,
         };
         let (area, gap, cw, ch) = (self.main_area, self.pane_gap, self.cell_w, self.cell_h);
+        let min_w = cw * 10.0;
+        let min_h = ch * 4.0;
         let slot = &mut self.slots[self.active_slot];
         let Some(target_id) = slot.active_focused_pane() else {
             return false;
         };
         let changed = match slot.view_mode {
-            SlotViewMode::Panes => slot
-                .root
-                .as_mut()
-                .is_some_and(|r| r.resize_pane_axis(target_id, axis, delta)),
-            SlotViewMode::Browser => slot
-                .browser_root
-                .as_mut()
-                .is_some_and(|r| r.resize_pane_axis(target_id, axis, delta)),
+            SlotViewMode::Panes => slot.root.as_mut().is_some_and(|r| {
+                r.resize_pane_axis(target_id, axis, delta, area, gap, min_w, min_h)
+            }),
+            SlotViewMode::Browser => slot.browser_root.as_mut().is_some_and(|r| {
+                r.resize_pane_axis(target_id, axis, delta, area, gap, min_w, min_h)
+            }),
         };
         if changed && slot.view_mode == SlotViewMode::Panes {
             slot.resize_to_area(area, gap, cw, ch);

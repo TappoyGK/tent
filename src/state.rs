@@ -108,7 +108,12 @@ impl SavedPaneTree {
                 SplitAxis::Horizontal
             };
             let comma = cur.find(',')?;
-            let ratio = cur[..comma].parse::<f32>().ok()?.clamp(0.1, 0.9);
+            let parsed_ratio = cur[..comma].parse::<f32>().ok()?;
+            let ratio = if parsed_ratio.is_finite() {
+                parsed_ratio.clamp(0.1, 0.9)
+            } else {
+                0.5
+            };
             *cur = &cur[comma + 1..];
             let first = Self::parse_node(cur)?;
             *cur = cur.strip_prefix(',')?;

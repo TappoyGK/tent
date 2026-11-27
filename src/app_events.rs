@@ -26,6 +26,11 @@ impl TentApp {
             }
             WindowEvent::Focused(focused) => {
                 self.window_focused = focused;
+                if !focused && self.divider_drag.take().is_some() {
+                    self.hovered_divider = None;
+                    self.save_state();
+                    self.update_cursor_icon();
+                }
             }
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 self.recompute_layout_and_resize();

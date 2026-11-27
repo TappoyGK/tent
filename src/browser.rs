@@ -1204,7 +1204,23 @@ pub fn install_macos_shortcut_monitor(proxy: EventLoopProxy<AppEvent>) {
             let has_cmd = flags.contains(NSEventModifierFlags::Command);
             let has_ctrl = flags.contains(NSEventModifierFlags::Control);
 
-            if has_cmd && !has_ctrl {
+            if has_cmd && has_ctrl {
+                let shift = flags.contains(NSEventModifierFlags::Shift);
+                let opt = flags.contains(NSEventModifierFlags::Option);
+                if !shift && !opt {
+                    let dir = match event.keyCode() {
+                        123 => Some(FocusDir::Left),
+                        124 => Some(FocusDir::Right),
+                        125 => Some(FocusDir::Down),
+                        126 => Some(FocusDir::Up),
+                        _ => None,
+                    };
+                    if let Some(dir) = dir {
+                        let _ = proxy.send_event(AppEvent::Shortcut(AppShortcut::ResizePane(dir)));
+                        return std::ptr::null_mut();
+                    }
+                }
+            } else if has_cmd && !has_ctrl {
                 // WinitView / WryWebView / IME / performKeyEquivalent の差異に左右されず
                 // TenT の全グローバルショートカットを確実に1箇所で捕捉し、null 返却で二重発火を防ぐ
                 let shift = flags.contains(NSEventModifierFlags::Shift);
