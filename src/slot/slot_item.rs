@@ -186,6 +186,7 @@ impl Slot {
                 p.is_waiting_input = false;
                 p.had_background_output = false;
                 p.background_output_started_at = None;
+                p.active_job_started_at = None;
                 p.mark_screen_seen();
             });
         }

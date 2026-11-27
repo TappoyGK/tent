@@ -103,6 +103,8 @@ pub struct TerminalPane {
     pub has_notification: bool,
     pub had_background_output: bool,
     pub background_output_started_at: Option<Instant>,
+    /// ユーザーによるコマンド送信（Enter）または OSC 133;C で明示的に開始されたジョブの開始時刻
+    pub active_job_started_at: Option<Instant>,
     pub is_waiting_input: bool,
     last_seen_screen_hash: u64,
     last_notification_sent: Option<Instant>,
@@ -176,6 +178,7 @@ impl TerminalPane {
             has_notification: false,
             had_background_output: false,
             background_output_started_at: None,
+            active_job_started_at: None,
             is_waiting_input: false,
             last_seen_screen_hash: 0,
             last_notification_sent: None,
@@ -240,6 +243,7 @@ impl TerminalPane {
             has_notification: false,
             had_background_output: false,
             background_output_started_at: None,
+            active_job_started_at: None,
             is_waiting_input: false,
             last_seen_screen_hash: 0,
             last_notification_sent: None,
@@ -257,6 +261,9 @@ impl TerminalPane {
 
     pub fn write_input(&mut self, bytes: &[u8]) {
         if !bytes.is_empty() {
+            if bytes.contains(&b'\r') || bytes.contains(&b'\n') {
+                self.active_job_started_at = Some(Instant::now());
+            }
             self.daemon.send_input(self.id, bytes.to_vec());
         }
     }
@@ -391,6 +398,10 @@ impl TerminalPane {
             return;
         }
         let now = Instant::now();
+        let (saw_osc133_start, saw_osc133_done) = scan_osc_133_markers(bytes);
+        if saw_osc133_start {
+            self.active_job_started_at = Some(now);
+        }
         self.terminal.vt_write(bytes);
         let in_startup_grace = now.duration_since(self.created_at) < STARTUP_GRACE_PERIOD;
         let is_resize_redraw = self
@@ -410,6 +421,21 @@ impl TerminalPane {
         } else if !self.had_background_output {
             // リサイズ猶予中の再描画は未確認出力とみなさず基準ハッシュを更新する
             self.mark_screen_seen();
+        }
+        if saw_osc133_done {
+            let job_long = self.active_job_started_at.take().is_some_and(|s| {
+                now.saturating_duration_since(s) >= BACKGROUND_NOTIFY_MIN_DURATION
+            });
+            if !is_active && !in_startup_grace && job_long {
+                self.is_waiting_input = true;
+                self.had_background_output = false;
+                self.background_output_started_at = None;
+                let title = format!("TenT [{}] {}", slot_label, self.folder_name);
+                self.try_send_os_notification(
+                    title,
+                    "コマンドが完了し入力待ちになりました".to_string(),
+                );
+            }
         }
         self.minimap_dirty = true;
         self.generation = self.generation.wrapping_add(1);
@@ -580,9 +606,13 @@ impl TerminalPane {
     /// 裏スロットでの実行時間が通知しきい値以上だったか判定する
     pub(crate) fn should_notify_background_completion(&self, now: Instant) -> bool {
         let end = self.last_output_instant.unwrap_or(now);
-        self.background_output_started_at.is_some_and(|start| {
+        let continuous_long = self.background_output_started_at.is_some_and(|start| {
             end.saturating_duration_since(start) >= BACKGROUND_NOTIFY_MIN_DURATION
-        })
+        });
+        let explicit_job_long = self.active_job_started_at.is_some_and(|start| {
+            end.saturating_duration_since(start) >= BACKGROUND_NOTIFY_MIN_DURATION
+        });
+        continuous_long || explicit_job_long
     }
 
     /// 裏タブで出力が止まったときに「AI入力待ち」へ遷移させ、一定時間以上動いていた場合は OS 通知する
@@ -607,6 +637,8 @@ impl TerminalPane {
             }
             let should_notify = self.should_notify_background_completion(now);
             self.had_background_output = false;
+            // 連続出力バーストの開始時刻は毎回リセットし、独立した周期ログの合算を防ぐ
+            self.background_output_started_at = None;
             // 最後に確認した時点から可視テキストが一切変わっていなければ（カーソル点滅・同一再描画等）黄色にしない
             let cur_hash = self.current_screen_hash();
             if cur_hash == self.last_seen_screen_hash {
@@ -615,9 +647,8 @@ impl TerminalPane {
             if !self.is_waiting_input {
                 self.is_waiting_input = true;
                 if should_notify {
-                    // 完了通知を発火した時点で実行区間をリセット（未発火の無出力区間では開始時刻を保持し、
-                    // 「開始出力 → 4秒無出力 → 10秒後に完了出力」の長時間処理でも通知を逃さない）
-                    self.background_output_started_at = None;
+                    // 完了通知を発火した時点で明示的ジョブの開始時刻も消費する
+                    self.active_job_started_at = None;
                     if let Some(label) = slot_label {
                         let title = format!("TenT [{}] {}", label, self.folder_name);
                         self.try_send_os_notification(
@@ -641,6 +672,20 @@ impl TerminalPane {
     pub fn url_at_cell(&mut self, col: u16, row: u16) -> Option<UrlMatch> {
         find_url_at_cell(&self.terminal, self.cols, col, row)
     }
+}
+
+/// OSC 133 シェル統合のコマンド開始（`133;C`）およびコマンド終了（`133;D`）マーカーを検出する
+fn scan_osc_133_markers(bytes: &[u8]) -> (bool, bool) {
+    let mut saw_start = false;
+    let mut saw_done = false;
+    for w in bytes.windows(7) {
+        if w == b"\x1b]133;C" {
+            saw_start = true;
+        } else if w == b"\x1b]133;D" {
+            saw_done = true;
+        }
+    }
+    (saw_start, saw_done)
 }
 
 pub fn extract_folder_name(path: &Path) -> String {

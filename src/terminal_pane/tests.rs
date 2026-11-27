@@ -393,18 +393,20 @@ fn test_background_completion_notification_survives_silent_gap() {
     pane.created_at = t0 - STARTUP_GRACE_PERIOD - Duration::from_secs(1);
     pane.mark_screen_seen();
 
-    // 1. t=0: 開始メッセージ出力（裏スロット）
+    // 1. t=0: ユーザーがコマンドを送信（明示的ジョブ開始）し、開始メッセージが出力される
+    pane.active_job_started_at = Some(t0);
     pane.terminal.vt_write(b"\r\nbuilding...");
     pane.had_background_output = true;
     pane.background_output_started_at = Some(t0);
     pane.last_output_instant = Some(t0);
 
     // 2. t=4s: 計算中の無出力区間で update_waiting_state が発火
-    //    （この時点では 5 秒未満なので通知未発火、開始時刻は保持されること）
+    //    （連続バースト開始時刻はリセットされるが、明示的ジョブ開始時刻は保持されること）
     let t4 = t0 + WAITING_IDLE_THRESHOLD;
     assert!(pane.update_waiting_state(t4, false, None));
     assert!(pane.is_waiting_input);
-    assert_eq!(pane.background_output_started_at, Some(t0));
+    assert_eq!(pane.background_output_started_at, None);
+    assert_eq!(pane.active_job_started_at, Some(t0));
 
     // 3. t=10s: 計算完了メッセージ出力
     let t10 = t0 + BACKGROUND_NOTIFY_MIN_DURATION + Duration::from_secs(5);
@@ -414,10 +416,60 @@ fn test_background_completion_notification_survives_silent_gap() {
     pane.background_output_started_at.get_or_insert(t10);
     pane.last_output_instant = Some(t10);
 
-    // 4. t=14s: 完了後のアイドル遷移で通知対象（>= 5s）と判定され、その後開始時刻がリセットされること
+    // 4. t=14s: 完了後のアイドル遷移で通知対象（>= 5s）と判定され、開始時刻が消費されること
     let t14 = t10 + WAITING_IDLE_THRESHOLD;
     assert!(pane.should_notify_background_completion(t14));
     assert!(pane.update_waiting_state(t14, false, None));
     assert!(pane.is_waiting_input);
+    assert_eq!(pane.active_job_started_at, None);
+}
+
+#[test]
+fn test_independent_periodic_short_logs_do_not_trigger_completion_notification() {
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    use super::{STARTUP_GRACE_PERIOD, TerminalPane, WAITING_IDLE_THRESHOLD};
+    use crate::daemon::{DaemonClient, ReplayedPane};
+
+    let mut pane = TerminalPane::attach_from_replay(
+        ReplayedPane {
+            pane_id: 1,
+            cols: 40,
+            rows: 6,
+            cwd: PathBuf::from("/tmp"),
+            replay_bytes: b"tail -f app.log".to_vec(),
+        },
+        DaemonClient::dummy_for_test(),
+    )
+    .unwrap();
+    let t0 = Instant::now();
+    pane.created_at = t0 - STARTUP_GRACE_PERIOD - Duration::from_secs(1);
+    pane.mark_screen_seen();
+    // 新規ジョブ送信なし（すでに稼働中の tail -f を別タブで放置している状態）
+    pane.active_job_started_at = None;
+
+    // 1. t=0: 1行目の短いログ
+    pane.terminal.vt_write(b"\r\n[00:00] heartbeat 1");
+    pane.had_background_output = true;
+    pane.background_output_started_at = Some(t0);
+    pane.last_output_instant = Some(t0);
+
+    // 2. t=4s: アイドル判定（5秒未満なので通知対象外、バースト開始時刻もリセットされる）
+    let t4 = t0 + WAITING_IDLE_THRESHOLD;
+    assert!(!pane.should_notify_background_completion(t4));
+    assert!(pane.update_waiting_state(t4, false, None));
     assert_eq!(pane.background_output_started_at, None);
+
+    // 3. t=60s: 1分後に独立した別の1行が届く
+    let t60 = t0 + Duration::from_secs(60);
+    pane.terminal.vt_write(b"\r\n[01:00] heartbeat 2");
+    pane.is_waiting_input = false;
+    pane.had_background_output = true;
+    pane.background_output_started_at.get_or_insert(t60);
+    pane.last_output_instant = Some(t60);
+
+    // 4. t=64s: 1行目と合算されず、短い独立出力として通知対象外であること
+    let t64 = t60 + WAITING_IDLE_THRESHOLD;
+    assert!(!pane.should_notify_background_completion(t64));
 }
