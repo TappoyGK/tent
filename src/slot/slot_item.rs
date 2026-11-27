@@ -198,7 +198,7 @@ impl Slot {
         if let Some(root) = &mut self.root {
             root.for_each_terminal_mut(&mut |p| {
                 p.mark_screen_seen();
-                if p.active_ai_tool.is_none() && p.is_actively_outputting(now) {
+                if !p.is_ai_hook_managed() && p.is_actively_outputting(now) {
                     p.had_background_output = true;
                     if p.has_active_work_indicator() {
                         p.work_indicator_started_at.get_or_insert(now);

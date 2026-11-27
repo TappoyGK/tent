@@ -1111,9 +1111,15 @@ impl ApplicationHandler<AppEvent> for TentApp {
     }
 }
 
-fn agy_hook_stdout_json(stdin_payload: &str) -> &'static str {
+fn agy_hook_stdout_json(event_override: Option<&str>, stdin_payload: &str) -> &'static str {
     // agy の PreToolUse 契約は decision フィールドを必須とするため、PreToolUse 時は {"decision":"allow"} を返す
-    if stdin_payload.contains("\"PreToolUse\"") {
+    let is_pre_tool_use = event_override.is_some_and(|e| {
+        matches!(
+            e.to_ascii_lowercase().as_str(),
+            "pre-tool-use" | "pretooluse"
+        )
+    }) || stdin_payload.contains("\"PreToolUse\"");
+    if is_pre_tool_use {
         "{\"decision\":\"allow\"}"
     } else {
         "{}"
@@ -1136,18 +1142,17 @@ fn resolve_hook_state_from_stdin(
     base_state
 }
 
-/// AI フックから呼び出される軽量 CLI (`tent hook <working|waiting|idle> [--tool claude|agy|codex]`)。
+/// AI フックから呼び出される軽量 CLI (`tent hook <working|waiting|idle> [--tool claude|agy|codex] [--event pre-tool-use]`)。
 /// TenT 外で実行された場合やデーモン未接続時は何もせず正常終了（exit 0）し、AI の動作を絶対に妨げない。
 fn run_hook_cli(mut args: impl Iterator<Item = String>) {
     use std::io::{IsTerminal, Read};
 
-    let Some(state_arg) = args.next() else {
-        return;
-    };
-    let Some(base_state) = daemon::AiHookState::parse_name(&state_arg) else {
-        return;
-    };
+    let state_arg = args.next();
+    let base_state = state_arg
+        .as_deref()
+        .and_then(daemon::AiHookState::parse_name);
     let mut tool: Option<daemon::AiTool> = None;
+    let mut event_override: Option<String> = None;
     let mut pane_id_override: Option<PaneId> = None;
     let mut sock_override: Option<PathBuf> = None;
 
@@ -1157,6 +1162,9 @@ fn run_hook_cli(mut args: impl Iterator<Item = String>) {
                 if let Some(val) = args.next() {
                     tool = daemon::AiTool::parse_name(&val);
                 }
+            }
+            "--event" => {
+                event_override = args.next();
             }
             "--pane-id" => {
                 if let Some(val) = args.next() {
@@ -1180,23 +1188,28 @@ fn run_hook_cli(mut args: impl Iterator<Item = String>) {
             .read_to_string(&mut stdin_payload);
     }
 
-    let state = resolve_hook_state_from_stdin(base_state, tool, &stdin_payload);
+    if let Some(base_state) = base_state {
+        let state = resolve_hook_state_from_stdin(base_state, tool, &stdin_payload);
 
-    let pane_id = pane_id_override.or_else(|| {
-        std::env::var("TENT_PANE_ID")
-            .ok()
-            .and_then(|s| s.parse::<PaneId>().ok())
-    });
-    if let Some(pane_id) = pane_id {
-        let sock_path = sock_override
-            .or_else(|| std::env::var_os("TENT_SOCKET").map(PathBuf::from))
-            .unwrap_or_else(default_socket_path);
-        let _ = daemon::send_hook_event(&sock_path, pane_id, state, tool);
+        let pane_id = pane_id_override.or_else(|| {
+            std::env::var("TENT_PANE_ID")
+                .ok()
+                .and_then(|s| s.parse::<PaneId>().ok())
+        });
+        if let Some(pane_id) = pane_id {
+            let sock_path = sock_override
+                .or_else(|| std::env::var_os("TENT_SOCKET").map(PathBuf::from))
+                .unwrap_or_else(default_socket_path);
+            let _ = daemon::send_hook_event(&sock_path, pane_id, state, tool);
+        }
     }
 
-    // agy のフック契約は stdout に有効な JSON オブジェクトを返すことを要求する
+    // agy のフック契約は stdout に有効な JSON オブジェクトを返すことを要求する（不正引数時も含む）
     if tool == Some(daemon::AiTool::Agy) {
-        println!("{}", agy_hook_stdout_json(&stdin_payload));
+        println!(
+            "{}",
+            agy_hook_stdout_json(event_override.as_deref(), &stdin_payload)
+        );
     }
 }
 
@@ -1340,16 +1353,24 @@ mod tests {
             AiHookState::Waiting
         );
 
-        // agy の PreToolUse だけは {"decision":"allow"} を返す
+        // agy の PreToolUse だけは {"decision":"allow"} を返す（明示 --event または stdin）
+        assert_eq!(
+            agy_hook_stdout_json(Some("pre-tool-use"), ""),
+            r#"{"decision":"allow"}"#
+        );
         assert_eq!(
             agy_hook_stdout_json(
-                r#"{"hookEventName":"PreToolUse","toolCall":{"name":"ask_question"}}"#
+                None,
+                r#"{"hookEventName":"PreToolUse","toolCall":{"name":"ask_question"}}"#,
             ),
             r#"{"decision":"allow"}"#
         );
-        assert_eq!(agy_hook_stdout_json(r#"{"hookEventName":"Stop"}"#), "{}");
+        assert_eq!(
+            agy_hook_stdout_json(None, r#"{"hookEventName":"Stop"}"#),
+            "{}"
+        );
 
-        // プロセス名・コマンドラインからの AI 3 ツール判別
+        // プロセス名・ネイティブ版バージョンパス・コマンドラインからの AI 3 ツール判別
         assert_eq!(
             macos::detect_ai_tool_from_process(Some(Path::new("/Users/me/.local/bin/agy")), &[]),
             Some(AiTool::Agy)
@@ -1360,6 +1381,20 @@ mod tests {
         );
         assert_eq!(
             macos::detect_ai_tool_from_process(
+                Some(Path::new("/Users/x/.local/share/claude/versions/2.1.332")),
+                &[],
+            ),
+            Some(AiTool::Claude)
+        );
+        assert_eq!(
+            macos::detect_ai_tool_from_process(
+                Some(Path::new("/bin/sleep")),
+                &["/Users/x/.local/bin/claude".to_string(), "5".to_string()],
+            ),
+            Some(AiTool::Claude)
+        );
+        assert_eq!(
+            macos::detect_ai_tool_from_process(
                 Some(Path::new("/opt/homebrew/bin/node")),
                 &[
                     "node".to_string(),
@@ -1367,6 +1402,33 @@ mod tests {
                 ],
             ),
             Some(AiTool::Claude)
+        );
+        // 誤検出しないこと（一般スクリプトや別プロジェクトパス）
+        assert_eq!(
+            macos::detect_ai_tool_from_process(
+                Some(Path::new("/opt/homebrew/bin/node")),
+                &["node".to_string(), "/Users/x/proj/claude".to_string()],
+            ),
+            None
+        );
+        assert_eq!(
+            macos::detect_ai_tool_from_process(
+                Some(Path::new("/usr/bin/python3")),
+                &[
+                    "python3".to_string(),
+                    "-m".to_string(),
+                    "http.server".to_string(),
+                    "/srv/codex".to_string(),
+                ],
+            ),
+            None
+        );
+        assert_eq!(
+            macos::detect_ai_tool_from_process(
+                Some(Path::new("/Users/x/src/claude-code/target/debug/mytool")),
+                &[],
+            ),
+            None
         );
         assert_eq!(
             macos::detect_ai_tool_from_process(Some(Path::new("/bin/zsh")), &[]),

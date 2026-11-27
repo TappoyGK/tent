@@ -120,7 +120,9 @@ pub struct TerminalPane {
     pub is_waiting_input: bool,
     /// このペインで特別監視対象の AI ツール（Claude Code / agy / Codex）が稼働中か
     pub active_ai_tool: Option<AiTool>,
-    /// AI フックから通知された明示状態（AI 稼働中は画面差分ルールを止めてこれを正とする）
+    /// 現在の AI セッションでフックイベントを 1 回以上受信済みか（未設定ユーザーは一般ルールを維持）
+    pub ai_hook_active: bool,
+    /// AI フックから通知された明示状態（AI フック管理モード中は画面差分ルールを止めてこれを正とする）
     pub ai_hook_state: Option<AiHookState>,
     /// AI が Working 状態に入った時刻（長時間処理の OS 通知判定用）
     ai_working_since: Option<Instant>,
@@ -204,6 +206,7 @@ impl TerminalPane {
             osc133_tail_len: 0,
             is_waiting_input: false,
             active_ai_tool: None,
+            ai_hook_active: false,
             ai_hook_state: None,
             ai_working_since: None,
             last_seen_line_hashes: Vec::new(),
@@ -277,6 +280,7 @@ impl TerminalPane {
             osc133_tail_len: 0,
             is_waiting_input: false,
             active_ai_tool: None,
+            ai_hook_active: false,
             ai_hook_state: None,
             ai_working_since: None,
             last_seen_line_hashes: Vec::new(),
@@ -384,30 +388,28 @@ impl TerminalPane {
         false
     }
 
+    /// このペインが AI フック駆動モードで管理されているか返す。
+    /// フックを 1 回も設定していない環境では一般ルールを維持し、フックを受信した AI セッションのみ切り替える。
+    pub fn is_ai_hook_managed(&self) -> bool {
+        self.active_ai_tool.is_some() && self.ai_hook_active
+    }
+
     /// デーモンから届いたフォアグラウンド AI ツール種別を反映する。
-    /// AI 稼働中は一般ルール（PTY 画面差分判定）を抑止し、シェル復帰時に一般ルールへ戻す。
+    /// シェル復帰時（`None`）にフック管理モードを解除して一般ルールへ戻す。
     pub fn update_ai_tool_from_daemon(&mut self, tool: Option<AiTool>) -> bool {
         if self.active_ai_tool == tool {
             return false;
         }
         self.active_ai_tool = tool;
-        match tool {
-            Some(_) => {
-                // AI 起動直後に一般ルールの残骸が誤反応しないようクリアする
-                self.had_background_output = false;
-                self.work_indicator_started_at = None;
-                self.osc133_job_started_at = None;
-                self.last_output_instant = None;
-            }
-            None => {
-                // AI 終了してシェルへ戻ったためフック状態を解除し、現在画面を基準にする
-                self.ai_hook_state = None;
-                self.ai_working_since = None;
-                self.had_background_output = false;
-                self.work_indicator_started_at = None;
-                self.last_output_instant = None;
-                self.mark_screen_seen();
-            }
+        if tool.is_none() {
+            // AI 終了してシェルへ戻ったためフック状態を解除し、現在画面を基準にする
+            self.ai_hook_active = false;
+            self.ai_hook_state = None;
+            self.ai_working_since = None;
+            self.had_background_output = false;
+            self.work_indicator_started_at = None;
+            self.last_output_instant = None;
+            self.mark_screen_seen();
         }
         true
     }
@@ -424,6 +426,7 @@ impl TerminalPane {
         if let Some(t) = tool {
             self.active_ai_tool = Some(t);
         }
+        self.ai_hook_active = true;
         let now = Instant::now();
         self.had_background_output = false;
         self.work_indicator_started_at = None;
@@ -439,6 +442,11 @@ impl TerminalPane {
                 self.last_output_instant = Some(now);
             }
             AiHookState::Waiting => {
+                // 既に Waiting 状態のところへ重ねて届いた Waiting（例: PermissionRequest 後の Notification や
+                // Stop 後の idle_prompt）は無視し、時刻更新・再点灯・重複 OS 通知を防ぐ
+                if self.ai_hook_state == Some(AiHookState::Waiting) {
+                    return false;
+                }
                 let worked_duration = self
                     .ai_working_since
                     .take()
@@ -495,7 +503,7 @@ impl TerminalPane {
             let after_lines = self.current_active_line_hashes();
             self.last_active_line_hashes = after_lines.clone();
             self.active_lines_dirty = false;
-            if self.active_ai_tool.is_none()
+            if !self.is_ai_hook_managed()
                 && (after_total_rows != before_total_rows || after_lines != before_lines)
             {
                 self.last_output_at = Local::now();
@@ -528,9 +536,9 @@ impl TerminalPane {
             return;
         }
         let now = Instant::now();
-        let is_ai_managed = self.active_ai_tool.is_some();
+        let is_ai_managed = self.is_ai_hook_managed();
 
-        // AI 稼働中（Claude Code / agy / Codex）はフックイベントを唯一の正とし、
+        // AI フック管理モード中はフックイベントを唯一の正とし、
         // PTY 出力による画面差分・タイムスタンプ・作業中/入力待ち判定を一切行わない。
         let (osc133_completed_long, visual_changed) = if is_ai_managed {
             self.terminal.vt_write(bytes);
@@ -539,19 +547,28 @@ impl TerminalPane {
         } else {
             let osc133_completed_long = self.process_osc_133_markers(bytes, now);
             let prev_total_rows = self.terminal.total_rows().unwrap_or(0);
-            let fast_streaming = self
-                .last_output_instant
-                .is_some_and(|t| now.duration_since(t) < ACTIVE_OUTPUT_FAST_PATH)
-                && bytes.iter().any(|&b| b >= 0x20 && b != 0x7f);
+            // 直近の確定済み可視変化から 50ms 以内で、かつ状態遷移（裏出力初回・通知解除・待機解除）が
+            // 不要な連続ストリーミング中のみハッシュ比較を省略し、時刻や状態は延長しない。
+            // 50ms 経過後のチャンクで必ずハッシュ比較へ戻り、不可視再描画による無限延長を防ぐ。
+            let can_use_fast_path = (is_active || self.had_background_output)
+                && !self.has_notification
+                && !self.is_waiting_input;
+            let fast_streaming = can_use_fast_path
+                && self
+                    .last_output_instant
+                    .is_some_and(|t| now.duration_since(t) < ACTIVE_OUTPUT_FAST_PATH);
             if !fast_streaming && self.active_lines_dirty {
                 self.last_active_line_hashes = self.current_active_line_hashes();
                 self.active_lines_dirty = false;
             }
             self.terminal.vt_write(bytes);
             let new_total_rows = self.terminal.total_rows().unwrap_or(0);
-            let visual_changed = if new_total_rows != prev_total_rows || fast_streaming {
+            let visual_changed = if new_total_rows != prev_total_rows {
                 self.active_lines_dirty = true;
                 true
+            } else if fast_streaming {
+                self.active_lines_dirty = true;
+                false
             } else {
                 let after_lines = self.current_active_line_hashes();
                 let changed = after_lines != self.last_active_line_hashes;
@@ -719,9 +736,9 @@ impl TerminalPane {
     }
 
     /// 処理中・出力中か（LED・出力中ハイライト用）。
-    /// AI 稼働中はフック由来の `Working` 状態を正とし、それ以外は直近 2 秒以内の出力で判定する。
+    /// AI フック管理モード中はフック由来の `Working` 状態を正とし、それ以外は直近 2 秒以内の出力で判定する。
     pub fn is_actively_outputting(&self, now: Instant) -> bool {
-        if self.active_ai_tool.is_some() {
+        if self.is_ai_hook_managed() {
             return self.ai_hook_state == Some(AiHookState::Working);
         }
         self.last_output_instant
@@ -788,7 +805,7 @@ impl TerminalPane {
         is_active: bool,
         slot_label: Option<&str>,
     ) -> bool {
-        if self.active_ai_tool.is_some() {
+        if self.is_ai_hook_managed() {
             return false;
         }
         if is_active {

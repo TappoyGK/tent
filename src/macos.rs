@@ -117,14 +117,16 @@ pub fn get_pid_cmdline_args(pid: i32) -> Vec<String> {
     args
 }
 
-/// 実行ファイルパスと引数リストから監視対象 AI ツール（Claude Code / agy / Codex）を判別する
+/// 実行ファイルパスと引数リストから監視対象 AI ツール（Claude Code / agy / Codex）を判別する。
+/// 一般的なスクリプト引数（例: `node /Users/x/proj/claude` や `python3 -m http.server /srv/codex`）での
+/// 誤検出を避けるため、実行ファイル名・ネイティブ版バージョンパス・`argv[0]`・`node_modules` 配下の公式パッケージのみを対象とする。
 pub fn detect_ai_tool_from_process(
     exe_path: Option<&std::path::Path>,
     args: &[String],
 ) -> Option<crate::daemon::AiTool> {
     use crate::daemon::AiTool;
 
-    let match_token = |token: &str| -> Option<AiTool> {
+    let match_basename = |token: &str| -> Option<AiTool> {
         let base = std::path::Path::new(token)
             .file_name()
             .and_then(|s| s.to_str())
@@ -134,33 +136,44 @@ pub fn detect_ai_tool_from_process(
             "claude" | "claude-code" => Some(AiTool::Claude),
             "agy" | "antigravity" | "antigravity-cli" => Some(AiTool::Agy),
             "codex" | "codex-cli" => Some(AiTool::Codex),
-            _ => {
-                let lower = token.to_ascii_lowercase();
-                if lower.contains("@anthropic-ai/claude-code")
-                    || lower.contains("/claude-code/")
-                    || lower.ends_with("/claude")
-                {
-                    Some(AiTool::Claude)
-                } else if lower.contains("antigravity-cli") || lower.ends_with("/agy") {
-                    Some(AiTool::Agy)
-                } else if lower.contains("@openai/codex") || lower.ends_with("/codex") {
-                    Some(AiTool::Codex)
-                } else {
-                    None
-                }
-            }
+            _ => None,
         }
     };
 
     if let Some(p) = exe_path
         && let Some(s) = p.to_str()
-        && let Some(tool) = match_token(s)
+    {
+        if let Some(tool) = match_basename(s) {
+            return Some(tool);
+        }
+        // Claude Code ネイティブ版は `~/.local/share/claude/versions/<version>` へのシンボリックリンク
+        let lower = s.to_ascii_lowercase();
+        if lower.contains("/claude/versions/") {
+            return Some(AiTool::Claude);
+        }
+    }
+
+    // シンボリックリンク起動（例: `~/.local/bin/claude -> .../versions/2.1.x`）を argv[0] で判別
+    if let Some(argv0) = args.first()
+        && let Some(tool) = match_basename(argv0)
     {
         return Some(tool);
     }
-    for arg in args.iter().take(4) {
-        if let Some(tool) = match_token(arg) {
-            return Some(tool);
+
+    // node / bun / deno 経由の起動時は node_modules 配下の公式パッケージパスのみを対象にする
+    let is_js_runtime = exe_path
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .is_some_and(|name| matches!(name.to_ascii_lowercase().as_str(), "node" | "bun" | "deno"));
+    if is_js_runtime {
+        for arg in args.iter().skip(1).take(3) {
+            let lower = arg.to_ascii_lowercase();
+            if lower.contains("node_modules/@anthropic-ai/claude-code") {
+                return Some(AiTool::Claude);
+            }
+            if lower.contains("node_modules/@openai/codex") {
+                return Some(AiTool::Codex);
+            }
         }
     }
     None
@@ -172,22 +185,8 @@ pub fn detect_ai_tool_for_pid(pid: i32) -> Option<crate::daemon::AiTool> {
     if let Some(tool) = detect_ai_tool_from_process(exe.as_deref(), &[]) {
         return Some(tool);
     }
-    // node / bun / python 等のランタイム経由で起動されている場合のみ argv を確認
-    let is_runtime = exe
-        .as_deref()
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-        .is_some_and(|name| {
-            matches!(
-                name.to_ascii_lowercase().as_str(),
-                "node" | "bun" | "deno" | "python" | "python3" | "env"
-            )
-        });
-    if is_runtime {
-        let args = get_pid_cmdline_args(pid);
-        return detect_ai_tool_from_process(exe.as_deref(), &args);
-    }
-    None
+    let args = get_pid_cmdline_args(pid);
+    detect_ai_tool_from_process(exe.as_deref(), &args)
 }
 
 /// macOS ネイティブ通知をバックグラウンドスレッドで非同期送信する

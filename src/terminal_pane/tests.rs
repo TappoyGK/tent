@@ -896,46 +896,92 @@ fn test_ai_managed_pane_ignores_pty_noise_and_tracks_hook_lifecycle() {
     pane.last_output_at = old_ts;
     pane.last_output_instant = None;
 
-    // 1. AI 稼働中（agy / claude / codex）は、PTY にどんな TUI 再描画・フッター更新・大量出力が来ても
-    //    一般ルールによる時刻更新・緑LED・黄LED が一切発火しないこと
+    // 1. フック未受信の AI ペイン（フック未設定ユーザー）は一般ルールがそのまま動くこと
     assert!(pane.update_ai_tool_from_daemon(Some(AiTool::Agy)));
+    assert!(!pane.is_ai_hook_managed());
+    pane.feed_pty_bytes(b"\r\nunhooked output\r\n> ", false, true, "1");
+    assert!(pane.last_output_at > old_ts);
+    assert!(pane.had_background_output);
+
+    // 2. SessionStart (Idle) 等のフックを受信した瞬間から AI フック管理モードに入り、
+    //    以降 PTY にどんな TUI 再描画・フッター更新が来ても一般ルールが一切発火しないこと
+    assert!(pane.apply_ai_hook_event(AiHookState::Idle, Some(AiTool::Agy), false, true, "1"));
+    assert!(pane.is_ai_hook_managed());
+    let ts_after_idle = pane.last_output_at;
     pane.feed_pty_bytes(
         b"\r\nstatus bar updated\r\nhint: press /help\r\nspinner ...",
         false,
         true,
         "1",
     );
-    assert_eq!(pane.last_output_at, old_ts);
+    assert_eq!(pane.last_output_at, ts_after_idle);
     assert!(!pane.is_actively_outputting(Instant::now()));
     assert!(!pane.had_background_output);
     let after_idle = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_secs(1);
     assert!(!pane.update_waiting_state(after_idle, false, Some("1")));
     assert!(!pane.is_waiting_input);
 
-    // 2. Working フックで緑LED（is_actively_outputting）が点灯し、2 秒以上無出力でも点灯を維持すること
-    pane.apply_ai_hook_event(AiHookState::Working, Some(AiTool::Agy), false, true, "1");
-    assert!(pane.last_output_at > old_ts);
+    // 3. Working フックで緑LED（is_actively_outputting）が点灯し、2 秒以上無出力でも点灯を維持すること
+    assert!(pane.apply_ai_hook_event(AiHookState::Working, Some(AiTool::Agy), false, true, "1"));
     assert!(pane.is_actively_outputting(Instant::now() + Duration::from_secs(30)));
     assert!(!pane.is_waiting_input);
 
-    // 3. Waiting フックで緑が消え、裏スロットが黄LED（is_waiting_input）になること
-    pane.apply_ai_hook_event(AiHookState::Waiting, Some(AiTool::Agy), false, true, "1");
+    // 4. Waiting フックで緑が消え、裏スロットが黄LED（is_waiting_input）になること。
+    //    さらに連続で届いた 2 回目の Waiting（PermissionRequest 後の Notification 等）は無視されること
+    assert!(pane.apply_ai_hook_event(AiHookState::Waiting, Some(AiTool::Agy), false, true, "1"));
     assert!(!pane.is_actively_outputting(Instant::now()));
     assert!(pane.is_waiting_input);
+    let ts_first_waiting = pane.last_output_at;
+    assert!(!pane.apply_ai_hook_event(AiHookState::Waiting, Some(AiTool::Agy), false, true, "1"));
+    assert_eq!(pane.last_output_at, ts_first_waiting);
 
-    // 4. Idle フック（ユーザーキャンセル等）で緑も黄もクリアされること
-    pane.apply_ai_hook_event(AiHookState::Idle, Some(AiTool::Agy), false, true, "1");
+    // 5. Idle フック（ユーザーキャンセル等）で緑も黄もクリアされること
+    assert!(pane.apply_ai_hook_event(AiHookState::Idle, Some(AiTool::Agy), false, true, "1"));
     assert!(!pane.is_actively_outputting(Instant::now()));
     assert!(!pane.is_waiting_input);
 
-    // 5. AI 終了してシェルへ戻ると一般ルールへ復帰し、通常出力を検知できること
+    // 6. AI 終了してシェルへ戻ると一般ルールへ復帰し、通常出力を検知できること
     assert!(pane.update_ai_tool_from_daemon(None));
+    assert!(!pane.is_ai_hook_managed());
     pane.feed_pty_bytes(b"\r\nhello from shell\r\n$ ", false, true, "1");
     assert!(pane.is_actively_outputting(Instant::now()));
     assert!(pane.had_background_output);
     let after_shell_idle = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
     assert!(pane.update_waiting_state(after_shell_idle, false, Some("1")));
     assert!(pane.is_waiting_input);
+}
+
+#[test]
+fn test_fast_path_does_not_extend_timestamp_on_repeated_invisible_redraws() {
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    use super::{STARTUP_GRACE_PERIOD, TerminalPane};
+    use crate::daemon::{DaemonClient, ReplayedPane};
+
+    let mut pane = TerminalPane::attach_from_replay(
+        ReplayedPane {
+            pane_id: 1,
+            cols: 60,
+            rows: 10,
+            cwd: PathBuf::from("/tmp"),
+            replay_bytes: b"done 18:39\r\n> ".to_vec(),
+        },
+        DaemonClient::dummy_for_test(),
+    )
+    .unwrap();
+    pane.created_at = Instant::now() - STARTUP_GRACE_PERIOD - Duration::from_secs(1);
+    pane.mark_screen_seen();
+    let old_ts = pane.last_output_at - chrono::TimeDelta::minutes(10);
+    pane.last_output_at = old_ts;
+    let initial_instant = Instant::now() - Duration::from_millis(10);
+    pane.last_output_instant = Some(initial_instant);
+
+    // 50ms 高速パス中に同一内容の不可視再描画が来ても時刻・last_output_instant を延長しないこと
+    pane.feed_pty_bytes(b"\x1b[?25l\x1b[1;1Hdone 18:39\x1b[?25h", false, true, "1");
+    assert_eq!(pane.last_output_at, old_ts);
+    assert_eq!(pane.last_output_instant, Some(initial_instant));
+    assert!(!pane.had_background_output);
 }
 
 #[test]
