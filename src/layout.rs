@@ -109,6 +109,7 @@ pub struct AppLayout {
     pub window_h: f32,
     pub main_rect: Rect,
     pub main_status_rect: Rect,
+    pub main_footer_rect: Rect,
     pub main_inner_rect: Rect,
     pub sidebar_rect: Rect,
     pub sidebar_state: SidebarState,
@@ -151,12 +152,14 @@ impl AppLayout {
         let main_rect = Rect::new(0.0, 0.0, main_w, h);
         let status_h = pad + toggle_h;
         let main_status_rect = Rect::new(0.0, 0.0, main_w, status_h);
+        let footer_h = (20.0 * scale).min((h - status_h).max(0.0));
+        let main_footer_rect = Rect::new(0.0, (h - footer_h).max(status_h), main_w, footer_h);
         let main_pad = 8.0 * scale;
         let main_inner_rect = Rect::new(
             main_rect.x + main_pad,
             main_status_rect.bottom() + main_pad,
             (main_rect.w - main_pad * 2.0).max(1.0),
-            (main_rect.h - main_status_rect.h - main_pad * 2.0).max(1.0),
+            (main_footer_rect.y - main_status_rect.bottom() - main_pad * 2.0).max(1.0),
         );
 
         let sidebar_rect = Rect::new(main_w, 0.0, sidebar_w, h);
@@ -207,6 +210,7 @@ impl AppLayout {
             window_h: h,
             main_rect,
             main_status_rect,
+            main_footer_rect,
             main_inner_rect,
             sidebar_rect,
             sidebar_state,
