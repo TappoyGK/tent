@@ -447,3 +447,68 @@ fn test_build_shell_integration_launch_for_zsh_bash_fish() {
         k == "XDG_DATA_DIRS" && v.contains("shell-integration/fish:") && v.ends_with(":/usr/share")
     }));
 }
+
+#[test]
+fn test_hook_event_and_ai_tool_list_protocol_roundtrip() {
+    use std::io::Cursor;
+
+    use super::protocol::{
+        ClientMsg, read_client_msg, read_daemon_event, write_client_msg, write_daemon_event,
+    };
+    use super::{AiHookState, AiTool, DaemonEvent};
+
+    // ClientMsg::HookEvent 往復
+    let mut buf = Vec::new();
+    write_client_msg(
+        &mut buf,
+        &ClientMsg::HookEvent {
+            pane_id: 42,
+            state: AiHookState::Working,
+            tool: Some(AiTool::Claude),
+        },
+    )
+    .unwrap();
+    let decoded_client = read_client_msg(&mut Cursor::new(&buf)).unwrap();
+    assert!(matches!(
+        decoded_client,
+        ClientMsg::HookEvent {
+            pane_id: 42,
+            state: AiHookState::Working,
+            tool: Some(AiTool::Claude)
+        }
+    ));
+
+    // DaemonEvent::HookEvent & AiToolList 往復
+    let mut ev_buf = Vec::new();
+    write_daemon_event(
+        &mut ev_buf,
+        &DaemonEvent::HookEvent {
+            pane_id: 7,
+            state: AiHookState::Waiting,
+            tool: Some(AiTool::Agy),
+        },
+    )
+    .unwrap();
+    write_daemon_event(
+        &mut ev_buf,
+        &DaemonEvent::AiToolList(vec![(1, Some(AiTool::Codex)), (2, None)]),
+    )
+    .unwrap();
+
+    let mut cursor = Cursor::new(&ev_buf);
+    let ev1 = read_daemon_event(&mut cursor).unwrap();
+    assert!(matches!(
+        ev1,
+        DaemonEvent::HookEvent {
+            pane_id: 7,
+            state: AiHookState::Waiting,
+            tool: Some(AiTool::Agy)
+        }
+    ));
+    let ev2 = read_daemon_event(&mut cursor).unwrap();
+    assert!(matches!(
+        ev2,
+        DaemonEvent::AiToolList(ref list)
+            if list.as_slice() == [(1, Some(AiTool::Codex)), (2, None)]
+    ));
+}

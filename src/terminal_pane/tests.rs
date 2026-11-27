@@ -872,64 +872,69 @@ fn test_invisible_pty_redraw_does_not_update_timestamp_or_active_state() {
 }
 
 #[test]
-fn test_minor_footer_hint_change_does_not_trigger_waiting_input_but_real_reply_does() {
+fn test_ai_managed_pane_ignores_pty_noise_and_tracks_hook_lifecycle() {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     use super::{STARTUP_GRACE_PERIOD, TerminalPane, WAITING_IDLE_THRESHOLD};
-    use crate::daemon::{DaemonClient, ReplayedPane};
+    use crate::daemon::{AiHookState, AiTool, DaemonClient, ReplayedPane};
 
-    // 全 12 行が埋まった TUI 画面を準備
-    let initial = (1..=8)
-        .map(|i| format!("Body line {i}"))
-        .collect::<Vec<_>>()
-        .join("\r\n")
-        + "\r\n--------\r\nhint old\r\n> \r\nauto mode on";
     let mut pane = TerminalPane::attach_from_replay(
         ReplayedPane {
             pane_id: 1,
             cols: 60,
             rows: 12,
             cwd: PathBuf::from("/tmp"),
-            replay_bytes: initial.into_bytes(),
+            replay_bytes: b"Welcome to agy\r\n> ".to_vec(),
         },
         DaemonClient::dummy_for_test(),
     )
     .unwrap();
     pane.created_at = Instant::now() - STARTUP_GRACE_PERIOD - Duration::from_secs(1);
     pane.mark_screen_seen();
+    let old_ts = pane.last_output_at - chrono::TimeDelta::minutes(30);
+    pane.last_output_at = old_ts;
+    pane.last_output_instant = None;
 
-    // 1. 既存非空行のうち下部 UI（4 行 = 33%）だけのその場書き換えでは黄色にならないこと
+    // 1. AI 稼働中（agy / claude / codex）は、PTY にどんな TUI 再描画・フッター更新・大量出力が来ても
+    //    一般ルールによる時刻更新・緑LED・黄LED が一切発火しないこと
+    assert!(pane.update_ai_tool_from_daemon(Some(AiTool::Agy)));
     pane.feed_pty_bytes(
-        b"\x1b[9;1H========\x1b[10;1Hnew task? /clear\x1b[11;1H> _\x1b[12;1Hauto mode on - 1 agent",
+        b"\r\nstatus bar updated\r\nhint: press /help\r\nspinner ...",
         false,
         true,
         "1",
     );
-    let t1 = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
-    assert!(!pane.update_waiting_state(t1, false, Some("1")));
+    assert_eq!(pane.last_output_at, old_ts);
+    assert!(!pane.is_actively_outputting(Instant::now()));
+    assert!(!pane.had_background_output);
+    let after_idle = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_secs(1);
+    assert!(!pane.update_waiting_state(after_idle, false, Some("1")));
     assert!(!pane.is_waiting_input);
 
-    // 2. 画面の 50% 以上（12 行中 6 行以上）が動く実出力があれば黄色（入力待ち）になること
-    pane.feed_pty_bytes(
-        b"\x1b[2;1HReply 1\x1b[3;1HReply 2\x1b[4;1HReply 3\x1b[5;1HReply 4\x1b[6;1HReply 5\x1b[7;1HReply 6",
-        false,
-        true,
-        "1",
-    );
-    let t2 = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
-    assert!(pane.update_waiting_state(t2, false, Some("1")));
+    // 2. Working フックで緑LED（is_actively_outputting）が点灯し、2 秒以上無出力でも点灯を維持すること
+    pane.apply_ai_hook_event(AiHookState::Working, Some(AiTool::Agy), false, true, "1");
+    assert!(pane.last_output_at > old_ts);
+    assert!(pane.is_actively_outputting(Instant::now() + Duration::from_secs(30)));
+    assert!(!pane.is_waiting_input);
+
+    // 3. Waiting フックで緑が消え、裏スロットが黄LED（is_waiting_input）になること
+    pane.apply_ai_hook_event(AiHookState::Waiting, Some(AiTool::Agy), false, true, "1");
+    assert!(!pane.is_actively_outputting(Instant::now()));
     assert!(pane.is_waiting_input);
 
-    // 3. 空き行がある画面（clear 直後など）への 1 行新規追記は黄色になること
-    pane.terminal.vt_write(b"\x1b[2J\x1b[H$ sleep 9\r\n");
-    pane.is_waiting_input = false;
-    pane.had_background_output = false;
-    pane.mark_screen_seen();
-    pane.last_output_instant = None;
-    pane.feed_pty_bytes(b"done\r\n$ ", false, true, "1");
-    let t3 = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
-    assert!(pane.update_waiting_state(t3, false, Some("1")));
+    // 4. Idle フック（ユーザーキャンセル等）で緑も黄もクリアされること
+    pane.apply_ai_hook_event(AiHookState::Idle, Some(AiTool::Agy), false, true, "1");
+    assert!(!pane.is_actively_outputting(Instant::now()));
+    assert!(!pane.is_waiting_input);
+
+    // 5. AI 終了してシェルへ戻ると一般ルールへ復帰し、通常出力を検知できること
+    assert!(pane.update_ai_tool_from_daemon(None));
+    pane.feed_pty_bytes(b"\r\nhello from shell\r\n$ ", false, true, "1");
+    assert!(pane.is_actively_outputting(Instant::now()));
+    assert!(pane.had_background_output);
+    let after_shell_idle = Instant::now() + WAITING_IDLE_THRESHOLD + Duration::from_millis(100);
+    assert!(pane.update_waiting_state(after_shell_idle, false, Some("1")));
     assert!(pane.is_waiting_input);
 }
 

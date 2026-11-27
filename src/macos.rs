@@ -33,6 +33,163 @@ pub fn get_pid_cwd(pid: i32) -> Option<PathBuf> {
     }
 }
 
+/// 指定 PID の実行ファイルパスを macOS `proc_pidpath` で取得する
+pub fn get_pid_exe_path(pid: i32) -> Option<PathBuf> {
+    if pid <= 0 {
+        return None;
+    }
+    // macOS PROC_PIDPATHINFO_MAXSIZE = 4096
+    let mut buf = [0u8; 4096];
+    let ret = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    if ret <= 0 {
+        return None;
+    }
+    let len = (ret as usize).min(buf.len());
+    let s = std::str::from_utf8(&buf[..len]).ok()?;
+    if s.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(s))
+    }
+}
+
+/// 指定 PID のコマンドライン引数（先頭数個）を macOS `KERN_PROCARGS2` で取得する
+pub fn get_pid_cmdline_args(pid: i32) -> Vec<String> {
+    if pid <= 0 {
+        return Vec::new();
+    }
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut size: libc::size_t = 0;
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &raw mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || size < 4 {
+        return Vec::new();
+    }
+    let alloc_size = size.min(64 * 1024);
+    let mut buf = vec![0u8; alloc_size];
+    let mut actual_size = alloc_size;
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr().cast(),
+            &raw mut actual_size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || actual_size < 4 {
+        return Vec::new();
+    }
+    let argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]).max(0) as usize;
+    let data = &buf[4..actual_size];
+    // exec_path (NUL 終端) をスキップし、後続の NUL パディングも飛ばす
+    let Some(first_nul) = data.iter().position(|&b| b == 0) else {
+        return Vec::new();
+    };
+    let mut pos = first_nul;
+    while pos < data.len() && data[pos] == 0 {
+        pos += 1;
+    }
+    let mut args = Vec::with_capacity(argc.min(8));
+    for _ in 0..argc.min(8) {
+        if pos >= data.len() {
+            break;
+        }
+        let end = data[pos..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|o| pos + o)
+            .unwrap_or(data.len());
+        if let Ok(s) = std::str::from_utf8(&data[pos..end]) {
+            args.push(s.to_string());
+        }
+        pos = end + 1;
+    }
+    args
+}
+
+/// 実行ファイルパスと引数リストから監視対象 AI ツール（Claude Code / agy / Codex）を判別する
+pub fn detect_ai_tool_from_process(
+    exe_path: Option<&std::path::Path>,
+    args: &[String],
+) -> Option<crate::daemon::AiTool> {
+    use crate::daemon::AiTool;
+
+    let match_token = |token: &str| -> Option<AiTool> {
+        let base = std::path::Path::new(token)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(token)
+            .to_ascii_lowercase();
+        match base.as_str() {
+            "claude" | "claude-code" => Some(AiTool::Claude),
+            "agy" | "antigravity" | "antigravity-cli" => Some(AiTool::Agy),
+            "codex" | "codex-cli" => Some(AiTool::Codex),
+            _ => {
+                let lower = token.to_ascii_lowercase();
+                if lower.contains("@anthropic-ai/claude-code")
+                    || lower.contains("/claude-code/")
+                    || lower.ends_with("/claude")
+                {
+                    Some(AiTool::Claude)
+                } else if lower.contains("antigravity-cli") || lower.ends_with("/agy") {
+                    Some(AiTool::Agy)
+                } else if lower.contains("@openai/codex") || lower.ends_with("/codex") {
+                    Some(AiTool::Codex)
+                } else {
+                    None
+                }
+            }
+        }
+    };
+
+    if let Some(p) = exe_path
+        && let Some(s) = p.to_str()
+        && let Some(tool) = match_token(s)
+    {
+        return Some(tool);
+    }
+    for arg in args.iter().take(4) {
+        if let Some(tool) = match_token(arg) {
+            return Some(tool);
+        }
+    }
+    None
+}
+
+/// 指定 PID のプロセスが監視対象 AI ツールか判別する
+pub fn detect_ai_tool_for_pid(pid: i32) -> Option<crate::daemon::AiTool> {
+    let exe = get_pid_exe_path(pid);
+    if let Some(tool) = detect_ai_tool_from_process(exe.as_deref(), &[]) {
+        return Some(tool);
+    }
+    // node / bun / python 等のランタイム経由で起動されている場合のみ argv を確認
+    let is_runtime = exe
+        .as_deref()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .is_some_and(|name| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "node" | "bun" | "deno" | "python" | "python3" | "env"
+            )
+        });
+    if is_runtime {
+        let args = get_pid_cmdline_args(pid);
+        return detect_ai_tool_from_process(exe.as_deref(), &args);
+    }
+    None
+}
+
 /// macOS ネイティブ通知をバックグラウンドスレッドで非同期送信する
 pub fn send_notification(title: String, body: String) {
     thread::spawn(move || {

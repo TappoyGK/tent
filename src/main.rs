@@ -423,6 +423,20 @@ impl TentApp {
                         changed = true;
                     }
                 }
+                DaemonEvent::AiToolList(list) => {
+                    if workspace.apply_ai_tool_updates(list) {
+                        changed = true;
+                    }
+                }
+                DaemonEvent::HookEvent {
+                    pane_id,
+                    state,
+                    tool,
+                } => {
+                    if workspace.apply_hook_event(pane_id, state, tool, self.window_focused) {
+                        changed = true;
+                    }
+                }
                 DaemonEvent::Resync(rp) => {
                     if workspace.apply_resync(rp) {
                         changed = true;
@@ -1097,6 +1111,95 @@ impl ApplicationHandler<AppEvent> for TentApp {
     }
 }
 
+fn agy_hook_stdout_json(stdin_payload: &str) -> &'static str {
+    // agy の PreToolUse 契約は decision フィールドを必須とするため、PreToolUse 時は {"decision":"allow"} を返す
+    if stdin_payload.contains("\"PreToolUse\"") {
+        "{\"decision\":\"allow\"}"
+    } else {
+        "{}"
+    }
+}
+
+fn resolve_hook_state_from_stdin(
+    base_state: daemon::AiHookState,
+    tool: Option<daemon::AiTool>,
+    stdin_payload: &str,
+) -> daemon::AiHookState {
+    // agy の Stop フックはユーザー自身が Ctrl+C 等でキャンセルした場合にも発火するため、
+    // terminationReason が USER_CANCELED なら入力待ち（黄）にせず Idle としてクリアする
+    if base_state == daemon::AiHookState::Waiting
+        && tool == Some(daemon::AiTool::Agy)
+        && stdin_payload.contains("USER_CANCELED")
+    {
+        return daemon::AiHookState::Idle;
+    }
+    base_state
+}
+
+/// AI フックから呼び出される軽量 CLI (`tent hook <working|waiting|idle> [--tool claude|agy|codex]`)。
+/// TenT 外で実行された場合やデーモン未接続時は何もせず正常終了（exit 0）し、AI の動作を絶対に妨げない。
+fn run_hook_cli(mut args: impl Iterator<Item = String>) {
+    use std::io::{IsTerminal, Read};
+
+    let Some(state_arg) = args.next() else {
+        return;
+    };
+    let Some(base_state) = daemon::AiHookState::parse_name(&state_arg) else {
+        return;
+    };
+    let mut tool: Option<daemon::AiTool> = None;
+    let mut pane_id_override: Option<PaneId> = None;
+    let mut sock_override: Option<PathBuf> = None;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--tool" => {
+                if let Some(val) = args.next() {
+                    tool = daemon::AiTool::parse_name(&val);
+                }
+            }
+            "--pane-id" => {
+                if let Some(val) = args.next() {
+                    pane_id_override = val.parse::<PaneId>().ok();
+                }
+            }
+            "--socket" => {
+                if let Some(val) = args.next() {
+                    sock_override = Some(PathBuf::from(val));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // パイプ経由で渡されたフック JSON を読み込む（TTY からの手動実行時はブロックしない）
+    let mut stdin_payload = String::new();
+    if !std::io::stdin().is_terminal() {
+        let _ = std::io::stdin()
+            .take(64 * 1024)
+            .read_to_string(&mut stdin_payload);
+    }
+
+    let state = resolve_hook_state_from_stdin(base_state, tool, &stdin_payload);
+
+    let pane_id = pane_id_override.or_else(|| {
+        std::env::var("TENT_PANE_ID")
+            .ok()
+            .and_then(|s| s.parse::<PaneId>().ok())
+    });
+    if let Some(pane_id) = pane_id {
+        let sock_path = sock_override
+            .or_else(|| std::env::var_os("TENT_SOCKET").map(PathBuf::from))
+            .unwrap_or_else(default_socket_path);
+        let _ = daemon::send_hook_event(&sock_path, pane_id, state, tool);
+    }
+
+    // agy のフック契約は stdout に有効な JSON オブジェクトを返すことを要求する
+    if tool == Some(daemon::AiTool::Agy) {
+        println!("{}", agy_hook_stdout_json(&stdin_payload));
+    }
+}
+
 fn spawn_replacement_instance() {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -1139,18 +1242,25 @@ fn main() {
         }
     }));
 
-    // `--daemon [socket_path]` が指定された場合はバックグラウンドデーモンとして稼働
+    // `--daemon [socket_path]` / `hook <working|waiting|idle> [--tool claude|agy|codex]`
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() == Some("--daemon") {
-        let sock_path = args
-            .next()
-            .map(PathBuf::from)
-            .unwrap_or_else(default_socket_path);
-        if let Err(err) = daemon::run_daemon_server(&sock_path) {
-            eprintln!("TenT daemon error: {err}");
-            std::process::exit(1);
+    match args.next().as_deref() {
+        Some("--daemon") => {
+            let sock_path = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(default_socket_path);
+            if let Err(err) = daemon::run_daemon_server(&sock_path) {
+                eprintln!("TenT daemon error: {err}");
+                std::process::exit(1);
+            }
+            return;
         }
-        return;
+        Some("hook") => {
+            run_hook_cli(args);
+            return;
+        }
+        _ => {}
     }
 
     let event_loop = EventLoop::<AppEvent>::with_user_event()
@@ -1204,5 +1314,63 @@ mod tests {
         assert_eq!(selection_autoscroll_delta(405.0, pane, cell_h), 1);
         assert!(selection_autoscroll_delta(440.0, pane, cell_h) > 1);
         assert_eq!(selection_autoscroll_delta(1000.0, pane, cell_h), 4);
+    }
+
+    #[test]
+    fn test_hook_cli_helpers_and_ai_process_detection() {
+        use std::path::Path;
+
+        use crate::daemon::{AiHookState, AiTool};
+
+        // agy の Stop フックは USER_CANCELED なら Idle、それ以外は Waiting
+        assert_eq!(
+            resolve_hook_state_from_stdin(
+                AiHookState::Waiting,
+                Some(AiTool::Agy),
+                r#"{"terminationReason":"USER_CANCELED"}"#,
+            ),
+            AiHookState::Idle
+        );
+        assert_eq!(
+            resolve_hook_state_from_stdin(
+                AiHookState::Waiting,
+                Some(AiTool::Agy),
+                r#"{"terminationReason":"NO_TOOL_CALL"}"#,
+            ),
+            AiHookState::Waiting
+        );
+
+        // agy の PreToolUse だけは {"decision":"allow"} を返す
+        assert_eq!(
+            agy_hook_stdout_json(
+                r#"{"hookEventName":"PreToolUse","toolCall":{"name":"ask_question"}}"#
+            ),
+            r#"{"decision":"allow"}"#
+        );
+        assert_eq!(agy_hook_stdout_json(r#"{"hookEventName":"Stop"}"#), "{}");
+
+        // プロセス名・コマンドラインからの AI 3 ツール判別
+        assert_eq!(
+            macos::detect_ai_tool_from_process(Some(Path::new("/Users/me/.local/bin/agy")), &[]),
+            Some(AiTool::Agy)
+        );
+        assert_eq!(
+            macos::detect_ai_tool_from_process(Some(Path::new("/opt/homebrew/bin/codex")), &[]),
+            Some(AiTool::Codex)
+        );
+        assert_eq!(
+            macos::detect_ai_tool_from_process(
+                Some(Path::new("/opt/homebrew/bin/node")),
+                &[
+                    "node".to_string(),
+                    "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/cli.js".to_string(),
+                ],
+            ),
+            Some(AiTool::Claude)
+        );
+        assert_eq!(
+            macos::detect_ai_tool_from_process(Some(Path::new("/bin/zsh")), &[]),
+            None
+        );
     }
 }
