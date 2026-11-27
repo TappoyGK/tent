@@ -246,7 +246,7 @@ impl TentApp {
                         && let Some(root) = ws.active_slot_mut().root.as_mut()
                         && let Some(pane) = root.terminal_pane_mut(sel.pane_id)
                     {
-                        let text = pane.extract_selection_text(sel.start, sel.end);
+                        let text = pane.extract_screen_selection_text(sel.start, sel.end);
                         if !text.is_empty() {
                             macos::write_clipboard_text(&text);
                         }

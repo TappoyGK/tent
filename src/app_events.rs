@@ -12,7 +12,9 @@ use crate::layout::{SidebarHit, StatusBarHit};
 use crate::macos;
 use crate::renderer::{RenderOverlays, SelectionOverlay, UrlHoverOverlay};
 use crate::slot::Workspace;
-use crate::{SelectionState, SlotDragState, TentApp};
+use crate::{
+    ClickTracker, MULTI_CLICK_INTERVAL, SelectionMode, SelectionState, SlotDragState, TentApp,
+};
 
 impl TentApp {
     pub(crate) fn handle_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
@@ -93,17 +95,8 @@ impl TentApp {
                     }
                 }
 
-                if let Some(sel) = self.selection.as_ref()
-                    && sel.active
-                {
-                    let rect = sel.pane_rect;
-                    let cell = self.pixel_to_cell(rect, px, py);
-                    if let Some(sel_mut) = self.selection.as_mut()
-                        && sel_mut.end != cell
-                    {
-                        sel_mut.end = cell;
-                        self.request_redraw_now();
-                    }
+                if self.extend_selection_to_cursor(px, py) {
+                    self.request_redraw_now();
                 }
             }
             WindowEvent::MouseInput {
@@ -302,19 +295,60 @@ impl TentApp {
                         if let Some(ws) = self.workspace.as_mut()
                             && let Some((pid, prect)) = ws.focus_pane_at(px, py)
                         {
-                            let is_terminal = ws
-                                .active_slot_ref()
-                                .root
+                            let vp_cell = self.pixel_to_cell(prect, px, py);
+                            let now = Instant::now();
+                            let click_tol = 8.0 * scale;
+                            let click_count = match &self.last_click {
+                                Some(prev)
+                                    if prev.pane_id == pid
+                                        && now.duration_since(prev.time)
+                                            <= MULTI_CLICK_INTERVAL
+                                        && (px - prev.pos.0).hypot(py - prev.pos.1)
+                                            <= click_tol =>
+                                {
+                                    (prev.count % 3) + 1
+                                }
+                                _ => 1,
+                            };
+                            self.last_click = Some(ClickTracker {
+                                time: now,
+                                pane_id: pid,
+                                pos: (px, py),
+                                count: click_count,
+                            });
+
+                            let mode = match click_count {
+                                2 => SelectionMode::Word,
+                                3 => SelectionMode::Line,
+                                _ => SelectionMode::Char,
+                            };
+
+                            let selection_bounds = self
+                                .workspace
                                 .as_ref()
+                                .and_then(|ws| ws.active_slot_ref().root.as_ref())
                                 .and_then(|r| r.terminal_pane(pid))
-                                .is_some();
-                            if is_terminal {
-                                let cell = self.pixel_to_cell(prect, px, py);
+                                .map(|pane| {
+                                    let (col, srow) = pane.viewport_cell_to_screen(vp_cell);
+                                    match mode {
+                                        SelectionMode::Char => ((col, srow), (col, srow)),
+                                        SelectionMode::Word => {
+                                            let (ws_col, we_col) =
+                                                pane.word_bounds_at_screen(col, srow);
+                                            ((ws_col, srow), (we_col, srow))
+                                        }
+                                        SelectionMode::Line => pane.line_bounds_at_screen(srow),
+                                    }
+                                });
+                            if let Some((start, end)) = selection_bounds {
                                 self.selection = Some(SelectionState {
                                     pane_id: pid,
                                     pane_rect: prect,
-                                    start: cell,
-                                    end: cell,
+                                    mode,
+                                    anchor_start: start,
+                                    anchor_end: end,
+                                    start,
+                                    end,
                                     active: true,
                                 });
                             }
@@ -362,7 +396,7 @@ impl TentApp {
                     && sel.active
                 {
                     sel.active = false;
-                    if sel.start == sel.end {
+                    if sel.mode == SelectionMode::Char && sel.start == sel.end {
                         self.selection = None;
                         self.request_redraw_now();
                     }
@@ -539,11 +573,21 @@ impl TentApp {
                     selection: self
                         .selection
                         .as_ref()
-                        .filter(|s| s.start != s.end)
-                        .map(|s| SelectionOverlay {
-                            pane_id: s.pane_id,
-                            start: s.start,
-                            end: s.end,
+                        .filter(|s| s.mode != SelectionMode::Char || s.start != s.end)
+                        .and_then(|s| {
+                            let pane = self
+                                .workspace
+                                .as_ref()?
+                                .active_slot_ref()
+                                .root
+                                .as_ref()?
+                                .terminal_pane(s.pane_id)?;
+                            let (start, end) = pane.screen_selection_to_viewport(s.start, s.end)?;
+                            Some(SelectionOverlay {
+                                pane_id: s.pane_id,
+                                start,
+                                end,
+                            })
                         }),
                     hovered_url: self.hovered_url.as_ref().map(|(pid, m)| UrlHoverOverlay {
                         pane_id: *pid,

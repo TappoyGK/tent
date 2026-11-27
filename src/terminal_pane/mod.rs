@@ -19,7 +19,11 @@ use crate::daemon::{DaemonClient, ReplayedPane};
 use crate::macos;
 
 pub use selection::UrlMatch;
-use selection::{extract_selection_from_terminal, find_url_at_cell};
+use selection::{
+    extract_selection_from_screen, extract_selection_from_terminal, find_url_at_cell,
+    line_bounds_at_screen, screen_selection_to_viewport, viewport_top_screen_row,
+    word_bounds_at_screen,
+};
 pub use snapshot::{MainScreenSnapshot, MinimapSnapshot};
 pub type PaneId = u64;
 
@@ -657,9 +661,50 @@ impl TerminalPane {
         false
     }
 
-    /// 指定のセル範囲 (col, row) から選択テキストを抽出する（Cmd+C コピー用）
+    /// 指定のセル範囲 (col, row) から選択テキストを抽出する（ビューポート座標版）
+    #[cfg(test)]
     pub fn extract_selection_text(&mut self, a: (u16, u16), b: (u16, u16)) -> String {
         extract_selection_from_terminal(&self.terminal, self.cols, self.rows, a, b)
+    }
+
+    /// ビューポートセル `(col, vp_row)` をスクロールバック込みの `Screen` 絶対座標へ変換する
+    pub fn viewport_cell_to_screen(&self, cell: (u16, u16)) -> (u16, u32) {
+        let vp_top = viewport_top_screen_row(&self.terminal);
+        let col = cell.0.min(self.cols.saturating_sub(1));
+        let row = cell.1.min(self.rows.saturating_sub(1));
+        (col, vp_top.saturating_add(u32::from(row)))
+    }
+
+    /// `Screen` 絶対座標 `(col, screen_row)` の単語範囲 `(start_col, end_col)` を返す
+    pub fn word_bounds_at_screen(&self, col: u16, screen_row: u32) -> (u16, u16) {
+        word_bounds_at_screen(&self.terminal, self.cols, col, screen_row)
+    }
+
+    /// `Screen` 絶対座標 `screen_row` を含む論理行（ソフトラップ連結）全体の範囲を返す
+    pub fn line_bounds_at_screen(&self, screen_row: u32) -> ((u16, u32), (u16, u32)) {
+        line_bounds_at_screen(&self.terminal, self.cols, screen_row)
+    }
+
+    /// `Screen` 絶対座標の範囲から選択テキストを抽出する（Cmd+C コピー・スクロールバック跨ぎ対応）
+    pub fn extract_screen_selection_text(&self, a: (u16, u32), b: (u16, u32)) -> String {
+        extract_selection_from_screen(&self.terminal, self.cols, a, b)
+    }
+
+    /// `Screen` 絶対座標の選択範囲を現在のビューポート範囲へ投影する（ハイライト描画用）
+    pub fn screen_selection_to_viewport(
+        &self,
+        a: (u16, u32),
+        b: (u16, u32),
+    ) -> Option<((u16, u16), (u16, u16))> {
+        let vp_top = viewport_top_screen_row(&self.terminal);
+        screen_selection_to_viewport(a, b, vp_top, self.cols, self.rows)
+    }
+
+    /// 代替画面（vim / less / tmux 等）が表示中か返す
+    pub fn is_alt_screen(&self) -> bool {
+        self.terminal.mode(Mode::ALT_SCREEN_SAVE).unwrap_or(false)
+            || self.terminal.mode(Mode::ALT_SCREEN).unwrap_or(false)
+            || self.terminal.mode(Mode::ALT_SCREEN_LEGACY).unwrap_or(false)
     }
 
     /// 指定のビューポートセル (col, row) にある URL（OSC 8 ハイパーリンクまたは http/https）を返す
