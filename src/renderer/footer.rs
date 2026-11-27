@@ -1,4 +1,4 @@
-use glyphon::{Attrs, Buffer, Color, Family, Metrics, Shaping, TextArea};
+use glyphon::{Attrs, Buffer, Color, Family, Metrics, Shaping, TextArea, Wrap};
 
 use crate::layout::{AppLayout, Rect};
 use crate::slot::{Slot, SlotViewMode};
@@ -134,8 +134,9 @@ impl Renderer {
         let scale_key = (scale_factor * 100.0).round() as u32;
 
         while self.footer_buffers.len() < columns.len() {
-            self.footer_buffers
-                .push(Buffer::new(&mut self.font_system, metrics));
+            let mut buf = Buffer::new(&mut self.font_system, metrics);
+            buf.set_wrap(Wrap::None);
+            self.footer_buffers.push(buf);
             self.footer_cache_keys.push((String::new(), 0, 0));
         }
         self.footer_buffers.truncate(columns.len());
