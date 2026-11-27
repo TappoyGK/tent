@@ -699,10 +699,25 @@ impl TerminalPane {
         Some((coord.x, coord.y))
     }
 
-    /// 追跡ピンで指定された選択範囲からテキストを抽出する（ピン無効時は空文字列）
+    /// 追跡ピン 2 点から選択範囲 `(start, end)` を解決する。
+    /// 片方の端だけがスクロールバック先頭パージ等で消えた場合は、消えた端を先頭 `(0, 0)` へ寄せて
+    /// 残存部分の選択を保持する。両方消滅した場合のみ `None` を返す。
+    pub fn resolve_tracked_selection_range(
+        &self,
+        a: &TrackedGridRef,
+        b: &TrackedGridRef,
+    ) -> Option<((u16, u32), (u16, u32))> {
+        match (self.resolve_tracked_point(a), self.resolve_tracked_point(b)) {
+            (Some(pa), Some(pb)) => Some((pa, pb)),
+            (None, Some(pb)) => Some(((0, 0), pb)),
+            (Some(pa), None) => Some((pa, (0, 0))),
+            (None, None) => None,
+        }
+    }
+
+    /// 追跡ピンで指定された選択範囲からテキストを抽出する（両方消滅時は空文字列）
     pub fn extract_tracked_selection_text(&self, a: &TrackedGridRef, b: &TrackedGridRef) -> String {
-        let (Some(pa), Some(pb)) = (self.resolve_tracked_point(a), self.resolve_tracked_point(b))
-        else {
+        let Some((pa, pb)) = self.resolve_tracked_selection_range(a, b) else {
             return String::new();
         };
         self.extract_screen_selection_text(pa, pb)
@@ -715,8 +730,7 @@ impl TerminalPane {
         a: &TrackedGridRef,
         b: &TrackedGridRef,
     ) -> Option<((u16, u16), (u16, u16))> {
-        let pa = self.resolve_tracked_point(a)?;
-        let pb = self.resolve_tracked_point(b)?;
+        let (pa, pb) = self.resolve_tracked_selection_range(a, b)?;
         self.screen_selection_to_viewport(pa, pb)
     }
 

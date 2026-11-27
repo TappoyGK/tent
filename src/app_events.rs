@@ -607,8 +607,7 @@ impl TentApp {
                             .root
                             .as_ref()?
                             .terminal_pane(s.pane_id)?;
-                        let pa = pane.resolve_tracked_point(&s.start)?;
-                        let pb = pane.resolve_tracked_point(&s.end)?;
+                        let (pa, pb) = pane.resolve_tracked_selection_range(&s.start, &s.end)?;
                         if s.mode == SelectionMode::Char && pa == pb {
                             return None;
                         }

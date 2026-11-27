@@ -547,10 +547,9 @@ impl TentApp {
             .and_then(|ws| ws.active_slot_ref().root.as_ref())
             .and_then(|root| root.terminal_pane(pid))
             .and_then(|pane| {
-                let anchor_start = pane.resolve_tracked_point(&sel.anchor_start)?;
-                let anchor_end = pane.resolve_tracked_point(&sel.anchor_end)?;
-                let cur_start_old = pane.resolve_tracked_point(&sel.start);
-                let cur_end_old = pane.resolve_tracked_point(&sel.end);
+                let (anchor_start, anchor_end) =
+                    pane.resolve_tracked_selection_range(&sel.anchor_start, &sel.anchor_end)?;
+                let cur_range_old = pane.resolve_tracked_selection_range(&sel.start, &sel.end);
                 let (col, srow) = pane.viewport_cell_to_screen(vp_cell);
                 let (new_start, new_end) = match mode {
                     SelectionMode::Char => (anchor_start, (col, srow)),
@@ -573,7 +572,7 @@ impl TentApp {
                         }
                     }
                 };
-                if cur_start_old == Some(new_start) && cur_end_old == Some(new_end) {
+                if cur_range_old == Some((new_start, new_end)) {
                     return Some(None);
                 }
                 let start_pin = pane.track_screen_point(new_start)?;

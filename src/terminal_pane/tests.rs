@@ -750,38 +750,70 @@ fn test_tracked_selection_survives_scrollback_pruning_and_clears_on_csi_3j() {
     let mut pane = TerminalPane::attach_from_replay(
         ReplayedPane {
             pane_id: 1,
-            cols: 20,
-            rows: 4,
+            cols: 12,
+            rows: 3,
             cwd: PathBuf::from("/tmp"),
             replay_bytes: Vec::new(),
         },
         DaemonClient::dummy_for_test(),
     )
     .unwrap();
-    // スクロールバック上限を小さくして先頭パージを起こす
-    pane.terminal.set_scrollback_max_bytes(Some(1024)).unwrap();
+    // スクロールバック上限を最小にしてページ単位の先頭パージを確実に発生させる
+    pane.terminal.set_scrollback_max_bytes(Some(1)).unwrap();
 
-    for i in 1..=80 {
-        pane.terminal.vt_write(format!("L{i:03}\r\n").as_bytes());
+    // まず十分な行数を流してパージ閾値付近まで溜める
+    let mut line_no: u32 = 0;
+    let mut batch = String::new();
+    for _ in 0..10_000 {
+        line_no += 1;
+        batch.push_str(&format!("L{line_no:06}\r\n"));
     }
-    // 最新の出力付近（まだパージされない位置）を追跡ピンで選択
+    pane.terminal.vt_write(batch.as_bytes());
+
+    // 1. 末尾付近の行（パージ後も残る位置）と、先頭 (0, 0)（パージで消える位置）にピンを立てる
     let vp_top = pane.viewport_top_screen_row();
-    let target_row = vp_top.saturating_sub(2);
-    let pin_a = pane.track_screen_point((0, target_row)).unwrap();
-    let pin_b = pane.track_screen_point((3, target_row)).unwrap();
-    let original = pane.extract_tracked_selection_text(&pin_a, &pin_b);
-    assert!(original.starts_with('L'));
+    let tail_row = vp_top.saturating_sub(2);
+    let tail_a = pane.track_screen_point((0, tail_row)).unwrap();
+    let tail_b = pane.track_screen_point((6, tail_row)).unwrap();
+    let head_pin = pane.track_screen_point((0, 0)).unwrap();
 
-    // 追加出力でスクロールバック先頭をパージさせても、残存している行は同じ内容を指し続けること
-    for i in 81..=100 {
-        pane.terminal.vt_write(format!("L{i:03}\r\n").as_bytes());
+    let original_tail = pane.extract_tracked_selection_text(&tail_a, &tail_b);
+    assert!(original_tail.starts_with('L'));
+    let before_tail_y = pane.resolve_tracked_point(&tail_a).unwrap().1;
+
+    // 実際にスクロールバック先頭がパージされる（head_pin が None になり tail_a の y が減少する）まで流す
+    let mut pruned = false;
+    for _ in 0..30 {
+        batch.clear();
+        for _ in 0..1_000 {
+            line_no += 1;
+            batch.push_str(&format!("L{line_no:06}\r\n"));
+        }
+        pane.terminal.vt_write(batch.as_bytes());
+        if pane.resolve_tracked_point(&head_pin).is_none() {
+            pruned = true;
+            break;
+        }
     }
-    let after_prune = pane.extract_tracked_selection_text(&pin_a, &pin_b);
-    assert_eq!(after_prune, original);
+    assert!(pruned, "scrollback head pruning must have occurred");
 
-    // CSI 3 J（スクロールバック消去）で対象行が消えたら別内容を指さず無効になること
+    // 2. パージで座標が前へ詰まっても、残存行のピンは元の内容を指し続けること
+    let after_tail_y = pane.resolve_tracked_point(&tail_a).unwrap().1;
+    assert!(after_tail_y < before_tail_y);
+    assert_eq!(
+        pane.extract_tracked_selection_text(&tail_a, &tail_b),
+        original_tail
+    );
+
+    // 3. 片方の端（head_pin）だけがパージされた場合、先頭 (0, 0) へ寄せて残存部分の選択が保たれること
+    let clamped_range = pane.resolve_tracked_selection_range(&head_pin, &tail_b);
+    assert_eq!(clamped_range, Some(((0, 0), (6, after_tail_y))));
+    let partial_text = pane.extract_tracked_selection_text(&head_pin, &tail_b);
+    assert!(partial_text.ends_with(&original_tail));
+
+    // 4. CSI 3 J（スクロールバック消去）で両方消えた場合は別内容を指さず無効になること
     pane.terminal.vt_write(b"\x1b[3J");
-    assert_eq!(pane.resolve_tracked_point(&pin_a), None);
-    assert_eq!(pane.tracked_selection_to_viewport(&pin_a, &pin_b), None);
-    assert_eq!(pane.extract_tracked_selection_text(&pin_a, &pin_b), "");
+    assert_eq!(pane.resolve_tracked_selection_range(&tail_a, &tail_b), None);
+    assert_eq!(pane.tracked_selection_to_viewport(&tail_a, &tail_b), None);
+    assert_eq!(pane.extract_tracked_selection_text(&tail_a, &tail_b), "");
 }
