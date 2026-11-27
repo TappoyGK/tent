@@ -752,9 +752,12 @@ impl BrowserManager {
         }
     }
 
-    /// 閉じられたブラウザペインの WebView を破棄する
-    pub fn retain_ids(&mut self, live_ids: &[PaneId]) {
+    /// 閉じられたブラウザペインの WebView を破棄する。
+    /// 1 つ以上破棄した場合は `true` を返す（親ビューのカーソル矩形再計算トリガー用）。
+    pub fn retain_ids(&mut self, live_ids: &[PaneId]) -> bool {
+        let before = self.views.len();
         self.views.retain(|id, _| live_ids.contains(id));
+        self.views.len() != before
     }
 
     pub fn navigate(&self, pane_id: PaneId, url: &str) {

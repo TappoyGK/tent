@@ -470,6 +470,9 @@ pub fn install_cursor_rect_passthrough(window: &winit::window::Window) {
             }
         }
 
+        // 注: winit の resetCursorRects を直接差し替えるため、現状 TenT が使用する
+        // Pointer / Default の 2 状態のみを TERMINAL_POINTER_CURSOR で反映している。
+        // 今後ほかのカーソルアイコンや set_cursor_visible(false) を使う場合はここも合わせて拡張する。
         let Some(cursor_cls) = AnyClass::get(c"NSCursor") else {
             return;
         };

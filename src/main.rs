@@ -309,7 +309,10 @@ impl TentApp {
         };
         let scale = window.scale_factor();
         let live_ids = ws.all_browser_ids();
-        self.browsers.retain_ids(&live_ids);
+        if self.browsers.retain_ids(&live_ids) {
+            // 最後の表示中 WebView を閉じた直後でも WinitView のカーソル矩形を張り直す
+            crate::macos::invalidate_cursor_rects(window);
+        }
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.retain_browser_textures(&live_ids);
         }
