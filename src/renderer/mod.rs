@@ -1,3 +1,4 @@
+mod footer;
 mod help_modal;
 mod main_pane;
 mod primitives;
@@ -166,6 +167,10 @@ pub struct Renderer {
     timer_cache_key: String,
     status_btn_buffers: [Buffer; 8],
     status_btn_labels: [String; 8],
+
+    // メインパネル下端フッター（ペイン別最終更新時刻）用バッファ
+    footer_buffers: Vec<Buffer>,
+    footer_cache_keys: Vec<(String, u32, u32)>,
 
     // ショートカットヘルプダイアログ用バッファ
     help_header_buffer: Buffer,
@@ -495,6 +500,8 @@ impl Renderer {
             timer_cache_key: String::new(),
             status_btn_buffers,
             status_btn_labels: std::array::from_fn(|_| String::new()),
+            footer_buffers: Vec::new(),
+            footer_cache_keys: Vec::new(),
             help_header_buffer,
             help_left_buffer,
             help_right_buffer,
@@ -607,6 +614,9 @@ impl Renderer {
         self.url_bar_cache_key = (String::new(), false, 0);
         self.clock_text.clear();
         self.status_btn_labels = std::array::from_fn(|_| String::new());
+        for key in &mut self.footer_cache_keys {
+            key.2 = 0;
+        }
         self.help_cache_key = (0, 0);
     }
 
@@ -681,6 +691,14 @@ impl Renderer {
             focused_pane_id,
             scale_factor,
             overlays,
+            &mut rects,
+        );
+        let footer_columns = self.build_footer(
+            &workspace.slots[active_idx],
+            &active_pane_rects,
+            layout,
+            scale_factor,
+            pane_gap,
             &mut rects,
         );
         let cursor_area = main_res.cursor_area;
@@ -759,6 +777,13 @@ impl Renderer {
             overlays,
             &main_res,
             wide_pad_x,
+            &mut text_areas,
+        );
+        footer::push_footer_text_areas(
+            &self.footer_buffers,
+            &footer_columns,
+            layout,
+            scale_factor,
             &mut text_areas,
         );
         sidebar::push_sidebar_text_areas(
