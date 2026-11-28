@@ -26,7 +26,7 @@ TenT は **Claude Code / agy / Codex** の 3 ツールをフォアグラウン�
 
 - `SessionStart` は `startup|resume|clear` に絞り、自動コンパクション（`compact`）時に作業中の緑表示が消えないようにします。
 - `Notification` の `matcher` は `permission_prompt|elicitation_dialog|elicitation_url_dialog` に絞り、サンドボックス内ネットワーク許可待ちや MCP 問い合わせを拾いつつ、`idle_prompt` / `auth_success` での誤点灯を防ぎます（`PermissionRequest` の後に届く `permission_prompt` の重複は TenT 側で抑止されます）。
-- **サブエージェントの扱い**: `SubagentStop` / `SubagentStart` は登録不要です（万が一登録されても `tent hook` がトップレベルの `hook_event_name` で自動無視します）。トップレベル `agent_id` が非空のサブエージェント由来イベントのうち、`PermissionRequest` / `Notification`（ユーザー許可待ち）と `working` は親ペインへ反映し、サブエージェントの `Stop` / `StopFailure` / `Idle` のみ無視します。
+- **サブエージェントの扱い**: `SubagentStop` / `SubagentStart` は登録不要で、万が一登録されてもトップレベルの `hook_event_name` で自動無視します。また、`--tool claude` でトップレベルに非空の `agent_id` があるイベントのうち、`PermissionRequest` / `Notification` 以外の `waiting`・`idle` は無視します（`PermissionRequest` / `Notification` の許可待ちと `working` は親ペインへ反映します）。
 - **制限事項**: Claude Code の仕様上、`Esc` / `Ctrl+C` でユーザーが中断したときは `Stop` フックが発火しないため、次のプロンプト送信またはセッション終了まで緑表示が残ります。
 
 ```json
@@ -108,7 +108,7 @@ TenT は **Claude Code / agy / Codex** の 3 ツールをフォアグラウン�
 - `--tool agy` を指定すると、`agy` のフック契約に合わせて stdout へ必ず JSON を返します（`--event pre-tool-use` 指定またはトップレベル `hookEventName: "PreToolUse"` 時は `{"decision":"allow"}`、それ以外は `{}`）。
 - `Stop` 時のトップレベル `terminationReason` が `"USER_CANCELED"` の場合は、`fullyIdle` の値にかかわらず自動で `idle`（クリア）扱いになります。
 - `Stop` 時のトップレベル `fullyIdle` が `false`（バックグラウンドタスク残存中）の場合は、入力待ち（黄）へ遷移させず無視します。
-- **制限事項**: `agy` の仕様上、`fullyIdle: false` の `Stop` のあとにすべてのバックグラウンドタスクが完了しても改めて `fullyIdle: true` の `Stop` が発火しない場合は、次のプロンプト送信または手動キャンセルまで緑表示が残ります。
+- **制限事項**: `agy` のフック仕様では、`fullyIdle: false` の `Stop` のあとにすべてのバックグラウンドタスクが完了しても改めて `fullyIdle: true` の `Stop` が発火するかは定められていません。改めて発火しない場合は、次のプロンプト送信または手動キャンセルまで緑表示が残ります。
 
 ```json
 {
@@ -147,7 +147,7 @@ TenT は **Claude Code / agy / Codex** の 3 ツールをフォアグラウン�
 ## 3. Codex (`~/.codex/hooks.json`)
 
 Codex ではフック機能は既定で有効です（旧バージョンで無効な場合のみ `~/.codex/config.toml` の `[features]` に `hooks = true` を設定してください）。
-`SubagentStop` / `SubagentStart` やトップレベル `agent_id` 付きの完了イベントは `tent hook` 側で無視されます。
+`SubagentStop` / `SubagentStart` は登録不要で、登録してもトップレベルの `hook_event_name` で自動無視します（`--tool codex` でもトップレベルに非空の `agent_id` がある `PermissionRequest` / `Notification` 以外の `waiting`・`idle` は無視します）。なお Codex の仕様上、サブエージェントのフックも親の `session_id` を使用するため、ペイロードからメインと区別できないイベントがあります。
 
 ```json
 {
