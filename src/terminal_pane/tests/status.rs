@@ -517,10 +517,15 @@ fn test_agy_permission_prompt_detection_and_recovery() {
     use super::super::AGY_PERMISSION_PROMPT_IDLE;
     use super::super::status::has_agy_permission_prompt_text;
 
-    // 1. 実機 agy の確認ダイアログ（Requesting permission for: / No, cancel / esc to cancel フッター）および
-    //    実行ファイル内の許可／拒否選択肢文言を検知できること
+    // 1. agy の許可／拒否選択肢パターン（No, cancel・複数拒否行・CRLF 自前改行含む）を検知できること
     assert!(has_agy_permission_prompt_text(
         "Command\n──────────────────────────────────────────────\n\nRequesting permission for:\n   echo hello\n\nRun this command?\n> 1. Yes, run command\n  2. Yes, and always allow in this\nconversation for commands that start with\n'echo'\n  3. Yes, and always allow for commands that\nstart with 'echo' (Persist to settings.json)\n  4. No, cancel\n\n  ↑/↓ Navigate · tab Amend · ctrl+g edit/expan\nesc to cancel           Gemini 4 Neon · medium"
+    ));
+    assert!(has_agy_permission_prompt_text(
+        "Run this command?\n  > Yes, run command\n    No, deny\n    No, and tell agy what to do differently"
+    ));
+    assert!(has_agy_permission_prompt_text(
+        "Allow access to this URL?\n  > Yes, allow access\n    No, deny access\n    No, and always deny access to 'example.com'"
     ));
     assert!(has_agy_permission_prompt_text(
         "Allow creation of this file?\n  > Yes, allow creation\n    No, deny creation"
@@ -532,22 +537,14 @@ fn test_agy_permission_prompt_detection_and_recovery() {
         "Do you want to proceed?\n  ❯ Yes, accept this change\n    No, reject this change"
     ));
     assert!(has_agy_permission_prompt_text(
-        "Allow access to this URL?\n  > Yes, allow access\n    Yes, and always allow access to 'example.com' (Persist to settings)\n    No, deny access"
-    ));
-    assert!(has_agy_permission_prompt_text(
-        "Allow access to this URL?\n  > Yes, allow access\n    No, deny access"
-    ));
-    assert!(has_agy_permission_prompt_text(
         "Grant requested permission?\n  1. Yes, grant permission\n  2. No, deny permission"
-    ));
-    assert!(has_agy_permission_prompt_text(
-        "Grant requested permission?\n  1. Yes, grant permission for git push (Persist to settings)\n  2. No, and always deny 'git push' in this conversation"
     ));
     assert!(has_agy_permission_prompt_text(
         "Grant requested permission?\n  1. Yes, and always grant permission for 'git' in this conversation\n  2. No, deny permission"
     ));
+    // CRLF 自前改行で途中で折り返された No, and tell ... も前方一致で検知できること
     assert!(has_agy_permission_prompt_text(
-        "Do you want to proceed?\n  1. Yes, and use Auto mode until you exit (auto-approve edits and safe commands)\n  2. No, deny"
+        "Run this command?\n  > Yes, run command\n    No, and tell agy\n    what to do differently"
     ));
 
     // 通常文章・Markdown 箇条書き・引用・diff・JSON では誤検知しないこと
@@ -585,12 +582,13 @@ fn test_agy_permission_prompt_detection_and_recovery() {
         "> Yes, run the migration\n> No, deny access to prod"
     ));
 
-    // 2. 20 行画面の先頭（0〜4 行目）に出たダイアログも最後の非空行基準で検知できること
+    // 2. 実機 agy の描画方式（初回のみ \x1b[?1049h、同期出力 \x1b[?2026h..\x1b[?2026l、\x1b[?7l、
+    //    SGR＋行消去 \x1b[K による再描画、応答後の次フレームでダイアログ消去）で一連のライフサイクルを検証する
     let mut pane = TerminalPane::attach_from_replay(
         ReplayedPane {
             pane_id: 1,
-            cols: 70,
-            rows: 20,
+            cols: 46,
+            rows: 54,
             cwd: PathBuf::from("/tmp"),
             replay_bytes: Vec::new(),
         },
@@ -598,450 +596,96 @@ fn test_agy_permission_prompt_detection_and_recovery() {
     )
     .unwrap();
     assert!(pane.apply_ai_hook_event(AiHookState::Working, Some(AiTool::Agy), false, true, "1"));
-    assert!(pane.is_actively_outputting(Instant::now()));
+    pane.feed_pty_bytes(b"\x1b[?1049h\x1b[?7l", false, true, "1");
 
+    let agy_dialog_frame = |cmd_lines: &str| {
+        format!(
+            "\x1b[?2026h\x1b[H\x1b[1mCommand\x1b[0m\x1b[K\r\n\
+             ──────────────────────────────────────────────\x1b[K\r\n\
+             \x1b[K\r\n\
+             Requesting permission for:\x1b[K\r\n\
+             {cmd_lines}\
+             \x1b[K\r\n\
+             Run this command?\x1b[K\r\n\
+             > 1. Yes, run command\x1b[K\r\n\
+               2. Yes, and always allow in this\x1b[K\r\n\
+             conversation for commands that start with\x1b[K\r\n\
+             'echo'\x1b[K\r\n\
+               3. Yes, and always allow for commands that\x1b[K\r\n\
+             start with 'echo' (Persist to settings.json)\x1b[K\r\n\
+               4. No, cancel\x1b[K\r\n\
+             \x1b[K\r\n\
+               ↑/↓ Navigate · tab Amend · ctrl+g edit/expan\x1b[K\r\n\
+             esc to cancel           Gemini 4 Neon · medium\x1b[K\x1b[J\x1b[?2026l"
+        )
+    };
+    let agy_running_frame =
+        b"\x1b[?2026h\x1b[HRunning command...\x1b[K\r\nesc to cancel\x1b[K\x1b[J\x1b[?2026l";
+
+    // 1 回目の確認ダイアログ（echo hello）：無出力直後は Waiting にせず、1.2 秒後に Waiting＋通知
     pane.feed_pty_bytes(
-        b"Run this command?\r\n  > Yes, run command\r\n    No, deny\r\n",
+        agy_dialog_frame("   echo hello\x1b[K\r\n").as_bytes(),
         false,
         true,
         "1",
     );
-    // 無出力直後はまだ Waiting にしない
     assert!(!pane.update_waiting_state(Instant::now(), false, true, Some("1")));
-    assert!(!pane.is_waiting_input);
-
-    // 1.2 秒経過後にパーミッション確認待ち（黄）へ遷移する
-    let after_idle = Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100);
-    assert!(pane.update_waiting_state(after_idle, false, true, Some("1")));
-    assert!(pane.is_waiting_input);
+    let after_idle1 = Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100);
+    assert!(pane.update_waiting_state(after_idle1, false, true, Some("1")));
     assert_eq!(pane.ai_hook_state, Some(AiHookState::Waiting));
-    assert!(!pane.is_actively_outputting(after_idle));
+    assert!(pane.is_waiting_input);
+    assert!(pane.last_notification_sent.is_some());
 
-    // 3. 選択肢移動キー（単発・連続・修飾付き矢印キー）では Waiting のまま維持され、Enter 等の応答で Working へ戻ること
+    // 矢印キーや未対応キーを押してもダイアログが画面にある間は Waiting を維持すること
     pane.write_input(b"\x1b[B");
-    pane.write_input(b"\x1b[B\x1b[B");
-    pane.write_input(b"\x1b[1;2B");
-    pane.write_input(b"\x1b[1B");
+    pane.write_input(b"x");
     assert_eq!(pane.ai_hook_state, Some(AiHookState::Waiting));
-    assert!(pane.is_waiting_input);
 
-    // 4. 裏スロットを開いて clear_attention 相当（Waiting→None）になったあとに承認しても
-    //    Working（緑）へ復帰し、さらに同じ画面が残ったまま無出力になっても再検知しないこと
+    // 裏スロットを開いて clear_attention 相当（Waiting→None）になったあとに応答し、
+    // 次フレームでダイアログが消えると Working（緑）へ復帰すること
     pane.is_waiting_input = false;
     pane.ai_hook_state = None;
     pane.write_input(b"\r");
+    pane.feed_pty_bytes(agy_running_frame, true, true, "1");
+    assert!(pane.update_waiting_state(Instant::now(), true, true, Some("1")));
     assert_eq!(pane.ai_hook_state, Some(AiHookState::Working));
     assert!(pane.is_actively_outputting(Instant::now()));
 
-    // 承認後にコマンド出力が続いて旧ダイアログ文字が画面に残っていても、1.3 秒後に再検知しないこと
-    pane.feed_pty_bytes(b"\r\n$ rm -rf build\r\n", true, true, "1");
-    let after_exec_idle = Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100);
-    assert!(!pane.update_waiting_state(after_exec_idle, true, true, Some("1")));
-    assert_eq!(pane.ai_hook_state, Some(AiHookState::Working));
-
-    // 5. 同じターン内の 2 つ目の許可ダイアログは新たに検知でき、ウィンドウ非フォーカスならアクティブスロットでも通知すること
+    // 2 回目の確認ダイアログ（5 行コマンド・250ms 後の連続確認）も確実に検知し、
+    // アクティブスロットで検知後に裏へ回ると黄色（is_waiting_input）になること
     pane.last_notification_sent = None;
     pane.feed_pty_bytes(
-        b"\r\nAllow creation of this file?\r\n  > Yes, allow creation\r\n    No, deny creation\r\n",
+        agy_dialog_frame(
+            "   echo line1\x1b[K\r\n   echo line2\x1b[K\r\n   echo line3\x1b[K\r\n   echo line4\x1b[K\r\n   echo line5\x1b[K\r\n",
+        )
+        .as_bytes(),
         true,
         false,
         "1",
     );
-    let after_second_idle =
-        Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100);
-    assert!(pane.update_waiting_state(after_second_idle, true, false, Some("1")));
+    let after_idle2 = Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100);
+    assert!(pane.update_waiting_state(after_idle2, true, false, Some("1")));
     assert_eq!(pane.ai_hook_state, Some(AiHookState::Waiting));
+    assert!(!pane.is_waiting_input);
     assert!(pane.last_notification_sent.is_some());
+    assert!(pane.update_waiting_state(after_idle2, false, false, Some("1")));
+    assert!(pane.is_waiting_input);
 
-    // 6. 画面検知による Waiting のあとにフック由来の Stop（Waiting）が届いても抑止されず適用されること
+    // 画面検知による Waiting 中にフック由来の Stop（Waiting）が届いても抑止されず適用されること
     assert!(pane.apply_ai_hook_event(AiHookState::Waiting, Some(AiTool::Agy), false, true, "1"));
     assert_eq!(pane.ai_hook_state, Some(AiHookState::Waiting));
-    assert!(pane.is_waiting_input);
 
-    // 7. 承認後にダイアログが画面から一度消えて同じ位置に同じ文言で再描画された場合は、2 回目も検知できること
+    // 1.2 秒未満でユーザーが即応答してダイアログが消えた場合は誤検知しないこと
     assert!(pane.apply_ai_hook_event(AiHookState::Working, Some(AiTool::Agy), true, true, "1"));
     pane.feed_pty_bytes(
-        b"\x1b[2J\x1b[Hhello\r\nRun this command?\r\n  > Yes, run command\r\n    No, deny\r\n",
+        agy_dialog_frame("   echo quick\x1b[K\r\n").as_bytes(),
         true,
         true,
         "1",
     );
-    let t_first = Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100);
-    assert!(pane.update_waiting_state(t_first, true, true, Some("1")));
-    assert_eq!(pane.ai_hook_state, Some(AiHookState::Waiting));
-
-    pane.write_input(b"\r");
-    assert_eq!(pane.ai_hook_state, Some(AiHookState::Working));
-    // ダイアログを画面から消去し、1.2 秒以上 None が続くと応答済み署名がクリアされる
-    // （一瞬の None ではクリアされないことも確認）
-    pane.feed_pty_bytes(b"\x1b[3A\x1b[J", true, true, "1");
-    let t_clear0 = Instant::now();
-    assert!(!pane.update_waiting_state(t_clear0, true, true, Some("1")));
-    assert!(!pane.update_waiting_state(
-        t_clear0 + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100),
-        true,
-        true,
-        Some("1")
-    ));
-    // 同じ位置に同じダイアログを再描画しても再び検知できる
-    pane.feed_pty_bytes(
-        b"Run this command?\r\n  > Yes, run command\r\n    No, deny\r\n",
-        true,
-        true,
-        "1",
-    );
-    let t_second = Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100);
-    assert!(pane.update_waiting_state(t_second, true, true, Some("1")));
-    assert_eq!(pane.ai_hook_state, Some(AiHookState::Waiting));
-
-    // 8. 承認後に上のスピナーや見出しの書き換え・リサイズ・次ターン Working・10 行以上の出力継続が起きても再検知せず、
-    //    古いダイアログ A の下に 6 行出力して新しいダイアログ B が出た場合は B を検知できること
-    assert!(pane.apply_ai_hook_event(AiHookState::Working, Some(AiTool::Agy), true, true, "1"));
-    pane.feed_pty_bytes(
-        b"\x1b[2J\x1b[Hctx\r\n\xe2\xa0\x8b Working 3s\r\nRun this command?\r\nrm -rf build\r\n> Yes, run command\r\n  Yes, and always allow for commands that start with rm\r\n  No, deny\r\n",
-        true,
-        true,
-        "1",
-    );
-    assert!(pane.update_waiting_state(
-        Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100),
-        true,
-        true,
-        Some("1")
-    ));
-    pane.write_input(b"\r");
-    assert_eq!(pane.ai_hook_state, Some(AiHookState::Working));
-
-    // スピナー行・見出し行だけ書き換えても再検知しない
-    pane.feed_pty_bytes(
-        b"\x1b[6A\r\xe2\xa0\x99 Working 4s\x1b[K\r\nRunning command...\x1b[K\x1b[5B\r",
-        true,
-        true,
-        "1",
-    );
-    assert!(!pane.update_waiting_state(
-        Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100),
-        true,
-        true,
-        Some("1")
-    ));
-    // リサイズでリフローしても再検知しない
-    pane.resize(40, 20, 8, 16);
-    assert!(!pane.update_waiting_state(
-        Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100),
-        true,
-        true,
-        Some("1")
-    ));
-    pane.resize(70, 20, 8, 16);
-    // Stop → 次ターンの Working フックが届いても古い残存ダイアログは再検知しない
-    assert!(pane.apply_ai_hook_event(AiHookState::Waiting, Some(AiTool::Agy), true, true, "1"));
-    assert!(pane.apply_ai_hook_event(AiHookState::Working, Some(AiTool::Agy), true, true, "1"));
-    assert!(!pane.update_waiting_state(
-        Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100),
-        true,
-        true,
-        Some("1")
-    ));
-
-    // 古いダイアログ A の下に 6 行出力して新しいダイアログ B が出た場合、B を取りこぼさず検知できる
-    pane.feed_pty_bytes(
-        b"o1\r\no2\r\no3\r\no4\r\no5\r\no6\r\nAllow access to this URL?\r\n> Yes, allow access\r\n  No, deny access\r\n",
-        true,
-        true,
-        "1",
-    );
-    assert!(pane.update_waiting_state(
-        Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100),
-        true,
-        true,
-        Some("1")
-    ));
-    assert_eq!(pane.ai_hook_state, Some(AiHookState::Waiting));
-
-    // 9. アクティブスロットで検知したまま裏スロットへ回ると黄色（is_waiting_input）になること
-    assert!(!pane.is_waiting_input);
-    assert!(pane.update_waiting_state(Instant::now(), false, true, Some("1")));
-    assert!(pane.is_waiting_input);
-
-    // 10. 未対応キー（x / y / 5 等）では応答済み署名を記録せず、ダイアログが 1.2 秒残れば再び Waiting になること。
-    //     一方、マウスクリック等でダイアログが画面から消えた場合、一瞬の描き替えでは再通知せず
-    //     1.2 秒以上消え続けたときに自動で Working へ復帰すること。
-    for key in [b"x".as_slice(), b"y".as_slice(), b"5".as_slice()] {
-        pane.write_input(key);
-        assert_eq!(pane.ai_hook_state, Some(AiHookState::Working));
-        assert!(pane.update_waiting_state(
-            Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100),
-            false,
-            true,
-            Some("1")
-        ));
-        assert_eq!(pane.ai_hook_state, Some(AiHookState::Waiting));
-    }
-
-    // 一瞬のフレーム消去＋再描画では Waiting のまま維持し、再通知しないこと
-    pane.last_notification_sent = None;
-    pane.feed_pty_bytes(b"\x1b[2J\x1b[H", false, true, "1");
-    let t_flicker = Instant::now();
-    assert!(!pane.update_waiting_state(t_flicker, false, true, Some("1")));
-    assert_eq!(pane.ai_hook_state, Some(AiHookState::Waiting));
-    pane.feed_pty_bytes(
-        b"Allow access to this URL?\r\n> Yes, allow access\r\n  No, deny access\r\n",
-        false,
-        true,
-        "1",
-    );
-    assert!(!pane.update_waiting_state(
-        t_flicker + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(300),
-        false,
-        true,
-        Some("1")
-    ));
-    assert!(pane.last_notification_sent.is_none());
-
-    // マウスクリック後にダイアログが消え続ければ 1.2 秒後に自動で Working へ復帰する
-    pane.write_input(b"\x1b[<0;5;3M\x1b[<0;5;3m");
-    assert_eq!(pane.ai_hook_state, Some(AiHookState::Waiting));
-    pane.feed_pty_bytes(b"\x1b[2J\x1b[Hbuilding...\r\n", false, true, "1");
-    let t_gone = Instant::now();
-    assert!(!pane.update_waiting_state(t_gone, false, true, Some("1")));
-    assert!(pane.update_waiting_state(
-        t_gone + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100),
-        false,
-        true,
-        Some("1")
-    ));
-    assert_eq!(pane.ai_hook_state, Some(AiHookState::Working));
-    assert!(!pane.is_waiting_input);
-
-    // 11. 1 回の feed で別コマンドの同選択肢ダイアログへ描き替えられた場合、
-    //     見出し〜最後拒否行の署名で区別して 2 つ目を検知でき、
-    //     1.2 秒未満での即 Enter 応答・Stop 上書き後の次ターンでは古いダイアログを再検知しないこと
-    pane.feed_pty_bytes(
-        b"\x1b[2J\x1b[HRun this command?\r\nrm -rf build\r\n> Yes, run command\r\n  No, deny\r\n",
-        true,
-        true,
-        "1",
-    );
-    let t_spin0 = Instant::now();
-    assert!(!pane.update_waiting_state(t_spin0, true, true, Some("1")));
-    // 400ms ごとに見出しより上のスピナーだけ更新されても、ダイアログが 1.2 秒不変なら検知する
-    pane.feed_pty_bytes(
-        b"\x1b[1;1H\x1b[L\xe2\xa0\x8b Working 1s\r\n",
-        true,
-        true,
-        "1",
-    );
-    assert!(!pane.update_waiting_state(
-        t_spin0 + Duration::from_millis(500),
-        true,
-        true,
-        Some("1")
-    ));
-    pane.feed_pty_bytes(b"\x1b[1;1H\xe2\xa0\x99 Working 2s\x1b[K", true, true, "1");
-    assert!(pane.update_waiting_state(
-        t_spin0 + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100),
-        true,
-        true,
-        Some("1")
-    ));
-    pane.write_input(b"\r");
-    // 同じ選択肢（Yes, run command / No, deny）でも別コマンド（git push --force）なら検知する
-    pane.feed_pty_bytes(
-        b"\x1b[2J\x1b[HRun this command?\r\ngit push --force\r\n> Yes, run command\r\n  No, deny\r\n",
-        true,
-        true,
-        "1",
-    );
-    assert!(pane.update_waiting_state(
-        Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100),
-        true,
-        true,
-        Some("1")
-    ));
-    // Stop フックで上書きされたあと次ターン Working が来ても、古いダイアログは再検知しない
-    assert!(pane.apply_ai_hook_event(AiHookState::Waiting, Some(AiTool::Agy), true, true, "1"));
-    assert!(pane.apply_ai_hook_event(AiHookState::Working, Some(AiTool::Agy), true, true, "1"));
-    assert!(!pane.update_waiting_state(
-        Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100),
-        true,
-        true,
-        Some("1")
-    ));
-
-    // 1.2 秒未満でユーザーが即 Enter 応答した場合も応答済みとなり、1.4 秒後に誤検知しないこと
-    pane.feed_pty_bytes(
-        b"\x1b[2J\x1b[HRun this command?\r\ncargo check\r\n> Yes, run command\r\n  No, deny\r\n",
-        true,
-        true,
-        "1",
-    );
-    let t_quick = Instant::now();
-    assert!(!pane.update_waiting_state(
-        t_quick + Duration::from_millis(200),
-        true,
-        true,
-        Some("1")
-    ));
-    pane.write_input(b"\r");
-    pane.feed_pty_bytes(b"\r\n$ cargo check\r\n", true, true, "1");
-    assert!(!pane.update_waiting_state(
-        t_quick + Duration::from_millis(1400),
-        true,
-        true,
-        Some("1")
-    ));
-    assert_eq!(pane.ai_hook_state, Some(AiHookState::Working));
-
-    // 12. 7 行コマンドの見出し配下での書き替え検知・フック Waiting 中の Enter 応答記録・
-    //     Working 中の候補 A→B 差替直後の Enter・Waiting 中の別ダイアログ切替通知
-    assert!(pane.apply_ai_hook_event(AiHookState::Working, Some(AiTool::Agy), true, true, "1"));
-    pane.feed_pty_bytes(
-        b"\x1b[2J\x1b[HRun this command?\r\nl1\r\nl2\r\nl3\r\nl4\r\nl5\r\nl6\r\nrm -rf build\r\n> Yes, run command\r\n  No, deny\r\n",
-        true,
-        true,
-        "1",
-    );
-    assert!(pane.update_waiting_state(
-        Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100),
-        true,
-        true,
-        Some("1")
-    ));
-    pane.write_input(b"\r");
-    // 7 行目だけ git push -f に描き替えても、見出しから署名を取っているため検知できる
-    pane.feed_pty_bytes(
-        b"\x1b[2J\x1b[HRun this command?\r\nl1\r\nl2\r\nl3\r\nl4\r\nl5\r\nl6\r\ngit push -f\r\n> Yes, run command\r\n  No, deny\r\n",
-        true,
-        true,
-        "1",
-    );
-    assert!(pane.update_waiting_state(
-        Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100),
-        true,
-        true,
-        Some("1")
-    ));
-
-    // Waiting 中に別内容のダイアログへ切り替わった場合は新しい許可待ちとして通知する
-    pane.last_notification_sent = None;
-    pane.feed_pty_bytes(
-        b"\x1b[2J\x1b[HAllow access to this URL?\r\nhttps://example.com\r\n> Yes, allow access\r\n  No, deny access\r\n",
-        false,
-        true,
-        "1",
-    );
-    assert!(pane.update_waiting_state(Instant::now(), false, true, Some("1")));
-    assert!(pane.last_notification_sent.is_some());
-
-    // フック由来 Waiting 中にダイアログへ Enter 応答し PostToolUse(Working) が来ても再検知しない
-    assert!(pane.apply_ai_hook_event(AiHookState::Waiting, Some(AiTool::Agy), true, true, "1"));
-    pane.feed_pty_bytes(
-        b"\x1b[2J\x1b[HRun this command?\r\ncargo build\r\n> Yes, run command\r\n  No, deny\r\n",
-        true,
-        true,
-        "1",
-    );
-    pane.write_input(b"\r");
-    assert!(pane.apply_ai_hook_event(AiHookState::Working, Some(AiTool::Agy), true, true, "1"));
-    pane.feed_pty_bytes(b"\r\nrunning\r\n", true, true, "1");
-    assert!(!pane.update_waiting_state(
-        Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100),
-        true,
-        true,
-        Some("1")
-    ));
-
-    // Working 中に候補 A を観測した直後、1 回の feed で B へ差し替わってから Enter すると B が応答済みになる
-    pane.feed_pty_bytes(
-        b"\x1b[2J\x1b[HRun this command?\r\ncargo clippy\r\n> Yes, run command\r\n  No, deny\r\n",
-        true,
-        true,
-        "1",
-    );
-    let t_ab = Instant::now();
-    assert!(!pane.update_waiting_state(t_ab + Duration::from_millis(100), true, true, Some("1")));
-    pane.feed_pty_bytes(
-        b"\x1b[2J\x1b[HAllow access to this URL?\r\nhttps://x.test\r\n> Yes, allow access\r\n  No, deny access\r\n",
-        true,
-        true,
-        "1",
-    );
-    pane.write_input(b"\r");
-    pane.feed_pty_bytes(b"\r\n$ curl x\r\n", true, true, "1");
-    assert!(!pane.update_waiting_state(t_ab + Duration::from_millis(1500), true, true, Some("1")));
-    assert_eq!(pane.ai_hook_state, Some(AiHookState::Working));
-
-    // 13. 実機 agy の代替スクリーン＋同期出力＋Requesting permission for:＋No, cancel＋kitty Esc/Ctrl+C で
-    //     echo hello → 500ms 後の echo world を続けて検知でき、kitty Esc (\x1b[27u) / Ctrl+C (\x1b[99;5u) が
-    //     確定・キャンセル応答として認識されること
-    pane.resize(46, 54, 8, 16);
-    assert!(pane.apply_ai_hook_event(AiHookState::Working, Some(AiTool::Agy), false, true, "1"));
-    let real_agy_frame = |cmd: &str| {
-        format!(
-            "\x1b[?1049h\x1b[?2026h\x1b[H\x1b[2J\x1b[?7lCommand\r\n──────────────────────────────────────────────\r\n\r\nRequesting permission for:\r\n   {cmd}\r\n\r\nRun this command?\r\n> 1. Yes, run command\r\n  2. Yes, and always allow in this\r\nconversation for commands that start with\r\n'echo'\r\n  3. Yes, and always allow for commands that\r\nstart with 'echo' (Persist to settings.json)\r\n  4. No, cancel\r\n\r\n  ↑/↓ Navigate · tab Amend · ctrl+g edit/expan\r\nesc to cancel           Gemini 4 Neon · medium\x1b[?2026l"
-        )
-    };
-    pane.feed_pty_bytes(real_agy_frame("echo hello").as_bytes(), false, true, "1");
-    let t_real1 = Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100);
-    assert!(pane.update_waiting_state(t_real1, false, true, Some("1")));
-    assert_eq!(pane.ai_hook_state, Some(AiHookState::Waiting));
-
-    // Enter で承認 → Running/Ran フレーム（500ms 後） → 同じ 'echo' 系の別コマンド echo world
-    pane.write_input(b"\r");
-    assert_eq!(pane.ai_hook_state, Some(AiHookState::Working));
-    pane.feed_pty_bytes(
-        b"\x1b[?2026h\x1b[H\x1b[2JRunning echo hello...\r\nesc to cancel\x1b[?2026l",
-        false,
-        true,
-        "1",
-    );
-    assert!(!pane.update_waiting_state(
-        t_real1 + Duration::from_millis(250),
-        false,
-        true,
-        Some("1")
-    ));
-    pane.feed_pty_bytes(real_agy_frame("echo world").as_bytes(), false, true, "1");
-    let t_real2 = Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100);
-    assert!(pane.update_waiting_state(t_real2, false, true, Some("1")));
-    assert_eq!(pane.ai_hook_state, Some(AiHookState::Waiting));
-
-    // kitty Esc (\x1b[27u) と kitty Ctrl+C (\x1b[99;5u) が確定・キャンセル応答として認識されること
     pane.write_input(b"\x1b[27u");
+    pane.feed_pty_bytes(agy_running_frame, true, true, "1");
+    let after_quick = Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100);
+    assert!(!pane.update_waiting_state(after_quick, true, true, Some("1")));
     assert_eq!(pane.ai_hook_state, Some(AiHookState::Working));
-    assert!(!pane.update_waiting_state(
-        Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100),
-        false,
-        true,
-        Some("1")
-    ));
-    pane.feed_pty_bytes(real_agy_frame("echo third").as_bytes(), false, true, "1");
-    let t_real3 = Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100);
-    assert!(pane.update_waiting_state(t_real3, false, true, Some("1")));
-    pane.write_input(b"\x1b[99;5u");
-    assert_eq!(pane.ai_hook_state, Some(AiHookState::Working));
-    assert!(!pane.update_waiting_state(
-        Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100),
-        false,
-        true,
-        Some("1")
-    ));
-
-    // 狭い幅（30 列）で拒否文言が折り返しても連結して検知できること
-    pane.resize(30, 20, 8, 16);
-    assert!(pane.apply_ai_hook_event(AiHookState::Working, Some(AiTool::Agy), true, true, "1"));
-    pane.feed_pty_bytes(
-        b"\x1b[?7h\x1b[2J\x1b[HRun this command?\r\n> Yes, run command\r\n  No, and tell agy what to do differently\r\n",
-        true,
-        true,
-        "1",
-    );
-    assert!(pane.update_waiting_state(
-        Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100),
-        true,
-        true,
-        Some("1")
-    ));
-    assert_eq!(pane.ai_hook_state, Some(AiHookState::Waiting));
 }

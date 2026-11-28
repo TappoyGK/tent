@@ -34,12 +34,8 @@ impl TerminalPane {
             self.ai_hook_state = None;
             self.ai_working_since = None;
             self.ai_permission_prompt_detected = false;
-            self.detected_agy_permission_prompt = None;
-            self.agy_prompt_candidate = None;
-            self.dismissed_agy_permission_prompt = None;
             self.last_agy_prompt_checked_gen = None;
-            self.last_agy_prompt_snapshot = None;
-            self.agy_prompt_absent_since = None;
+            self.last_agy_prompt_visible = false;
             self.had_background_output = false;
             self.work_indicator_started_at = None;
             self.last_output_instant = None;
@@ -62,23 +58,8 @@ impl TerminalPane {
         }
         self.ai_hook_active = true;
         let was_prompt_detected = self.ai_permission_prompt_detected;
-        let prev_detected = self.detected_agy_permission_prompt.take();
-        if was_prompt_detected
-            && let Some(sig) = self.last_agy_prompt_snapshot.clone().or(prev_detected)
-        {
-            // 画面検知による Waiting をフック（Stop 等）が上書きした際、
-            // そのダイアログを応答済みへ移して次ターンで古い残存ダイアログを再検知しないようにする
-            self.dismissed_agy_permission_prompt = Some(sig);
-        }
         self.ai_permission_prompt_detected = false;
-        self.agy_prompt_absent_since = None;
-        self.agy_prompt_candidate = None;
         self.last_agy_prompt_checked_gen = None;
-        // 応答済み署名は画面からダイアログが消える（検出が None になる）まで保持し、
-        // PreInvocation（Working）や次ターン開始で古い残存ダイアログを再検知しないようにする。
-        if matches!(state, AiHookState::Idle) && self.active_ai_tool != Some(AiTool::Agy) {
-            self.dismissed_agy_permission_prompt = None;
-        }
         let now = Instant::now();
         self.had_background_output = false;
         self.work_indicator_started_at = None;
@@ -192,11 +173,11 @@ impl TerminalPane {
         })
     }
 
-    /// アクティブ画面の最後の非空行から最大 16 行以内（折り返し行は連結）に agy の
-    /// パーミッション確認プロンプトが表示されているか判定し、見出し〜最後拒否行の署名を返す。
-    pub(super) fn detect_agy_permission_prompt(&self) -> Option<AgyPermissionPromptSignature> {
+    /// アクティブ画面の最後の非空行から最大 16 行以内に `agy` のパーミッション確認ダイアログ
+    /// （許可／拒否の選択肢ペア）が表示されているか判定する。
+    fn has_agy_permission_prompt(&self) -> bool {
         if self.rows == 0 || self.cols == 0 {
-            return None;
+            return false;
         }
         let mut last_non_empty_row = None;
         for row in (0..self.rows).rev() {
@@ -205,25 +186,14 @@ impl TerminalPane {
                 break;
             }
         }
-        let end_row = last_non_empty_row?;
+        let Some(end_row) = last_non_empty_row else {
+            return false;
+        };
         let start_row = end_row.saturating_sub(15);
 
-        let mut logical_lines: Vec<String> =
-            Vec::with_capacity(usize::from(end_row - start_row + 1));
+        let mut lines: Vec<String> = Vec::with_capacity(usize::from(end_row - start_row + 1));
         let mut grapheme_buf = ['\0'; 16];
-        let mut prev_wrapped = false;
         for row in start_row..=end_row {
-            let is_wrapped = self
-                .terminal
-                .grid_ref(Point::Active(PointCoordinate {
-                    x: 0,
-                    y: u32::from(row),
-                }))
-                .ok()
-                .and_then(|gr| gr.row().ok())
-                .and_then(|r| r.is_wrapped().ok())
-                .unwrap_or(false);
-
             let mut row_text = String::with_capacity(usize::from(self.cols));
             for col in 0..self.cols {
                 let Ok(gr) = self.terminal.grid_ref(Point::Active(PointCoordinate {
@@ -250,54 +220,13 @@ impl TerminalPane {
                     }
                 }
             }
-            if !is_wrapped {
-                let trimmed_len = row_text.trim_end().len();
-                row_text.truncate(trimmed_len);
-            }
-            if prev_wrapped && let Some(last) = logical_lines.last_mut() {
-                last.push_str(&row_text);
-            } else {
-                logical_lines.push(row_text);
-            }
-            prev_wrapped = is_wrapped;
+            let trimmed_len = row_text.trim_end().len();
+            row_text.truncate(trimmed_len);
+            lines.push(row_text);
         }
 
-        let line_refs: Vec<&str> = logical_lines.iter().map(String::as_str).collect();
-        let (allow_start, last_deny) = match_agy_permission_prompt_lines(&line_refs)?;
-
-        // `Requesting permission for:` 行（実機 agy でコマンド行の直前に出る）または実物の見出し行を、
-        // ひとつ上のダイアログの拒否選択肢行の手前まで遡って探す。
-        // `Requesting permission for:` が見つかればそこから、なければ見出し行から、
-        // それも見つからなければ選択肢行のみから最後の拒否行までを署名にする。
-        let mut sig_start = allow_start;
-        for idx in (0..allow_start).rev() {
-            let opt_lower = strip_option_affixes(&logical_lines[idx]).to_ascii_lowercase();
-            if is_agy_deny_option(&opt_lower) {
-                break;
-            }
-            if is_agy_requesting_permission_header(&logical_lines[idx]) {
-                sig_start = idx;
-                break;
-            }
-            if sig_start == allow_start && is_agy_prompt_heading(&logical_lines[idx]) {
-                sig_start = idx;
-            }
-        }
-
-        let mut line_hashes = Vec::with_capacity(last_deny - sig_start + 1);
-        for (idx, line) in logical_lines[sig_start..=last_deny].iter().enumerate() {
-            let abs_idx = sig_start + idx;
-            let normalized = if abs_idx >= allow_start {
-                strip_option_affixes(line).to_ascii_lowercase()
-            } else {
-                strip_border_and_trim(line).to_ascii_lowercase()
-            };
-            let mut hasher = DefaultHasher::new();
-            normalized.hash(&mut hasher);
-            line_hashes.push(hasher.finish());
-        }
-
-        Some(AgyPermissionPromptSignature { line_hashes })
+        let line_refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        has_agy_permission_prompt_lines(&line_refs)
     }
 
     /// 裏タブで出力が止まったときに「入力待ち」へ遷移させ、
@@ -315,63 +244,19 @@ impl TerminalPane {
             if self.active_ai_tool != Some(AiTool::Agy) {
                 return false;
             }
-            let should_scan = self.ai_hook_state == Some(AiHookState::Working)
-                || self.ai_permission_prompt_detected
-                || self.dismissed_agy_permission_prompt.is_some();
-            if !should_scan {
-                return false;
-            }
-            if self.last_agy_prompt_checked_gen != Some(self.content_generation) {
-                self.last_agy_prompt_checked_gen = Some(self.content_generation);
-                self.last_agy_prompt_snapshot = self.detect_agy_permission_prompt();
-            }
-            let Some(sig) = self.last_agy_prompt_snapshot.clone() else {
-                self.agy_prompt_candidate = None;
-                // 一瞬のフレーム描き替え（2 分割フレームやリサイズ再描画）による誤再検知・重複通知を防ぐため、
-                // 応答済み署名のクリアおよび Waiting からの自動復帰はいずれも None が 1.2 秒以上継続してから行う
-                let absent_since = *self.agy_prompt_absent_since.get_or_insert(now);
-                if now.saturating_duration_since(absent_since) >= AGY_PERMISSION_PROMPT_IDLE {
-                    self.dismissed_agy_permission_prompt = None;
-                    self.agy_prompt_absent_since = None;
-                    if self.ai_permission_prompt_detected {
-                        self.ai_permission_prompt_detected = false;
-                        self.detected_agy_permission_prompt = None;
-                        self.ai_hook_state = Some(AiHookState::Working);
-                        self.is_waiting_input = false;
-                        return true;
-                    }
-                }
-                return false;
-            };
-            self.agy_prompt_absent_since = None;
-
             if self.ai_permission_prompt_detected {
-                // Waiting 中（自動復帰待ち 1.2 秒以内を含む）に別内容のダイアログへ切り替わった場合は
-                // 新しい許可待ちとして通知・時刻更新を行う
-                if self
-                    .detected_agy_permission_prompt
-                    .as_ref()
-                    .is_some_and(|cur| !cur.matches(&sig))
-                {
-                    self.detected_agy_permission_prompt = Some(sig);
-                    self.ai_hook_state = Some(AiHookState::Waiting);
-                    self.last_output_at = Local::now();
-                    self.last_output_instant = None;
-                    if !is_active {
-                        self.is_waiting_input = true;
-                    }
-                    if (!is_active || !window_focused)
-                        && let Some(label) = slot_label
-                    {
-                        let title = format!("TenT [{}] {}", label, self.folder_name);
-                        self.try_send_os_notification(
-                            title,
-                            "AI がパーミッション確認を待っています".to_string(),
-                        );
-                    }
+                if self.last_agy_prompt_checked_gen != Some(self.content_generation) {
+                    self.last_agy_prompt_checked_gen = Some(self.content_generation);
+                    self.last_agy_prompt_visible = self.has_agy_permission_prompt();
+                }
+                if !self.last_agy_prompt_visible {
+                    // 応答後の次フレームでダイアログが画面から消えたら Working へ復帰する
+                    // （裏スロットを開いて clear_attention で Waiting を消したあとの応答も含む）
+                    self.ai_permission_prompt_detected = false;
+                    self.ai_hook_state = Some(AiHookState::Working);
+                    self.is_waiting_input = false;
                     return true;
                 }
-                // アクティブスロットで検知したまま裏スロットへ回った場合は黄色表示を立てる
                 if self.ai_hook_state == Some(AiHookState::Waiting)
                     && !is_active
                     && !self.is_waiting_input
@@ -381,33 +266,18 @@ impl TerminalPane {
                 }
                 return false;
             }
-
-            if self.ai_hook_state == Some(AiHookState::Working) {
-                if self
-                    .dismissed_agy_permission_prompt
-                    .as_ref()
-                    .is_some_and(|d| d.matches(&sig))
-                {
-                    self.agy_prompt_candidate = None;
-                    return false;
+            if self.ai_hook_state == Some(AiHookState::Working)
+                && self
+                    .last_pty_output_instant
+                    .is_some_and(|t| now.duration_since(t) >= AGY_PERMISSION_PROMPT_IDLE)
+            {
+                if self.last_agy_prompt_checked_gen != Some(self.content_generation) {
+                    self.last_agy_prompt_checked_gen = Some(self.content_generation);
+                    self.last_agy_prompt_visible = self.has_agy_permission_prompt();
                 }
-                // 出力全体が止まっているかだけでなく、ダイアログ内容が 1.2 秒間変化せずに留まっているかで判定する
-                // （ダイアログ表示中に見出しより上のスピナーや経過時間が更新され続けるケースにも対応）
-                let first_seen = match &self.agy_prompt_candidate {
-                    Some((prev, t)) if prev == &sig => *t,
-                    _ => {
-                        let initial = self.last_pty_output_instant.map_or(now, |p| p.min(now));
-                        self.agy_prompt_candidate = Some((sig.clone(), initial));
-                        initial
-                    }
-                };
-                if now.saturating_duration_since(first_seen) >= AGY_PERMISSION_PROMPT_IDLE {
+                if self.last_agy_prompt_visible {
                     self.ai_hook_state = Some(AiHookState::Waiting);
                     self.ai_permission_prompt_detected = true;
-                    self.detected_agy_permission_prompt = Some(sig);
-                    self.agy_prompt_absent_since = None;
-                    self.dismissed_agy_permission_prompt = None;
-                    self.agy_prompt_candidate = None;
                     self.last_output_at = Local::now();
                     self.last_output_instant = None;
                     if !is_active {
@@ -572,106 +442,9 @@ fn hash_active_line(terminal: &Terminal, cols: u16, row: u16) -> Option<u64> {
     has_non_space.then(|| hasher.finish())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct AgyPermissionPromptSignature {
-    /// 実物の見出し行（存在する場合）から最後の拒否選択肢行までの正規化ハッシュ列。
-    /// 見出しより上の行（スピナー等）や `Point::Screen` 行番号を含めないことで、
-    /// スピナー更新・リサイズのリフロー・スクロールバックパージでの誤再検知を防ぎつつ、
-    /// コマンドや URL の異なる同選択肢ダイアログを区別する。
-    line_hashes: Vec<u64>,
-}
-
-impl AgyPermissionPromptSignature {
-    /// `other` がこの応答済みダイアログと同一か判定する。
-    /// 見出しの書き換えや出力継続で上側の行が欠けても、残った行が応答済み列の接尾辞と一致すれば同一とみなす。
-    fn matches(&self, other: &Self) -> bool {
-        !other.line_hashes.is_empty() && self.line_hashes.ends_with(&other.line_hashes)
-    }
-}
-
-/// kitty キーボードプロトコル（CSI ... u）で符号化された Enter (13) / Esc (27) / Ctrl+C (99;5) を判定する。
-fn is_kitty_confirm_csi_u(bytes: &[u8]) -> bool {
-    let Some(inner) = bytes
-        .strip_prefix(b"\x1b[")
-        .and_then(|s| s.strip_suffix(b"u"))
-    else {
-        return false;
-    };
-    let Ok(inner_str) = std::str::from_utf8(inner) else {
-        return false;
-    };
-    let mut parts = inner_str.split(';');
-    let key_code = parts
-        .next()
-        .and_then(|k| k.split(':').next())
-        .and_then(|k| k.parse::<u32>().ok());
-    let modifier = parts
-        .next()
-        .and_then(|m| m.split(':').next())
-        .and_then(|m| m.parse::<u32>().ok());
-    match key_code {
-        Some(13 | 27) => true,
-        Some(99 | 67) => modifier.is_some_and(|m| m >= 1 && ((m - 1) & 4) != 0),
-        _ => false,
-    }
-}
-
-/// パーミッション確認ダイアログに対する確定・キャンセル応答キー（応答済み署名を記録する対象）か判定する。
-/// 通常の Enter / Esc / Ctrl+C に加え、`agy` が有効にする kitty キーボードモード（`\x1b[>5u`）での
-/// `\x1b[13u`・`\x1b[27u`・`\x1b[99;5u` 等も受け付ける。
-/// 確定動作が確認できていない文字・数字・`y`/`n`・スペース・貼り付け等は `false` を返し、
-/// ダイアログが残れば 1.2 秒後に再検知させる。
-pub(super) fn is_prompt_confirm_input(bytes: &[u8]) -> bool {
-    matches!(bytes, b"\r" | b"\n" | b"\r\n" | b"\x1b" | b"\x03") || is_kitty_confirm_csi_u(bytes)
-}
-
-/// パーミッション確認ダイアログの選択肢移動のみを行うキー入力か判定する（確定・キャンセルではない）。
-/// 連続送出された矢印キー（`\x1b[B\x1b[B`）、修飾付き／数値付き CSI 矢印（`\x1b[1;2B` / `\x1b[1B`）、
-/// SS3 矢印、Tab / Shift+Tab、マウスシーケンスのみで構成されている場合に `true` を返す。
-pub(super) fn is_prompt_navigation_input(bytes: &[u8]) -> bool {
-    if bytes.is_empty() {
-        return false;
-    }
-    let mut rest = bytes;
-    while !rest.is_empty() {
-        if let Some(next) = rest.strip_prefix(b"\t") {
-            rest = next;
-        } else if let Some(next) = rest.strip_prefix(b"\x1b[Z") {
-            rest = next;
-        } else if rest.len() >= 3
-            && rest[0] == 0x1b
-            && rest[1] == b'O'
-            && matches!(rest[2], b'A'..=b'D')
-        {
-            rest = &rest[3..];
-        } else if let Some(after_csi) = rest.strip_prefix(b"\x1b[") {
-            if after_csi.starts_with(b"<") {
-                if let Some(end_idx) = after_csi.iter().position(|&b| b == b'M' || b == b'm') {
-                    rest = &after_csi[end_idx + 1..];
-                } else {
-                    return false;
-                }
-            } else if after_csi.starts_with(b"M") && after_csi.len() >= 4 {
-                rest = &after_csi[4..];
-            } else {
-                let param_len = after_csi
-                    .iter()
-                    .take_while(|b| b.is_ascii_digit() || **b == b';')
-                    .count();
-                if param_len < after_csi.len() && matches!(after_csi[param_len], b'A'..=b'D') {
-                    rest = &after_csi[param_len + 1..];
-                } else {
-                    return false;
-                }
-            }
-        } else {
-            return false;
-        }
-    }
-    true
-}
-
-fn strip_border_and_trim(line: &str) -> &str {
+/// ダイアログ選択肢の行頭装飾（空白・枠線・選択カーソル・連番）と行末の枠線・空白を取り除く。
+/// diff 行（`+` / `-`）の誤検知を防ぐため `+` / `-` は取り除かない。
+fn strip_option_affixes(line: &str) -> &str {
     let mut s = line.trim();
     if let Some(rest) = s
         .strip_prefix('│')
@@ -687,35 +460,6 @@ fn strip_border_and_trim(line: &str) -> &str {
     {
         s = rest.trim_end();
     }
-    s
-}
-
-/// 実機 `agy` のパーミッション確認ダイアログでコマンド行の直前に出力される見出し行か判定する。
-fn is_agy_requesting_permission_header(line: &str) -> bool {
-    strip_border_and_trim(line).eq_ignore_ascii_case("requesting permission for:")
-}
-
-/// `agy` 実物のパーミッション確認ダイアログ見出し行か判定する（署名開始位置の特定用）。
-fn is_agy_prompt_heading(line: &str) -> bool {
-    matches!(
-        strip_border_and_trim(line).to_ascii_lowercase().as_str(),
-        "run this command?"
-            | "allow access to this url?"
-            | "allow creation of this file?"
-            | "allow calling this tool?"
-            | "do you want to proceed?"
-            | "allow sandbox bypass for command execution?"
-            | "grant requested permission?"
-            | "accept this file edit?"
-            | "allow access to this file?"
-            | "allow administrator elevation?"
-    )
-}
-
-/// ダイアログ選択肢の行頭装飾（空白・枠線・選択カーソル・連番）と行末の枠線・空白を取り除く。
-/// diff 行（`+` / `-`）の誤検知を防ぐため `+` / `-` は取り除かない。
-fn strip_option_affixes(line: &str) -> &str {
-    let mut s = strip_border_and_trim(line);
     if let Some(first) = s.chars().next()
         && matches!(
             first,
@@ -752,7 +496,7 @@ fn is_agy_allow_option(opt_lower: &str) -> bool {
         || opt_lower.starts_with("yes, and always grant permission for ")
         || opt_lower.starts_with("yes, use auto mode until you exit")
         || opt_lower.starts_with("yes, and use auto mode until you exit")
-        || (opt_lower.starts_with("yes, and tell ") && opt_lower.ends_with(" what to do next"))
+        || opt_lower.starts_with("yes, and tell ")
 }
 
 fn is_agy_deny_option(opt_lower: &str) -> bool {
@@ -766,19 +510,17 @@ fn is_agy_deny_option(opt_lower: &str) -> bool {
             | "no, deny permission"
             | "no, reject this change"
     ) || opt_lower.starts_with("no, and always deny ")
-        || (opt_lower.starts_with("no, and tell ")
-            && opt_lower.ends_with(" what to do differently"))
+        || opt_lower.starts_with("no, and tell ")
 }
 
-/// アクティブ画面の論理行スライスから `agy` のパーミッション確認ダイアログ（実物の許可／拒否選択肢の組）を
-/// 検出し、`(許可選択肢ブロック先頭インデックス, 最後の拒否選択肢インデックス)` を返す。
-/// - 最後の拒否行から上へ向かって 10 行以内の直近の許可行ブロックと組むことで、
-///   画面上部に過去のダイアログが残っていても最新ダイアログを取りこぼさない。
-/// - 実機 `agy` は実行中もダイアログ表示中もフッターに `esc to cancel` を出すため、フッター除外は行わない。
-fn match_agy_permission_prompt_lines(lines: &[&str]) -> Option<(usize, usize)> {
+/// アクティブ画面の行スライスに `agy` のパーミッション確認ダイアログ（許可／拒否選択肢の組）が
+/// 含まれているか判定する。
+/// 最後の拒否行より上に許可行が 1 つ以上あり、間の選択肢行数が 10 件以内であれば `true` を返す。
+fn has_agy_permission_prompt_lines(lines: &[&str]) -> bool {
     let mut is_allow = Vec::with_capacity(lines.len());
     let mut is_deny = Vec::with_capacity(lines.len());
     let mut last_deny: Option<usize> = None;
+
     for (idx, line) in lines.iter().enumerate() {
         let opt_lower = strip_option_affixes(line).to_ascii_lowercase();
         let allow = is_agy_allow_option(&opt_lower);
@@ -790,23 +532,21 @@ fn match_agy_permission_prompt_lines(lines: &[&str]) -> Option<(usize, usize)> {
         }
     }
 
-    let deny_idx = last_deny?;
-    let min_search = deny_idx.saturating_sub(10);
-    // 最後の拒否行から上へ向かって 10 行以内（かつ、ひとつ前のダイアログの拒否行より下）にある
-    // 許可選択肢群の先頭を探す。長い許可文言が CRLF で折り返されて非選択肢行を挟む場合にも対応する。
-    let prev_deny_boundary = (min_search..deny_idx)
-        .rev()
-        .find(|&i| is_deny[i])
-        .map_or(min_search, |i| i + 1);
-    let allow_start = (prev_deny_boundary..deny_idx).find(|&i| is_allow[i])?;
-    Some((allow_start, deny_idx))
+    let Some(deny_idx) = last_deny else {
+        return false;
+    };
+    let Some(nearest_allow) = (0..deny_idx).rev().find(|&i| is_allow[i]) else {
+        return false;
+    };
+    let options_between = (nearest_allow..=deny_idx)
+        .filter(|&i| is_allow[i] || is_deny[i])
+        .count();
+    options_between <= 10
 }
 
 /// 画面テキストに `agy` のパーミッション確認プロンプトが含まれているか判定する。
-/// 通常会話・Markdown 箇条書き・diff・JSON 等での偽陽性を防ぐため、
-/// `agy` 実物の決まった許可／拒否選択肢（完全一致または可変引数付き定型文言）が近接して並んでいる場合のみ `true` を返す。
 #[cfg(test)]
 pub(super) fn has_agy_permission_prompt_text(text: &str) -> bool {
     let lines: Vec<&str> = text.lines().collect();
-    match_agy_permission_prompt_lines(&lines).is_some()
+    has_agy_permission_prompt_lines(&lines)
 }
