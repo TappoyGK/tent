@@ -121,6 +121,9 @@ impl SearchTarget {
     }
 }
 
+/// 出力継続中の自動再検索スロットル間隔（毎フレーム全走査による描画詰まりを防止）
+pub(crate) const SEARCH_RESYNC_INTERVAL: Duration = Duration::from_millis(300);
+
 pub(crate) struct SearchState {
     pub(crate) target: SearchTarget,
     pub(crate) query: String,
@@ -131,6 +134,8 @@ pub(crate) struct SearchState {
     pub(crate) current_pin: Option<TrackedGridRef>,
     /// 最後に検索を実行した時点の `TerminalPane::content_generation`
     pub(crate) content_generation: u64,
+    /// 最後に再検索を実行した時刻（出力継続中のスロットル用）
+    pub(crate) last_sync_at: Instant,
 }
 
 #[derive(Default)]
@@ -564,7 +569,33 @@ impl TentApp {
         if self.can_autoscroll_selection() {
             wake_at = wake_at.min((self.last_autoscroll + AUTOSCROLL_INTERVAL).max(now));
         }
+        if let Some(due) = self.search_resync_due_at() {
+            wake_at = wake_at.min(due.max(now));
+        }
         event_loop.set_control_flow(ControlFlow::WaitUntil(wake_at));
+    }
+
+    /// 出力・リサイズ等により再検索が保留中であれば、次に自動再検索すべき時刻を返す
+    fn search_resync_due_at(&self) -> Option<Instant> {
+        let search = self.search.as_ref()?;
+        let SearchTarget::Terminal(pid) = search.target else {
+            return None;
+        };
+        if search.query.is_empty() {
+            return None;
+        }
+        let pane = self
+            .workspace
+            .as_ref()?
+            .active_slot_ref()
+            .root
+            .as_ref()?
+            .terminal_pane(pid)?;
+        if pane.content_generation == search.content_generation {
+            None
+        } else {
+            Some(search.last_sync_at + SEARCH_RESYNC_INTERVAL)
+        }
     }
 
     fn can_autoscroll_selection(&self) -> bool {
@@ -996,6 +1027,10 @@ impl ApplicationHandler<AppEvent> for TentApp {
                 need_redraw = true;
             }
             self.was_any_outputting = now_outputting;
+        }
+
+        if self.search_resync_due_at().is_some_and(|due| now >= due) {
+            need_redraw = true;
         }
 
         // 起動後の段階的セッション復旧（アクティブスロットの後、残りスロットを1つずつ順次復旧）

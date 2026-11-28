@@ -144,10 +144,12 @@ pub(super) fn search_terminal_screen(
 }
 
 /// 再検索後のマッチ一覧に対して、追跡ピンから解決した前回座標 `prev_pos` に最も対応するインデックスを返す。
+/// ピンが失効している場合（スクロールバック先頭パージや Resync 等）でも、直前の行番号 `prev_row` が
+/// 分かっていればそれに最も近いマッチへ引き継ぐ。
 pub fn resolve_tracked_search_match_index(
     matches: &[SearchMatch],
     prev_pos: Option<(u16, u32)>,
-    had_current: bool,
+    prev_row: Option<u32>,
 ) -> Option<usize> {
     if matches.is_empty() {
         return None;
@@ -162,9 +164,17 @@ pub fn resolve_tracked_search_match_index(
         let idx = matches.partition_point(|m| (m.start_row, m.start_col) < (prow, pcol));
         return Some(idx.min(matches.len() - 1));
     }
-    if had_current {
-        Some(0)
-    } else {
-        Some(matches.len() - 1)
+    if let Some(row) = prev_row {
+        let idx = matches.partition_point(|m| m.start_row < row);
+        if idx == 0 {
+            return Some(0);
+        }
+        if idx >= matches.len() {
+            return Some(matches.len() - 1);
+        }
+        let dist_prev = row.saturating_sub(matches[idx - 1].start_row);
+        let dist_curr = matches[idx].start_row.saturating_sub(row);
+        return Some(if dist_prev <= dist_curr { idx - 1 } else { idx });
     }
+    Some(matches.len() - 1)
 }

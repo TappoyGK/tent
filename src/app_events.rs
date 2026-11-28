@@ -702,7 +702,7 @@ impl TentApp {
             }
             WindowEvent::RedrawRequested => {
                 self.drain_daemon_events();
-                self.sync_search_matches_if_needed();
+                self.sync_search_matches_if_needed(false);
                 self.last_redraw = Instant::now();
                 self.pending_redraw = false;
 

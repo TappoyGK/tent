@@ -166,6 +166,7 @@ impl TentApp {
             current_match: None,
             current_pin: None,
             content_generation: 0,
+            last_sync_at: std::time::Instant::now(),
         });
         if target.is_browser() {
             self.browsers.focus_parent();
@@ -195,8 +196,10 @@ impl TentApp {
 
     /// 出力追加・スクロールバック先頭パージ・リサイズ等で端末内容が変化していれば再検索し、
     /// 追跡ピンを使って現在のマッチ位置を座標ベースで引き継ぐ。
+    /// `force == false` のときは `SEARCH_RESYNC_INTERVAL` 未満の連続再検索を間引き、
+    /// 出力継続中のメインスレッド描画詰まりを防ぐ。
     /// 対象ペインが現在のアクティブスロットに存在しない場合は検索を閉じる。
-    pub(crate) fn sync_search_matches_if_needed(&mut self) {
+    pub(crate) fn sync_search_matches_if_needed(&mut self, force: bool) {
         let Some(target) = self.search.as_ref().map(|s| s.target) else {
             return;
         };
@@ -229,16 +232,22 @@ impl TentApp {
                 if pane.content_generation == search.content_generation {
                     return;
                 }
+                let now = std::time::Instant::now();
+                if !force && now.duration_since(search.last_sync_at) < crate::SEARCH_RESYNC_INTERVAL
+                {
+                    return;
+                }
                 let prev_pos = search
                     .current_pin
                     .as_ref()
                     .and_then(|pin| pane.resolve_tracked_point(pin));
-                let had_current = search.current_match.is_some();
+                let prev_row = search
+                    .current_match
+                    .and_then(|idx| search.matches.get(idx))
+                    .map(|m| m.start_row);
                 let found = pane.search_screen(&search.query);
                 let next_idx = crate::terminal_pane::resolve_tracked_search_match_index(
-                    &found,
-                    prev_pos,
-                    had_current,
+                    &found, prev_pos, prev_row,
                 );
                 let next_pin = next_idx
                     .and_then(|i| found.get(i))
@@ -247,6 +256,7 @@ impl TentApp {
                 search.current_match = next_idx;
                 search.current_pin = next_pin;
                 search.content_generation = pane.content_generation;
+                search.last_sync_at = now;
             }
             SearchTarget::Browser(pid) => {
                 let pane_exists = self
@@ -291,6 +301,7 @@ impl TentApp {
                 };
                 search.current_pin = current_pin;
                 search.content_generation = content_generation;
+                search.last_sync_at = std::time::Instant::now();
                 search.matches = found;
             }
             SearchTarget::Browser(pid) => {
@@ -300,7 +311,7 @@ impl TentApp {
     }
 
     pub(crate) fn step_search_match(&mut self, backwards: bool) {
-        self.sync_search_matches_if_needed();
+        self.sync_search_matches_if_needed(true);
         let Some(search) = self.search.as_mut() else {
             return;
         };
