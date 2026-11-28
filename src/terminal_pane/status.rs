@@ -265,18 +265,22 @@ impl TerminalPane {
         let line_refs: Vec<&str> = logical_lines.iter().map(String::as_str).collect();
         let (allow_start, last_deny) = match_agy_permission_prompt_lines(&line_refs)?;
 
-        // 実物の見出し行を、ひとつ上のダイアログの選択肢行の手前まで遡って探す。
-        // 見つかれば見出しから最後の拒否行までを署名に含め（見出しより上の行は含めない）、
-        // 見つからなければ選択肢行のみで署名を作る。
+        // `Requesting permission for:` 行（実機 agy でコマンド行の直前に出る）または実物の見出し行を、
+        // ひとつ上のダイアログの拒否選択肢行の手前まで遡って探す。
+        // `Requesting permission for:` が見つかればそこから、なければ見出し行から、
+        // それも見つからなければ選択肢行のみから最後の拒否行までを署名にする。
         let mut sig_start = allow_start;
         for idx in (0..allow_start).rev() {
             let opt_lower = strip_option_affixes(&logical_lines[idx]).to_ascii_lowercase();
-            if is_agy_allow_option(&opt_lower) || is_agy_deny_option(&opt_lower) {
+            if is_agy_deny_option(&opt_lower) {
                 break;
             }
-            if is_agy_prompt_heading(&logical_lines[idx]) {
+            if is_agy_requesting_permission_header(&logical_lines[idx]) {
                 sig_start = idx;
                 break;
+            }
+            if sig_start == allow_start && is_agy_prompt_heading(&logical_lines[idx]) {
+                sig_start = idx;
             }
         }
 
@@ -585,11 +589,40 @@ impl AgyPermissionPromptSignature {
     }
 }
 
+/// kitty キーボードプロトコル（CSI ... u）で符号化された Enter (13) / Esc (27) / Ctrl+C (99;5) を判定する。
+fn is_kitty_confirm_csi_u(bytes: &[u8]) -> bool {
+    let Some(inner) = bytes
+        .strip_prefix(b"\x1b[")
+        .and_then(|s| s.strip_suffix(b"u"))
+    else {
+        return false;
+    };
+    let Ok(inner_str) = std::str::from_utf8(inner) else {
+        return false;
+    };
+    let mut parts = inner_str.split(';');
+    let key_code = parts
+        .next()
+        .and_then(|k| k.split(':').next())
+        .and_then(|k| k.parse::<u32>().ok());
+    let modifier = parts
+        .next()
+        .and_then(|m| m.split(':').next())
+        .and_then(|m| m.parse::<u32>().ok());
+    match key_code {
+        Some(13 | 27) => true,
+        Some(99 | 67) => modifier.is_some_and(|m| m >= 1 && ((m - 1) & 4) != 0),
+        _ => false,
+    }
+}
+
 /// パーミッション確認ダイアログに対する確定・キャンセル応答キー（応答済み署名を記録する対象）か判定する。
-/// `agy` で確定動作が確認できていない文字・数字・`y`/`n`・スペース・貼り付け等は `false` を返し、
+/// 通常の Enter / Esc / Ctrl+C に加え、`agy` が有効にする kitty キーボードモード（`\x1b[>5u`）での
+/// `\x1b[13u`・`\x1b[27u`・`\x1b[99;5u` 等も受け付ける。
+/// 確定動作が確認できていない文字・数字・`y`/`n`・スペース・貼り付け等は `false` を返し、
 /// ダイアログが残れば 1.2 秒後に再検知させる。
 pub(super) fn is_prompt_confirm_input(bytes: &[u8]) -> bool {
-    matches!(bytes, b"\r" | b"\n" | b"\r\n" | b"\x1b" | b"\x03")
+    matches!(bytes, b"\r" | b"\n" | b"\r\n" | b"\x1b" | b"\x03") || is_kitty_confirm_csi_u(bytes)
 }
 
 /// パーミッション確認ダイアログの選択肢移動のみを行うキー入力か判定する（確定・キャンセルではない）。
@@ -657,6 +690,11 @@ fn strip_border_and_trim(line: &str) -> &str {
     s
 }
 
+/// 実機 `agy` のパーミッション確認ダイアログでコマンド行の直前に出力される見出し行か判定する。
+fn is_agy_requesting_permission_header(line: &str) -> bool {
+    strip_border_and_trim(line).eq_ignore_ascii_case("requesting permission for:")
+}
+
 /// `agy` 実物のパーミッション確認ダイアログ見出し行か判定する（署名開始位置の特定用）。
 fn is_agy_prompt_heading(line: &str) -> bool {
     matches!(
@@ -720,7 +758,8 @@ fn is_agy_allow_option(opt_lower: &str) -> bool {
 fn is_agy_deny_option(opt_lower: &str) -> bool {
     matches!(
         opt_lower,
-        "no, deny"
+        "no, cancel"
+            | "no, deny"
             | "no, deny access"
             | "no, deny creation"
             | "no, deny tool call"
@@ -733,50 +772,38 @@ fn is_agy_deny_option(opt_lower: &str) -> bool {
 
 /// アクティブ画面の論理行スライスから `agy` のパーミッション確認ダイアログ（実物の許可／拒否選択肢の組）を
 /// 検出し、`(許可選択肢ブロック先頭インデックス, 最後の拒否選択肢インデックス)` を返す。
-/// - 末尾 3 非空行（フッター）に `esc to interrupt` がある場合は実行中とみなして除外する。
 /// - 最後の拒否行から上へ向かって 10 行以内の直近の許可行ブロックと組むことで、
 ///   画面上部に過去のダイアログが残っていても最新ダイアログを取りこぼさない。
+/// - 実機 `agy` は実行中もダイアログ表示中もフッターに `esc to cancel` を出すため、フッター除外は行わない。
 fn match_agy_permission_prompt_lines(lines: &[&str]) -> Option<(usize, usize)> {
-    // 末尾 3 非空行（フッター）に esc to interrupt がある場合は実行中とみなす
-    let mut non_empty_seen = 0usize;
-    for line in lines.iter().rev() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if line.to_ascii_lowercase().contains("esc to interrupt") {
-            return None;
-        }
-        non_empty_seen += 1;
-        if non_empty_seen >= 3 {
-            break;
-        }
-    }
-
     let mut is_allow = Vec::with_capacity(lines.len());
+    let mut is_deny = Vec::with_capacity(lines.len());
     let mut last_deny: Option<usize> = None;
     for (idx, line) in lines.iter().enumerate() {
         let opt_lower = strip_option_affixes(line).to_ascii_lowercase();
         let allow = is_agy_allow_option(&opt_lower);
+        let deny = !allow && is_agy_deny_option(&opt_lower);
         is_allow.push(allow);
-        if !allow && is_agy_deny_option(&opt_lower) {
+        is_deny.push(deny);
+        if deny {
             last_deny = Some(idx);
         }
     }
 
     let deny_idx = last_deny?;
     let min_search = deny_idx.saturating_sub(10);
-    // 最後の拒否行から上へ向かって、10 行以内にある最も近い許可行を探す
-    let nearest_allow = (min_search..deny_idx).rev().find(|&i| is_allow[i])?;
-    // 同じダイアログ内の連続した許可選択肢（例: Yes, run command / Yes, and always allow ...）の先頭まで遡る
-    let mut allow_start = nearest_allow;
-    while allow_start > min_search && is_allow[allow_start - 1] {
-        allow_start -= 1;
-    }
+    // 最後の拒否行から上へ向かって 10 行以内（かつ、ひとつ前のダイアログの拒否行より下）にある
+    // 許可選択肢群の先頭を探す。長い許可文言が CRLF で折り返されて非選択肢行を挟む場合にも対応する。
+    let prev_deny_boundary = (min_search..deny_idx)
+        .rev()
+        .find(|&i| is_deny[i])
+        .map_or(min_search, |i| i + 1);
+    let allow_start = (prev_deny_boundary..deny_idx).find(|&i| is_allow[i])?;
     Some((allow_start, deny_idx))
 }
 
 /// 画面テキストに `agy` のパーミッション確認プロンプトが含まれているか判定する。
-/// 通常会話・Markdown 箇条書き・diff・JSON 等での偽陽性を防ぐため、末尾 3 非空行（フッター）の `esc to interrupt` を除外した上で
+/// 通常会話・Markdown 箇条書き・diff・JSON 等での偽陽性を防ぐため、
 /// `agy` 実物の決まった許可／拒否選択肢（完全一致または可変引数付き定型文言）が近接して並んでいる場合のみ `true` を返す。
 #[cfg(test)]
 pub(super) fn has_agy_permission_prompt_text(text: &str) -> bool {

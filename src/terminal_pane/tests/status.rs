@@ -517,9 +517,10 @@ fn test_agy_permission_prompt_detection_and_recovery() {
     use super::super::AGY_PERMISSION_PROMPT_IDLE;
     use super::super::status::has_agy_permission_prompt_text;
 
-    // 1. agy 実行ファイル内の許可／拒否選択肢文言（および組み合わせパターン）を検知できること
+    // 1. 実機 agy の確認ダイアログ（Requesting permission for: / No, cancel / esc to cancel フッター）および
+    //    実行ファイル内の許可／拒否選択肢文言を検知できること
     assert!(has_agy_permission_prompt_text(
-        "Run this command?\n  ❯ 1. Yes, run command\n    2. No, deny\n    3. No, and tell agy what to do differently\n(Enter/Esc to cancel)"
+        "Command\n──────────────────────────────────────────────\n\nRequesting permission for:\n   echo hello\n\nRun this command?\n> 1. Yes, run command\n  2. Yes, and always allow in this\nconversation for commands that start with\n'echo'\n  3. Yes, and always allow for commands that\nstart with 'echo' (Persist to settings.json)\n  4. No, cancel\n\n  ↑/↓ Navigate · tab Amend · ctrl+g edit/expan\nesc to cancel           Gemini 4 Neon · medium"
     ));
     assert!(has_agy_permission_prompt_text(
         "Allow creation of this file?\n  > Yes, allow creation\n    No, deny creation"
@@ -540,7 +541,7 @@ fn test_agy_permission_prompt_detection_and_recovery() {
         "Grant requested permission?\n  1. Yes, grant permission\n  2. No, deny permission"
     ));
     assert!(has_agy_permission_prompt_text(
-        "Grant requested permission?\n  1. Yes, grant permission for 'git push' (Persist to settings)\n  2. No, and always deny 'git push' in this conversation"
+        "Grant requested permission?\n  1. Yes, grant permission for git push (Persist to settings)\n  2. No, and always deny 'git push' in this conversation"
     ));
     assert!(has_agy_permission_prompt_text(
         "Grant requested permission?\n  1. Yes, and always grant permission for 'git' in this conversation\n  2. No, deny permission"
@@ -548,15 +549,8 @@ fn test_agy_permission_prompt_detection_and_recovery() {
     assert!(has_agy_permission_prompt_text(
         "Do you want to proceed?\n  1. Yes, and use Auto mode until you exit (auto-approve edits and safe commands)\n  2. No, deny"
     ));
-    // 履歴の上部にある esc to interrupt はフッターではないため除外しない
-    assert!(has_agy_permission_prompt_text(
-        "previous: (esc to interrupt)\nRun this command?\n  > Yes, run command\n    No, deny"
-    ));
 
-    // 実行中インジケータ（esc to interrupt）があれば除外し、通常文章・Markdown 箇条書き・引用・diff・JSON では誤検知しないこと
-    assert!(!has_agy_permission_prompt_text(
-        "Working... (esc to interrupt)\n  1. Yes, run command\n  2. No, deny"
-    ));
+    // 通常文章・Markdown 箇条書き・引用・diff・JSON では誤検知しないこと
     assert!(!has_agy_permission_prompt_text(
         "You can choose Allow once or Cancel in the dialog."
     ));
@@ -978,11 +972,67 @@ fn test_agy_permission_prompt_detection_and_recovery() {
     assert!(!pane.update_waiting_state(t_ab + Duration::from_millis(1500), true, true, Some("1")));
     assert_eq!(pane.ai_hook_state, Some(AiHookState::Working));
 
+    // 13. 実機 agy の代替スクリーン＋同期出力＋Requesting permission for:＋No, cancel＋kitty Esc/Ctrl+C で
+    //     echo hello → 500ms 後の echo world を続けて検知でき、kitty Esc (\x1b[27u) / Ctrl+C (\x1b[99;5u) が
+    //     確定・キャンセル応答として認識されること
+    pane.resize(46, 54, 8, 16);
+    assert!(pane.apply_ai_hook_event(AiHookState::Working, Some(AiTool::Agy), false, true, "1"));
+    let real_agy_frame = |cmd: &str| {
+        format!(
+            "\x1b[?1049h\x1b[?2026h\x1b[H\x1b[2J\x1b[?7lCommand\r\n──────────────────────────────────────────────\r\n\r\nRequesting permission for:\r\n   {cmd}\r\n\r\nRun this command?\r\n> 1. Yes, run command\r\n  2. Yes, and always allow in this\r\nconversation for commands that start with\r\n'echo'\r\n  3. Yes, and always allow for commands that\r\nstart with 'echo' (Persist to settings.json)\r\n  4. No, cancel\r\n\r\n  ↑/↓ Navigate · tab Amend · ctrl+g edit/expan\r\nesc to cancel           Gemini 4 Neon · medium\x1b[?2026l"
+        )
+    };
+    pane.feed_pty_bytes(real_agy_frame("echo hello").as_bytes(), false, true, "1");
+    let t_real1 = Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100);
+    assert!(pane.update_waiting_state(t_real1, false, true, Some("1")));
+    assert_eq!(pane.ai_hook_state, Some(AiHookState::Waiting));
+
+    // Enter で承認 → Running/Ran フレーム（500ms 後） → 同じ 'echo' 系の別コマンド echo world
+    pane.write_input(b"\r");
+    assert_eq!(pane.ai_hook_state, Some(AiHookState::Working));
+    pane.feed_pty_bytes(
+        b"\x1b[?2026h\x1b[H\x1b[2JRunning echo hello...\r\nesc to cancel\x1b[?2026l",
+        false,
+        true,
+        "1",
+    );
+    assert!(!pane.update_waiting_state(
+        t_real1 + Duration::from_millis(250),
+        false,
+        true,
+        Some("1")
+    ));
+    pane.feed_pty_bytes(real_agy_frame("echo world").as_bytes(), false, true, "1");
+    let t_real2 = Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100);
+    assert!(pane.update_waiting_state(t_real2, false, true, Some("1")));
+    assert_eq!(pane.ai_hook_state, Some(AiHookState::Waiting));
+
+    // kitty Esc (\x1b[27u) と kitty Ctrl+C (\x1b[99;5u) が確定・キャンセル応答として認識されること
+    pane.write_input(b"\x1b[27u");
+    assert_eq!(pane.ai_hook_state, Some(AiHookState::Working));
+    assert!(!pane.update_waiting_state(
+        Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100),
+        false,
+        true,
+        Some("1")
+    ));
+    pane.feed_pty_bytes(real_agy_frame("echo third").as_bytes(), false, true, "1");
+    let t_real3 = Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100);
+    assert!(pane.update_waiting_state(t_real3, false, true, Some("1")));
+    pane.write_input(b"\x1b[99;5u");
+    assert_eq!(pane.ai_hook_state, Some(AiHookState::Working));
+    assert!(!pane.update_waiting_state(
+        Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100),
+        false,
+        true,
+        Some("1")
+    ));
+
     // 狭い幅（30 列）で拒否文言が折り返しても連結して検知できること
     pane.resize(30, 20, 8, 16);
     assert!(pane.apply_ai_hook_event(AiHookState::Working, Some(AiTool::Agy), true, true, "1"));
     pane.feed_pty_bytes(
-        b"\x1b[2J\x1b[HRun this command?\r\n> Yes, run command\r\n  No, and tell agy what to do differently\r\n",
+        b"\x1b[?7h\x1b[2J\x1b[HRun this command?\r\n> Yes, run command\r\n  No, and tell agy what to do differently\r\n",
         true,
         true,
         "1",
