@@ -35,9 +35,11 @@ use crate::terminal_pane::{AppEvent, PaneId, SearchMatch, TrackedGridRef, UrlMat
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const CWD_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 const BATTERY_POLL_INTERVAL: Duration = Duration::from_secs(30);
-const SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(2000);
 const RESTORE_STEP_INTERVAL: Duration = Duration::from_millis(350);
 const PTY_DRAIN_BUDGET: Duration = Duration::from_millis(8);
+const DAEMON_EVENT_QUEUE_CAPACITY: usize = 64;
+const MEMORY_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(400);
 const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -242,6 +244,7 @@ struct TentApp {
     proxy: EventLoopProxy<AppEvent>,
     initial_state: Option<SavedState>,
     daemon: Option<DaemonClient>,
+    daemon_pid: Option<i32>,
     daemon_rx: Option<Receiver<DaemonEvent>>,
 
     window: Option<Arc<Window>>,
@@ -260,6 +263,8 @@ struct TentApp {
     last_battery_poll: Instant,
     battery_status: Arc<Mutex<Option<macos::BatteryStatus>>>,
     wifi_status: Arc<Mutex<Option<macos::WifiStatus>>>,
+    last_memory_poll: Instant,
+    memory_bytes: u64,
     last_snapshot_poll: Instant,
     last_restore_step: Instant,
     restore_queue: VecDeque<usize>,
@@ -298,6 +303,7 @@ impl TentApp {
             proxy,
             initial_state: Some(saved),
             daemon: None,
+            daemon_pid: None,
             daemon_rx: None,
             window: None,
             renderer: None,
@@ -314,6 +320,8 @@ impl TentApp {
             last_battery_poll: now - BATTERY_POLL_INTERVAL,
             battery_status: Arc::new(Mutex::new(None)),
             wifi_status: Arc::new(Mutex::new(None)),
+            last_memory_poll: now - MEMORY_POLL_INTERVAL,
+            memory_bytes: 0,
             last_snapshot_poll: now - SNAPSHOT_POLL_INTERVAL,
             last_restore_step: now,
             restore_queue: VecDeque::new(),
@@ -796,8 +804,9 @@ impl ApplicationHandler<AppEvent> for TentApp {
             Renderer::new(Arc::clone(&window), scale).expect("failed to initialize wgpu renderer");
 
         // デーモンへ接続（未起動なら自動デタッチ起動）し、生きたペインをすべて再接続
-        // 大量出力時も Output / Exited を絶対に欠落させないため無制限チャネルを使用（ドレインは8ms予算で制御）
-        let (ev_tx, ev_rx) = mpsc::channel::<DaemonEvent>();
+        // スリープや描画停止中に GUI 側キューが際限なく膨張するのを防ぐため有界チャネルを使用し、
+        // 詰まった際はデーモン側の 16MB ガード＋自動スナップショット再同期へバックプレッシャーを返す
+        let (ev_tx, ev_rx) = mpsc::sync_channel::<DaemonEvent>(DAEMON_EVENT_QUEUE_CAPACITY);
         let proxy_for_daemon = self.proxy.clone();
         let sock_path = default_socket_path();
         let attach = DaemonClient::connect_or_spawn(&sock_path, true, move |ev| {
@@ -821,6 +830,7 @@ impl ApplicationHandler<AppEvent> for TentApp {
         let restore_queue: VecDeque<usize> = workspace.slots_needing_restore().into();
 
         self.daemon = Some(attach.client);
+        self.daemon_pid = attach.daemon_pid;
         self.daemon_rx = Some(ev_rx);
         self.daemon_version_mismatch = attach.daemon_version_mismatch;
         self.window = Some(window);
@@ -1064,6 +1074,16 @@ impl ApplicationHandler<AppEvent> for TentApp {
             }
             if self.sync_live_browser_urls() {
                 self.save_state();
+            }
+            if now.duration_since(self.last_memory_poll) >= MEMORY_POLL_INTERVAL {
+                self.last_memory_poll = now;
+                let self_bytes =
+                    macos::get_pid_memory_bytes(std::process::id() as i32).unwrap_or(0);
+                let daemon_bytes = self
+                    .daemon_pid
+                    .and_then(macos::get_pid_memory_bytes)
+                    .unwrap_or(0);
+                self.memory_bytes = self_bytes.saturating_add(daemon_bytes);
             }
             if now.duration_since(self.last_battery_poll) >= BATTERY_POLL_INTERVAL {
                 self.last_battery_poll = now;
@@ -1513,5 +1533,40 @@ mod tests {
             macos::detect_ai_tool_from_process(Some(Path::new("/bin/zsh")), &[]),
             None
         );
+    }
+
+    #[test]
+    fn test_memory_overlay_budget_threshold_and_formatting() {
+        use crate::renderer::MemoryOverlay;
+
+        // 0 バイトは空ラベル・非超過
+        let empty = MemoryOverlay::from_bytes(0);
+        assert_eq!(empty.label, "");
+        assert!(!empty.is_over_budget);
+
+        // 256 MiB = フルスケール(640 MiB)の 40%・非超過
+        let normal = MemoryOverlay::from_bytes(256 * 1024 * 1024);
+        assert_eq!(normal.label, "256M");
+        assert!(!normal.is_over_budget);
+        assert!((normal.fraction - 0.40).abs() < 0.01);
+
+        // 512 MiB（ちょうど 80% ライン）はまだ赤にならない
+        let at_budget = MemoryOverlay::from_bytes(MemoryOverlay::BUDGET_BYTES);
+        assert_eq!(at_budget.label, "512M");
+        assert!(!at_budget.is_over_budget);
+        assert!((at_budget.fraction - 0.80).abs() < 0.01);
+
+        // 512 MiB 超過で赤警告（is_over_budget == true）
+        let over = MemoryOverlay::from_bytes(MemoryOverlay::BUDGET_BYTES + 1);
+        assert!(over.is_over_budget);
+
+        // 1.5 GiB は "1.5G" 表記で fraction は 1.0 にクランプ
+        let huge = MemoryOverlay::from_bytes(1536 * 1024 * 1024);
+        assert_eq!(huge.label, "1.5G");
+        assert!(huge.is_over_budget);
+        assert_eq!(huge.fraction, 1.0);
+
+        // 自プロセスの物理メモリが macOS で取得できること
+        assert!(macos::get_pid_memory_bytes(std::process::id() as i32).is_some());
     }
 }

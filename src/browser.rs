@@ -963,44 +963,47 @@ impl BrowserManager {
                 if img_ptr.is_null() || !err_ptr.is_null() {
                     return;
                 }
-                let img = unsafe { &*img_ptr };
-                let Some(cg) = (unsafe {
-                    img.CGImageForProposedRect_context_hints(std::ptr::null_mut(), None, None)
-                }) else {
-                    return;
-                };
-                let w = CGImage::width(Some(&cg));
-                let h = CGImage::height(Some(&cg));
-                if w == 0 || h == 0 || w > 1024 || h > 1024 {
-                    return;
-                }
-                let Some(cs) = CGColorSpace::new_device_rgb() else {
-                    return;
-                };
-                let mut rgba = vec![0u8; w * h * 4];
-                // kCGImageAlphaPremultipliedLast (1) | kCGBitmapByteOrder32Big (4 << 12)
-                let bitmap_info: u32 = 1 | (4 << 12);
-                let ctx = unsafe {
-                    CGBitmapContextCreate(
-                        rgba.as_mut_ptr().cast(),
-                        w,
-                        h,
-                        8,
-                        w * 4,
-                        Some(&cs),
-                        bitmap_info,
-                    )
-                };
-                if let Some(ctx) = ctx {
-                    let rect = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(w as f64, h as f64));
-                    CGContext::draw_image(Some(&ctx), rect, Some(&cg));
-                    let _ = proxy.send_event(AppEvent::BrowserSnapshot {
-                        pane_id,
-                        width: w as u32,
-                        height: h as u32,
-                        rgba,
-                    });
-                }
+                objc2::rc::autoreleasepool(|_| {
+                    let img = unsafe { &*img_ptr };
+                    let Some(cg) = (unsafe {
+                        img.CGImageForProposedRect_context_hints(std::ptr::null_mut(), None, None)
+                    }) else {
+                        return;
+                    };
+                    let w = CGImage::width(Some(&cg));
+                    let h = CGImage::height(Some(&cg));
+                    if w == 0 || h == 0 || w > 1024 || h > 1024 {
+                        return;
+                    }
+                    let Some(cs) = CGColorSpace::new_device_rgb() else {
+                        return;
+                    };
+                    let mut rgba = vec![0u8; w * h * 4];
+                    // kCGImageAlphaPremultipliedLast (1) | kCGBitmapByteOrder32Big (4 << 12)
+                    let bitmap_info: u32 = 1 | (4 << 12);
+                    let ctx = unsafe {
+                        CGBitmapContextCreate(
+                            rgba.as_mut_ptr().cast(),
+                            w,
+                            h,
+                            8,
+                            w * 4,
+                            Some(&cs),
+                            bitmap_info,
+                        )
+                    };
+                    if let Some(ctx) = ctx {
+                        let rect =
+                            CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(w as f64, h as f64));
+                        CGContext::draw_image(Some(&ctx), rect, Some(&cg));
+                        let _ = proxy.send_event(AppEvent::BrowserSnapshot {
+                            pane_id,
+                            width: w as u32,
+                            height: h as u32,
+                            rgba,
+                        });
+                    }
+                });
             });
             unsafe {
                 wk.takeSnapshotWithConfiguration_completionHandler(Some(&config), &block);

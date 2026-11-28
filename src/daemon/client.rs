@@ -28,6 +28,8 @@ pub struct AttachResult {
     pub next_pane_id: PaneId,
     /// 常駐デーモンが現行バイナリと異なるプロトコルバージョンの場合 true
     pub daemon_version_mismatch: bool,
+    /// 接続先常駐デーモンの PID（メモリ使用量モニタリング用）
+    pub daemon_pid: Option<i32>,
 }
 
 impl DaemonClient {
@@ -57,6 +59,7 @@ impl DaemonClient {
             Err(e) => return Err(e),
         };
 
+        let daemon_pid = peer_pid_of_stream(&stream);
         let mut reader = stream.try_clone()?;
         let mut writer = stream;
 
@@ -120,6 +123,7 @@ impl DaemonClient {
             replayed_panes,
             next_pane_id,
             daemon_version_mismatch,
+            daemon_pid,
         })
     }
 
@@ -183,6 +187,21 @@ pub(super) fn normalize_post_handshake_event(ev: DaemonEvent, server_version: u3
         return DaemonEvent::Resync(rp);
     }
     ev
+}
+
+fn peer_pid_of_stream(stream: &UnixStream) -> Option<i32> {
+    let mut peer_pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            std::ptr::from_mut(&mut peer_pid).cast(),
+            &raw mut len,
+        )
+    };
+    (rc == 0 && peer_pid > 0).then_some(peer_pid)
 }
 
 /// 単発 CLI（`tent hook`）から常駐デーモンへ AI フック状態イベントを送信する。
