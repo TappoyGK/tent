@@ -151,7 +151,7 @@ pub struct RenderOverlays<'a> {
     pub daemon_upgrade_confirm: bool,
     pub version_copied: bool,
     pub timer: TimerOverlay,
-    pub memory: MemoryOverlay,
+    pub memory: &'a MemoryOverlay,
 }
 
 /// 1フレーム描画の戻り値
@@ -222,7 +222,7 @@ pub struct Renderer {
     timer_buffer: Buffer,
     timer_cache_key: String,
     mem_buffer: Buffer,
-    mem_cache_key: String,
+    mem_cache_key: (String, bool, u32),
     status_btn_buffers: [Buffer; 8],
     status_btn_labels: [String; 8],
 
@@ -568,7 +568,7 @@ impl Renderer {
             timer_buffer,
             timer_cache_key: String::new(),
             mem_buffer,
-            mem_cache_key: String::new(),
+            mem_cache_key: (String::new(), false, 0),
             status_btn_buffers,
             status_btn_labels: std::array::from_fn(|_| String::new()),
             footer_buffers: Vec::new(),
@@ -701,7 +701,7 @@ impl Renderer {
         self.main_status_cache_key = (String::new(), 0);
         self.url_bar_cache_key = (String::new(), false, 0);
         self.clock_text.clear();
-        self.mem_cache_key.clear();
+        self.mem_cache_key.2 = 0;
         self.status_btn_labels = std::array::from_fn(|_| String::new());
         for key in &mut self.footer_cache_keys {
             key.2 = 0;

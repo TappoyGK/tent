@@ -828,7 +828,7 @@ impl TentApp {
                         .version_copied_until
                         .is_some_and(|d| Instant::now() < d),
                     timer: self.status_timer.overlay(Instant::now()),
-                    memory: crate::renderer::MemoryOverlay::from_bytes(self.memory_bytes),
+                    memory: &self.memory_overlay,
                 };
 
                 let mut outcome = None;

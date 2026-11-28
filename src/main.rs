@@ -244,6 +244,7 @@ struct TentApp {
     proxy: EventLoopProxy<AppEvent>,
     initial_state: Option<SavedState>,
     daemon: Option<DaemonClient>,
+    /// 初回接続時に取得した常駐デーモンの PID（メモリ合算用。デーモン異常終了後に PID が再利用される可能性は極めて低いため接続時値を保持）
     daemon_pid: Option<i32>,
     daemon_rx: Option<Receiver<DaemonEvent>>,
 
@@ -264,7 +265,7 @@ struct TentApp {
     battery_status: Arc<Mutex<Option<macos::BatteryStatus>>>,
     wifi_status: Arc<Mutex<Option<macos::WifiStatus>>>,
     last_memory_poll: Instant,
-    memory_bytes: u64,
+    memory_overlay: crate::renderer::MemoryOverlay,
     last_snapshot_poll: Instant,
     last_restore_step: Instant,
     restore_queue: VecDeque<usize>,
@@ -321,7 +322,7 @@ impl TentApp {
             battery_status: Arc::new(Mutex::new(None)),
             wifi_status: Arc::new(Mutex::new(None)),
             last_memory_poll: now - MEMORY_POLL_INTERVAL,
-            memory_bytes: 0,
+            memory_overlay: crate::renderer::MemoryOverlay::default(),
             last_snapshot_poll: now - SNAPSHOT_POLL_INTERVAL,
             last_restore_step: now,
             restore_queue: VecDeque::new(),
@@ -1083,7 +1084,9 @@ impl ApplicationHandler<AppEvent> for TentApp {
                     .daemon_pid
                     .and_then(macos::get_pid_memory_bytes)
                     .unwrap_or(0);
-                self.memory_bytes = self_bytes.saturating_add(daemon_bytes);
+                self.memory_overlay = crate::renderer::MemoryOverlay::from_bytes(
+                    self_bytes.saturating_add(daemon_bytes),
+                );
             }
             if now.duration_since(self.last_battery_poll) >= BATTERY_POLL_INTERVAL {
                 self.last_battery_poll = now;

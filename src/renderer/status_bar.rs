@@ -279,13 +279,11 @@ impl Renderer {
             );
             self.push_border(rects, mr, 1.0 * scale_factor, track_border);
 
-            let mkey = format!(
-                "{}|{}|{}",
-                overlays.memory.label,
-                over,
-                (scale_factor * 100.0).round() as u32
-            );
-            if self.mem_cache_key != mkey {
+            let scale_key = (scale_factor * 100.0).round() as u32;
+            if self.mem_cache_key.0 != overlays.memory.label
+                || self.mem_cache_key.1 != over
+                || self.mem_cache_key.2 != scale_key
+            {
                 let mfs = (10.0 * scale_factor).round().max(9.0);
                 let mmetrics = Metrics::new(mfs, (mfs * 1.3).ceil());
                 self.mem_buffer.set_metrics(mmetrics);
@@ -306,7 +304,7 @@ impl Renderer {
                 );
                 self.mem_buffer
                     .shape_until_scroll(&mut self.font_system, false);
-                self.mem_cache_key = mkey;
+                self.mem_cache_key = (overlays.memory.label.clone(), over, scale_key);
             }
         }
 
