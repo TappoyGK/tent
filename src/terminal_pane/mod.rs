@@ -43,7 +43,7 @@ const BACKGROUND_NOTIFY_MIN_DURATION: Duration = Duration::from_secs(5);
 const ACTIVE_OUTPUT_FAST_PATH: Duration = Duration::from_millis(50);
 /// DEC Mode 2026 (Synchronized Output) で描画ホールドを許可する最大時間（固まり防止）
 const SYNC_OUTPUT_MAX_HOLD: Duration = Duration::from_secs(1);
-/// agy の Working 中にパーミッション確認プロンプトが安定表示されてから Waiting へ遷移するまでの時間
+/// agy の Working 中に PTY 出力が止まってからパーミッション確認プロンプトを検知するまでの無出力時間
 const AGY_PERMISSION_PROMPT_IDLE: Duration = Duration::from_millis(1200);
 
 /// イベントループへのカスタム通知

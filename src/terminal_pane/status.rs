@@ -58,6 +58,17 @@ impl TerminalPane {
         }
         self.ai_hook_active = true;
         let was_prompt_detected = self.ai_permission_prompt_detected;
+        // 画面検知による Waiting 中にフックの Working が届いても、ダイアログがまだ画面に残っている場合は
+        // 検知中の状態を維持し、1.2 秒後の再検知・重複通知を防ぐ
+        if state == AiHookState::Working
+            && was_prompt_detected
+            && self.active_ai_tool == Some(AiTool::Agy)
+            && self.has_agy_permission_prompt()
+        {
+            self.last_agy_prompt_checked_gen = Some(self.content_generation);
+            self.last_agy_prompt_visible = true;
+            return false;
+        }
         self.ai_permission_prompt_detected = false;
         self.last_agy_prompt_checked_gen = None;
         let now = Instant::now();
@@ -496,7 +507,6 @@ fn is_agy_allow_option(opt_lower: &str) -> bool {
         || opt_lower.starts_with("yes, and always grant permission for ")
         || opt_lower.starts_with("yes, use auto mode until you exit")
         || opt_lower.starts_with("yes, and use auto mode until you exit")
-        || opt_lower.starts_with("yes, and tell ")
 }
 
 fn is_agy_deny_option(opt_lower: &str) -> bool {
@@ -510,12 +520,37 @@ fn is_agy_deny_option(opt_lower: &str) -> bool {
             | "no, deny permission"
             | "no, reject this change"
     ) || opt_lower.starts_with("no, and always deny ")
-        || opt_lower.starts_with("no, and tell ")
+}
+
+/// `Yes, and tell ... what to do next` / `No, and tell ... what to do differently` を判定する。
+/// `agy` が自前 CRLF 改行で複数行に分けた場合にも対応するため、最大 2 行の続き行を空白連結して末尾一致を確認する。
+fn matches_tell_option(lines: &[&str], idx: usize, prefix: &str, suffix: &str) -> bool {
+    let opt = strip_option_affixes(lines[idx]).to_ascii_lowercase();
+    if !opt.starts_with(prefix) {
+        return false;
+    }
+    if opt.ends_with(suffix) {
+        return true;
+    }
+    let mut joined = opt;
+    for next_line in lines.iter().skip(idx + 1).take(2) {
+        let trimmed = strip_option_affixes(next_line).to_ascii_lowercase();
+        if trimmed.is_empty() || is_agy_allow_option(&trimmed) || is_agy_deny_option(&trimmed) {
+            break;
+        }
+        joined.push(' ');
+        joined.push_str(&trimmed);
+        if joined.ends_with(suffix) {
+            return true;
+        }
+    }
+    false
 }
 
 /// アクティブ画面の行スライスに `agy` のパーミッション確認ダイアログ（許可／拒否選択肢の組）が
 /// 含まれているか判定する。
-/// 最後の拒否行より上に許可行が 1 つ以上あり、間の選択肢行数が 10 件以内であれば `true` を返す。
+/// 最後の拒否行より上に許可行が 1 つ以上あり、直近の許可行から最後の拒否行までが 10 行以内
+/// （かつ間の選択肢行数が 10 件以内）であれば `true` を返す。
 fn has_agy_permission_prompt_lines(lines: &[&str]) -> bool {
     let mut is_allow = Vec::with_capacity(lines.len());
     let mut is_deny = Vec::with_capacity(lines.len());
@@ -523,8 +558,11 @@ fn has_agy_permission_prompt_lines(lines: &[&str]) -> bool {
 
     for (idx, line) in lines.iter().enumerate() {
         let opt_lower = strip_option_affixes(line).to_ascii_lowercase();
-        let allow = is_agy_allow_option(&opt_lower);
-        let deny = !allow && is_agy_deny_option(&opt_lower);
+        let allow = is_agy_allow_option(&opt_lower)
+            || matches_tell_option(lines, idx, "yes, and tell ", " what to do next");
+        let deny = !allow
+            && (is_agy_deny_option(&opt_lower)
+                || matches_tell_option(lines, idx, "no, and tell ", " what to do differently"));
         is_allow.push(allow);
         is_deny.push(deny);
         if deny {
@@ -538,6 +576,9 @@ fn has_agy_permission_prompt_lines(lines: &[&str]) -> bool {
     let Some(nearest_allow) = (0..deny_idx).rev().find(|&i| is_allow[i]) else {
         return false;
     };
+    if deny_idx - nearest_allow > 10 {
+        return false;
+    }
     let options_between = (nearest_allow..=deny_idx)
         .filter(|&i| is_allow[i] || is_deny[i])
         .count();

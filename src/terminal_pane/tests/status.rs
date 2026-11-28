@@ -517,7 +517,8 @@ fn test_agy_permission_prompt_detection_and_recovery() {
     use super::super::AGY_PERMISSION_PROMPT_IDLE;
     use super::super::status::has_agy_permission_prompt_text;
 
-    // 1. agy の許可／拒否選択肢パターン（No, cancel・複数拒否行・CRLF 自前改行含む）を検知できること
+    // 1. 選択肢パターン判定（実機記録で確認できたのは 46 列の Run this command? のみ。
+    //    その他の組および No, and tell ... の改行位置は実行ファイル内文言から組み立てたテストケース）
     assert!(has_agy_permission_prompt_text(
         "Command\n──────────────────────────────────────────────\n\nRequesting permission for:\n   echo hello\n\nRun this command?\n> 1. Yes, run command\n  2. Yes, and always allow in this\nconversation for commands that start with\n'echo'\n  3. Yes, and always allow for commands that\nstart with 'echo' (Persist to settings.json)\n  4. No, cancel\n\n  ↑/↓ Navigate · tab Amend · ctrl+g edit/expan\nesc to cancel           Gemini 4 Neon · medium"
     ));
@@ -542,12 +543,21 @@ fn test_agy_permission_prompt_detection_and_recovery() {
     assert!(has_agy_permission_prompt_text(
         "Grant requested permission?\n  1. Yes, and always grant permission for 'git' in this conversation\n  2. No, deny permission"
     ));
-    // CRLF 自前改行で途中で折り返された No, and tell ... も前方一致で検知できること
+    // 自前 CRLF 改行で複数行に分かれた No, and tell ... も続き行を連結して末尾一致で検知できること
     assert!(has_agy_permission_prompt_text(
         "Run this command?\n  > Yes, run command\n    No, and tell agy\n    what to do differently"
     ));
 
-    // 通常文章・Markdown 箇条書き・引用・diff・JSON では誤検知しないこと
+    // 通常文章・Markdown 箇条書き・引用・diff・JSON・11 行以上離れた組では誤検知しないこと
+    assert!(!has_agy_permission_prompt_text(
+        "Yes, run command\nNo, and tell me what to do differently next time"
+    ));
+    assert!(!has_agy_permission_prompt_text(
+        "Yes, and tell me which file to edit.\nI will wait.\nNo, and tell me why it failed."
+    ));
+    assert!(!has_agy_permission_prompt_text(
+        "> 1. Yes, run command\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nNo, deny"
+    ));
     assert!(!has_agy_permission_prompt_text(
         "You can choose Allow once or Cancel in the dialog."
     ));
@@ -582,8 +592,9 @@ fn test_agy_permission_prompt_detection_and_recovery() {
         "> Yes, run the migration\n> No, deny access to prod"
     ));
 
-    // 2. 実機 agy の描画方式（初回のみ \x1b[?1049h、同期出力 \x1b[?2026h..\x1b[?2026l、\x1b[?7l、
-    //    SGR＋行消去 \x1b[K による再描画、応答後の次フレームでダイアログ消去）で一連のライフサイクルを検証する
+    // 2. 46 列の Run this command? 記録の表示内容を元に手で組み立てた再現フレーム
+    //    （実物の生バイト列ではなく、相対移動・桁指定・行ごとの色・OSC 8・上部会話行を省いた再現）で
+    //    一連のライフサイクルを検証する
     let mut pane = TerminalPane::attach_from_replay(
         ReplayedPane {
             pane_id: 1,
@@ -640,6 +651,18 @@ fn test_agy_permission_prompt_detection_and_recovery() {
     pane.write_input(b"\x1b[B");
     pane.write_input(b"x");
     assert_eq!(pane.ai_hook_state, Some(AiHookState::Waiting));
+
+    // 検知中にフックの Working が届いてもダイアログが画面に残っていれば Waiting を維持し再通知しないこと
+    pane.last_notification_sent = None;
+    assert!(!pane.apply_ai_hook_event(AiHookState::Working, Some(AiTool::Agy), false, true, "1"));
+    assert_eq!(pane.ai_hook_state, Some(AiHookState::Waiting));
+    assert!(!pane.update_waiting_state(
+        Instant::now() + AGY_PERMISSION_PROMPT_IDLE + Duration::from_millis(100),
+        false,
+        true,
+        Some("1")
+    ));
+    assert!(pane.last_notification_sent.is_none());
 
     // 裏スロットを開いて clear_attention 相当（Waiting→None）になったあとに応答し、
     // 次フレームでダイアログが消えると Working（緑）へ復帰すること
