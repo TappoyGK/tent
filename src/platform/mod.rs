@@ -15,7 +15,10 @@ use std::time::{Duration, Instant};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, NSObjectProtocol};
 use objc2::{MainThreadOnly, define_class, msg_send, sel};
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+use objc2_app_kit::{
+    NSApplication, NSApplicationActivationPolicy, NSEvent, NSEventModifierFlags, NSEventType,
+};
+use objc2_core_foundation::CGPoint;
 use objc2_foundation::{
     MainThreadMarker, NSNotification, NSObject, NSRunLoop, NSRunLoopCommonModes, NSTimer,
 };
@@ -144,6 +147,25 @@ fn run_exiting_once() {
     });
 }
 
+fn stop_app_run_loop(mtm: MainThreadMarker) {
+    let app = NSApplication::sharedApplication(mtm);
+    app.stop(None);
+    // app.stop() は次のイベント処理後に app.run() を抜けるため、ダミーイベントを 1 件積んで即座に復帰させる
+    if let Some(ev) = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+        NSEventType::ApplicationDefined,
+        CGPoint::new(0.0, 0.0),
+        NSEventModifierFlags::empty(),
+        0.0,
+        0,
+        None,
+        0,
+        0,
+        0,
+    ) {
+        app.postEvent_atStart(&ev, true);
+    }
+}
+
 fn finish_if_exiting_or_panicked() {
     let has_panic = PANIC_PAYLOAD.with(|p| p.borrow().is_some());
     let should_exit = RUNTIME.with(|cell| {
@@ -153,17 +175,10 @@ fn finish_if_exiting_or_panicked() {
             .unwrap_or(false)
     });
 
-    if has_panic {
+    if has_panic || should_exit {
         run_exiting_once();
         if let Some(mtm) = MainThreadMarker::new() {
-            let app = NSApplication::sharedApplication(mtm);
-            app.stop(None);
-        }
-    } else if should_exit {
-        run_exiting_once();
-        if let Some(mtm) = MainThreadMarker::new() {
-            let app = NSApplication::sharedApplication(mtm);
-            app.terminate(None);
+            stop_app_run_loop(mtm);
         }
     }
 }
@@ -381,6 +396,13 @@ define_class!(
         #[unsafe(method(applicationWillTerminate:))]
         fn application_will_terminate(&self, _notification: &NSNotification) {
             run_exiting_once();
+            // NSApp.terminate: が C の exit(0) を呼ぶ前に RUNTIME（wgpu::Queue 等）を明示破棄し、
+            // TLS 解体順による wgpu_hal の panic_access_error (SIGABRT) を防ぐ
+            RUNTIME.with(|cell| {
+                if let Ok(mut borrow) = cell.try_borrow_mut() {
+                    *borrow = None;
+                }
+            });
         }
 
         #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
@@ -434,6 +456,14 @@ pub fn run_app<H: ApplicationHandler + 'static>(proxy: AppProxy, handler: H) {
         let _: () = msg_send![&app, setDelegate: &*app_delegate];
     }
     app.run();
+
+    // app.run() 復帰後に RUNTIME（wgpu / NSWindow 等）を全 TLS が生存しているうちに明示破棄する
+    run_exiting_once();
+    RUNTIME.with(|cell| {
+        if let Ok(mut borrow) = cell.try_borrow_mut() {
+            *borrow = None;
+        }
+    });
 
     if let Some(payload) = PANIC_PAYLOAD.with(|p| p.borrow_mut().take()) {
         resume_unwind(payload);
