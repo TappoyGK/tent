@@ -52,6 +52,9 @@ impl TentApp {
                     .is_some_and(|b| b.id == edit.pane_id)
             {
                 self.browsers.focus_webview(edit.pane_id);
+            } else {
+                // First Responder が NSWindow へ宙ぶらりんにならないよう確実にフォーカスを戻す
+                self.focus_terminal_view();
             }
             self.request_redraw_now();
         }
@@ -556,7 +559,9 @@ impl TentApp {
                 self.request_redraw_now();
             }
             AppShortcut::Copy => {
-                if let Some(sel) = &self.selection {
+                if let Some(search) = &self.search {
+                    macos::write_clipboard_text(&search.query);
+                } else if let Some(sel) = &self.selection {
                     if let Some(ws) = self.workspace.as_mut()
                         && let Some(root) = ws.active_slot_mut().root.as_mut()
                         && let Some(pane) = root.terminal_pane_mut(sel.pane_id)
@@ -571,7 +576,18 @@ impl TentApp {
                 }
             }
             AppShortcut::Paste => {
-                if let Some(ws) = self.workspace.as_mut()
+                if let Some(search) = self.search.as_mut() {
+                    if let Some(clip) = macos::read_clipboard_text() {
+                        let single_line = clip.replace(['\r', '\n'], "");
+                        if search.select_all {
+                            search.query.clear();
+                            search.select_all = false;
+                        }
+                        search.query.push_str(&single_line);
+                        self.update_search_results(true);
+                        self.request_redraw_now();
+                    }
+                } else if let Some(ws) = self.workspace.as_mut()
                     && let Some(pane) = ws.active_pane_mut()
                     && let Some(text) = macos::resolve_terminal_paste_payload(
                         macos::read_clipboard_text(),

@@ -29,6 +29,7 @@ pub use types::{
     ModifiersState, MouseButton, MouseScrollDelta, NamedKey, PhysicalKey, PhysicalPosition,
     PhysicalSize, WindowEvent,
 };
+pub use url_field::is_url_field_or_editor;
 pub use window::{NativeWindow, SurfaceTarget, WindowAttributes};
 
 use crate::terminal_pane::AppEvent;
@@ -130,21 +131,48 @@ extern "C" fn on_proxy_wake(_ctx: *mut c_void) {
 }
 
 fn run_exiting_once() {
-    if EXITED.replace(true) {
+    if EXITED.get() {
         return;
     }
     RUNTIME.with(|cell| {
         if let Ok(mut borrow) = cell.try_borrow_mut()
             && let Some(rt) = borrow.as_mut()
         {
+            EXITED.set(true);
             if let Some(timer) = rt.wake_timer.take() {
                 timer.invalidate();
             }
+            let prev = IN_DISPATCH.replace(true);
             let _ = catch_unwind(AssertUnwindSafe(|| {
                 rt.handler.exiting(&rt.event_loop);
             }));
+            IN_DISPATCH.set(prev);
         }
     });
+}
+
+fn schedule_stop_on_main() {
+    extern "C" fn on_stop(_ctx: *mut c_void) {
+        if let Some(mtm) = MainThreadMarker::new() {
+            stop_app_run_loop(mtm);
+        }
+    }
+    unsafe extern "C" {
+        #[link_name = "_dispatch_main_q"]
+        static DISPATCH_MAIN_Q: c_void;
+        fn dispatch_async_f(
+            queue: *const c_void,
+            context: *mut c_void,
+            work: extern "C" fn(*mut c_void),
+        );
+    }
+    unsafe {
+        dispatch_async_f(
+            &DISPATCH_MAIN_Q as *const c_void,
+            std::ptr::null_mut(),
+            on_stop,
+        );
+    }
 }
 
 fn stop_app_run_loop(mtm: MainThreadMarker) {
@@ -166,7 +194,7 @@ fn stop_app_run_loop(mtm: MainThreadMarker) {
     }
 }
 
-fn finish_if_exiting_or_panicked() {
+fn finish_if_exiting_or_panicked(defer_stop: bool) {
     let has_panic = PANIC_PAYLOAD.with(|p| p.borrow().is_some());
     let should_exit = RUNTIME.with(|cell| {
         cell.try_borrow()
@@ -175,15 +203,27 @@ fn finish_if_exiting_or_panicked() {
             .unwrap_or(false)
     });
 
-    if has_panic || should_exit {
+    if has_panic {
+        // パニック時は中途半端な状態で state.conf を上書きしないため exiting() は呼ばずに即停止する
+        if defer_stop {
+            schedule_stop_on_main();
+        } else if let Some(mtm) = MainThreadMarker::new() {
+            stop_app_run_loop(mtm);
+        }
+    } else if should_exit {
         run_exiting_once();
-        if let Some(mtm) = MainThreadMarker::new() {
+        if defer_stop {
+            schedule_stop_on_main();
+        } else if let Some(mtm) = MainThreadMarker::new() {
             stop_app_run_loop(mtm);
         }
     }
 }
 
 fn dispatch_or_enqueue(item: PendingDispatch) {
+    if PANIC_PAYLOAD.with(|p| p.borrow().is_some()) {
+        return;
+    }
     PENDING.with(|q| q.borrow_mut().push_back(item));
     if IN_DISPATCH.get() {
         return;
@@ -252,7 +292,7 @@ fn dispatch_or_enqueue(item: PendingDispatch) {
             }
         });
     }
-    finish_if_exiting_or_panicked();
+    finish_if_exiting_or_panicked(false);
 }
 
 fn reschedule_timer(rt: &mut MainRuntime) {
@@ -387,7 +427,9 @@ define_class!(
                         *slot = Some(payload);
                     }
                 });
-                finish_if_exiting_or_panicked();
+                // applicationDidFinishLaunching: 時点では app.run() のメインループ開始前のため
+                // 次の RunLoop 周回で stop + ダミーイベントを実行する
+                finish_if_exiting_or_panicked(true);
                 return;
             }
             dispatch_or_enqueue(PendingDispatch::TimerTick);
@@ -458,7 +500,10 @@ pub fn run_app<H: ApplicationHandler + 'static>(proxy: AppProxy, handler: H) {
     app.run();
 
     // app.run() 復帰後に RUNTIME（wgpu / NSWindow 等）を全 TLS が生存しているうちに明示破棄する
-    run_exiting_once();
+    let has_panic = PANIC_PAYLOAD.with(|p| p.borrow().is_some());
+    if !has_panic {
+        run_exiting_once();
+    }
     RUNTIME.with(|cell| {
         if let Ok(mut borrow) = cell.try_borrow_mut() {
             *borrow = None;

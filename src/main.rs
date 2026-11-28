@@ -60,8 +60,9 @@ pub(crate) struct TentApp {
     pub(crate) daemon_pid: Option<i32>,
     pub(crate) daemon_rx: Option<Receiver<DaemonEvent>>,
 
-    pub(crate) window: Option<Rc<NativeWindow>>,
+    /// `wgpu::Surface` が `NativeWindow` より先に確実に drop されるよう `renderer` を前に置く
     pub(crate) renderer: Option<Renderer>,
+    pub(crate) window: Option<Rc<NativeWindow>>,
     pub(crate) workspace: Option<Workspace>,
     pub(crate) browsers: BrowserManager,
     pub(crate) layout: Option<AppLayout>,

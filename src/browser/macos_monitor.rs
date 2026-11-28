@@ -11,21 +11,17 @@ use crate::platform::{AppProxy, ModifiersState};
 use crate::terminal_pane::AppEvent;
 
 #[cfg(target_os = "macos")]
-fn is_native_terminal_view(obj: &objc2::runtime::NSObject) -> bool {
+fn is_native_terminal_view(win: &objc2_app_kit::NSWindow, obj: &objc2::runtime::NSObject) -> bool {
     let name = obj.class().name().to_string_lossy();
     name.contains("TentMetalView")
         || name.contains("TentRootView")
-        || name.contains("NSText")
-        || name.contains("NSClipView")
+        || crate::platform::is_url_field_or_editor(win, obj)
 }
 
 #[cfg(target_os = "macos")]
 fn is_native_text_field_focused(win: &objc2_app_kit::NSWindow) -> bool {
-    win.firstResponder().is_some_and(|fr| {
-        let obj: &objc2::runtime::NSObject = &fr;
-        let name = obj.class().name().to_string_lossy();
-        name.contains("NSText")
-    })
+    win.firstResponder()
+        .is_some_and(|fr| crate::platform::is_url_field_or_editor(win, &fr))
 }
 
 /// WKWebView にフォーカスがある間も TenT のグローバルショートカット
@@ -55,7 +51,7 @@ pub fn install_macos_shortcut_monitor(proxy: AppProxy) {
                 let loc = event.locationInWindow();
                 if let Some(hit_view) = content.hitTest(loc) {
                     let obj: &NSObject = &hit_view;
-                    if is_native_terminal_view(obj) {
+                    if is_native_terminal_view(&win, obj) {
                         last_hovered_clone.store(0, Ordering::Relaxed);
                     } else {
                         let ptr = std::ptr::from_ref(obj) as usize;
@@ -82,7 +78,7 @@ pub fn install_macos_shortcut_monitor(proxy: AppProxy) {
                     .hitTest(loc)
                     .map(|v| {
                         let obj: &NSObject = &v;
-                        is_native_terminal_view(obj)
+                        is_native_terminal_view(&win, obj)
                     })
                     .unwrap_or(true);
                 if !hit_is_terminal {
@@ -107,7 +103,7 @@ pub fn install_macos_shortcut_monitor(proxy: AppProxy) {
                     .hitTest(loc)
                     .map(|v| {
                         let obj: &NSObject = &v;
-                        is_native_terminal_view(obj)
+                        is_native_terminal_view(&win, obj)
                     })
                     .unwrap_or(true);
                 if !hit_is_terminal {
@@ -234,7 +230,7 @@ pub fn install_macos_shortcut_monitor(proxy: AppProxy) {
                     .hitTest(loc)
                     .map(|v| {
                         let obj: &NSObject = &v;
-                        is_native_terminal_view(obj)
+                        is_native_terminal_view(&win, obj)
                     })
                     .unwrap_or(true);
                 if !hit_is_terminal {

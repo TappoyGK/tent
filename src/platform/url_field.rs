@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, NSObjectProtocol, Sel};
@@ -12,6 +13,29 @@ use objc2_foundation::{MainThreadMarker, NSNotification, NSObject, NSString};
 use crate::layout::Rect;
 use crate::platform::AppProxy;
 use crate::terminal_pane::AppEvent;
+
+static ACTIVE_URL_FIELD_PTR: AtomicUsize = AtomicUsize::new(0);
+
+/// 指定オブジェクトが TenT のネイティブ URL バー（`NSTextField` またはその子孫 / Field Editor）かをポインタで判定する
+pub fn is_url_field_or_editor(win: &NSWindow, obj: &AnyObject) -> bool {
+    let field_addr = ACTIVE_URL_FIELD_PTR.load(Ordering::Relaxed);
+    if field_addr == 0 {
+        return false;
+    }
+    let field_ptr = field_addr as *const AnyObject;
+    let obj_ptr: *const AnyObject = obj;
+    if std::ptr::eq(obj_ptr, field_ptr) {
+        return true;
+    }
+    unsafe {
+        let editor: *mut AnyObject = msg_send![win, fieldEditor: Bool::NO, forObject: field_ptr];
+        if !editor.is_null() && std::ptr::eq(obj_ptr, editor) {
+            return true;
+        }
+        let is_descendant: Bool = msg_send![obj_ptr, isDescendantOf: field_ptr];
+        is_descendant.as_bool()
+    }
+}
 
 struct TentUrlFieldDelegateIvars {
     proxy: AppProxy,
@@ -106,6 +130,7 @@ impl NativeUrlField {
         }
         field.setHidden(true);
         root_view.addSubview(&field);
+        ACTIVE_URL_FIELD_PTR.store((&*field as *const NSTextField) as usize, Ordering::Relaxed);
 
         Self { field, delegate }
     }

@@ -73,7 +73,7 @@ pub struct TentMetalViewIvars {
     ime_rect_phys: Cell<(i32, i32, u32, u32)>,
     in_key_down: Cell<bool>,
     ime_consumed_keydown: Cell<bool>,
-    last_mods: Cell<ModifiersState>,
+    command_by_selector: Cell<bool>,
     cursor_kind: AtomicU8,
     tracking_area: RefCell<Option<Retained<NSTrackingArea>>>,
 }
@@ -243,6 +243,7 @@ define_class!(
 
             self.ivars().in_key_down.set(true);
             self.ivars().ime_consumed_keydown.set(false);
+            self.ivars().command_by_selector.set(false);
 
             let events = NSArray::from_slice(&[event]);
             self.interpretKeyEvents(&events);
@@ -250,7 +251,10 @@ define_class!(
             self.ivars().in_key_down.set(false);
 
             let has_marked_now = !self.ivars().marked_text.borrow().is_empty();
-            if !self.ivars().ime_consumed_keydown.get() && !had_marked && !has_marked_now {
+            let forward_command = self.ivars().command_by_selector.get() && !has_marked_now;
+            if forward_command
+                || (!self.ivars().ime_consumed_keydown.get() && !had_marked && !has_marked_now)
+            {
                 dispatch_window_event(WindowEvent::KeyboardInput { event: key_event });
             }
         }
@@ -263,27 +267,26 @@ define_class!(
 
         #[unsafe(method(flagsChanged:))]
         fn flags_changed(&self, event: &NSEvent) {
-            let mods = ModifiersState::from_macos_flags(event.modifierFlags().0);
-            let prev = self.ivars().last_mods.replace(mods);
+            let raw_flags = event.modifierFlags().0;
+            let mods = ModifiersState::from_macos_flags(raw_flags);
             dispatch_window_event(WindowEvent::ModifiersChanged(mods));
 
-            // Kitty Keyboard Protocol 用に修飾キー単体の押下/解放イベントも送出する
+            // macOS device-dependent ビットで左右の修飾キー・CapsLock を正確に区別して押下/解放を送出する
             let physical_key = macos_keycode_to_physical(event.keyCode());
             if let PhysicalKey::Code(code) = physical_key {
-                let pressed = match code {
-                    KeyCode::ShiftLeft | KeyCode::ShiftRight => {
-                        mods.shift_key() && !prev.shift_key()
-                    }
-                    KeyCode::ControlLeft | KeyCode::ControlRight => {
-                        mods.control_key() && !prev.control_key()
-                    }
-                    KeyCode::AltLeft | KeyCode::AltRight => mods.alt_key() && !prev.alt_key(),
-                    KeyCode::SuperLeft | KeyCode::SuperRight => {
-                        mods.super_key() && !prev.super_key()
-                    }
+                let mask: usize = match code {
+                    KeyCode::ControlLeft => 0x0001,
+                    KeyCode::ShiftLeft => 0x0002,
+                    KeyCode::ShiftRight => 0x0004,
+                    KeyCode::SuperLeft => 0x0008,
+                    KeyCode::SuperRight => 0x0010,
+                    KeyCode::AltLeft => 0x0020,
+                    KeyCode::AltRight => 0x0040,
+                    KeyCode::ControlRight => 0x2000,
+                    KeyCode::CapsLock => 1 << 16,
                     _ => return,
                 };
-                let state = if pressed {
+                let state = if (raw_flags & mask) != 0 {
                     ElementState::Pressed
                 } else {
                     ElementState::Released
@@ -429,6 +432,7 @@ define_class!(
         #[unsafe(method(doCommandBySelector:))]
         fn do_command_by_selector(&self, _selector: Sel) {
             // 制御キー・矢印・Enter・Backspace 等は keyDown 側の KeyboardInput へそのまま流す
+            self.ivars().command_by_selector.set(true);
         }
 
         #[unsafe(method(setMarkedText:selectedRange:replacementRange:))]
@@ -522,7 +526,7 @@ impl TentMetalView {
             ime_rect_phys: Cell::new((0, 0, 1, 1)),
             in_key_down: Cell::new(false),
             ime_consumed_keydown: Cell::new(false),
-            last_mods: Cell::new(ModifiersState::empty()),
+            command_by_selector: Cell::new(false),
             cursor_kind: AtomicU8::new(AppCursorKind::Default as u8),
             tracking_area: RefCell::new(None),
         });
