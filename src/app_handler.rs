@@ -119,15 +119,18 @@ impl ApplicationHandler for TentApp {
                 self.update_control_flow(event_loop);
             }
             AppEvent::WebViewClicked { px, py } => {
-                let mut changed = self.url_bar_edit.is_some();
-                self.close_url_bar_edit(false);
-                if self.search.is_some() {
-                    self.close_search();
-                    changed = true;
-                }
+                let mut changed = false;
                 if let Some(ws) = self.workspace.as_mut()
                     && ws.focus_pane_at(px, py).is_some()
                 {
+                    changed = true;
+                }
+                if self.url_bar_edit.is_some() {
+                    self.close_url_bar_edit();
+                    changed = true;
+                }
+                if self.search.is_some() {
+                    self.close_search();
                     changed = true;
                 }
                 if changed {
@@ -269,7 +272,7 @@ impl ApplicationHandler for TentApp {
                 self.submit_url_bar_edit(&text);
             }
             AppEvent::UrlBarCancel => {
-                self.close_url_bar_edit(true);
+                self.close_url_bar_edit();
             }
         }
     }

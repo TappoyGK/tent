@@ -271,22 +271,53 @@ define_class!(
             let mods = ModifiersState::from_macos_flags(raw_flags);
             dispatch_window_event(WindowEvent::ModifiersChanged(mods));
 
-            // macOS device-dependent ビットで左右の修飾キー・CapsLock を正確に区別して押下/解放を送出する
+            // macOS device-dependent ビットで左右の修飾キーを正確に区別して押下/解放を送出する。
+            // 合成イベント等で device-dependent ビットがすべて 0 の場合は汎用フラグへフォールバックする。
             let physical_key = macos_keycode_to_physical(event.keyCode());
             if let PhysicalKey::Code(code) = physical_key {
-                let mask: usize = match code {
-                    KeyCode::ControlLeft => 0x0001,
-                    KeyCode::ShiftLeft => 0x0002,
-                    KeyCode::ShiftRight => 0x0004,
-                    KeyCode::SuperLeft => 0x0008,
-                    KeyCode::SuperRight => 0x0010,
-                    KeyCode::AltLeft => 0x0020,
-                    KeyCode::AltRight => 0x0040,
-                    KeyCode::ControlRight => 0x2000,
-                    KeyCode::CapsLock => 1 << 16,
-                    _ => return,
+                if code == KeyCode::CapsLock {
+                    // macOS の Caps Lock はトグル通知のみで押下/解放の組が来ないため、
+                    // Kitty プロトコルで押しっぱなし扱いにならないよう Pressed → Released を続けて送出する
+                    for state in [ElementState::Pressed, ElementState::Released] {
+                        dispatch_window_event(WindowEvent::KeyboardInput {
+                            event: KeyEvent {
+                                physical_key,
+                                logical_key: Key::Unidentified,
+                                unshifted_char: None,
+                                state,
+                                repeat: false,
+                                text: None,
+                            },
+                        });
+                    }
+                    return;
+                }
+
+                const DEVICE_DEPENDENT_ALL: usize = 0x207f;
+                let has_device_bits = (raw_flags & DEVICE_DEPENDENT_ALL) != 0;
+                let pressed = if has_device_bits {
+                    let mask: usize = match code {
+                        KeyCode::ControlLeft => 0x0001,
+                        KeyCode::ShiftLeft => 0x0002,
+                        KeyCode::ShiftRight => 0x0004,
+                        KeyCode::SuperLeft => 0x0008,
+                        KeyCode::SuperRight => 0x0010,
+                        KeyCode::AltLeft => 0x0020,
+                        KeyCode::AltRight => 0x0040,
+                        KeyCode::ControlRight => 0x2000,
+                        _ => return,
+                    };
+                    (raw_flags & mask) != 0
+                } else {
+                    match code {
+                        KeyCode::ShiftLeft | KeyCode::ShiftRight => mods.shift_key(),
+                        KeyCode::ControlLeft | KeyCode::ControlRight => mods.control_key(),
+                        KeyCode::AltLeft | KeyCode::AltRight => mods.alt_key(),
+                        KeyCode::SuperLeft | KeyCode::SuperRight => mods.super_key(),
+                        _ => return,
+                    }
                 };
-                let state = if (raw_flags & mask) != 0 {
+                let state = if pressed {
                     ElementState::Pressed
                 } else {
                     ElementState::Released

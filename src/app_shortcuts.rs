@@ -39,21 +39,16 @@ impl TentApp {
         self.request_redraw_now();
     }
 
-    pub(crate) fn close_url_bar_edit(&mut self, restore_webview_focus: bool) {
-        if let Some(edit) = self.url_bar_edit.take() {
+    pub(crate) fn close_url_bar_edit(&mut self) {
+        if self.url_bar_edit.take().is_some() {
             if let Some(window) = &self.window {
                 window.hide_url_bar();
             }
-            if restore_webview_focus
-                && self
-                    .workspace
-                    .as_ref()
-                    .and_then(Workspace::focused_browser)
-                    .is_some_and(|b| b.id == edit.pane_id)
+            if self.search.is_none()
+                && let Some(b) = self.workspace.as_ref().and_then(Workspace::focused_browser)
             {
-                self.browsers.focus_webview(edit.pane_id);
+                self.browsers.focus_webview(b.id);
             } else {
-                // First Responder が NSWindow へ宙ぶらりんにならないよう確実にフォーカスを戻す
                 self.focus_terminal_view();
             }
             self.request_redraw_now();
@@ -78,7 +73,7 @@ impl TentApp {
     }
 
     pub(crate) fn start_search(&mut self) {
-        self.close_url_bar_edit(false);
+        self.close_url_bar_edit();
         let Some(ws) = self.workspace.as_mut() else {
             return;
         };
@@ -413,7 +408,7 @@ impl TentApp {
             shortcut,
             AppShortcut::Copy | AppShortcut::Paste | AppShortcut::FocusUrlBar
         ) {
-            self.close_url_bar_edit(false);
+            self.close_url_bar_edit();
         }
         // 検索バー編集中でも検索操作以外のナビゲーションを受けたら検索を閉じる
         if !matches!(

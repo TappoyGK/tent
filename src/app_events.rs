@@ -305,7 +305,7 @@ impl TentApp {
                 }
 
                 // URL バー外をクリックしたら編集終了
-                self.close_url_bar_edit(false);
+                self.close_url_bar_edit();
 
                 // 2. 右サイドバー判定
                 let hit = self

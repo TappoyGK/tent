@@ -32,8 +32,15 @@ pub fn is_url_field_or_editor(win: &NSWindow, obj: &AnyObject) -> bool {
         if !editor.is_null() && std::ptr::eq(obj_ptr, editor) {
             return true;
         }
-        let is_descendant: Bool = msg_send![obj_ptr, isDescendantOf: field_ptr];
-        is_descendant.as_bool()
+        // NSWindow 等の NSView 以外のレスポンダへ isDescendantOf: を送らないようクラスを確認する
+        if let Some(view_cls) = objc2::runtime::AnyClass::get(c"NSView") {
+            let is_view: Bool = msg_send![obj_ptr, isKindOfClass: view_cls];
+            if is_view.as_bool() {
+                let is_descendant: Bool = msg_send![obj_ptr, isDescendantOf: field_ptr];
+                return is_descendant.as_bool();
+            }
+        }
+        false
     }
 }
 
