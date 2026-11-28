@@ -112,6 +112,7 @@ impl Renderer {
                     "  Cmd+W            ペイン / ブラウザを閉じる\n",
                     "  Cmd+[ / Cmd+]    前後のペインへ移動\n",
                     "  Cmd+Opt+Arrow    方向指定でペイン移動\n",
+                    "  Cmd+Ctrl+Arrow   分割ペイン境界をリサイズ\n",
                 );
                 let right_text = concat!(
                     "[ Browser ]\n",
@@ -126,6 +127,8 @@ impl Renderer {
                     "  Cmd+Shift+Click  URL を外部ブラウザで開く\n",
                     "  File D&D         スクショ等のパスを貼り付け\n",
                     "  Cmd+C / Cmd+V    コピー / ペースト\n",
+                    "  Cmd+F            ペイン内検索（Enter / Shift+Enter / Cmd+G / Cmd+Shift+G / Esc）\n",
+                    "  Cmd+K            画面・スクロールバックをクリア\n",
                     "  Cmd+Opt+R        TenT 本体再起動\n",
                     "  Cmd+/ / Cmd+?    このヘルプを表示 / 閉じる\n",
                 );

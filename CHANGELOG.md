@@ -3,6 +3,27 @@
 このプロジェクトの主な変更履歴を記録します。  
 フォーマットは [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に準拠し、バージョニングは [Semantic Versioning](https://semver.org/lang/ja/) に従います。
 
+## [0.2.0] - Unreleased
+
+### Added
+- クリップボードに画像（PNG / TIFF）が入っている状態で `Cmd+V` を押した際、`/tmp/tent-drops/` へ PNG 保存してエスケープ済みファイルパスをターミナルへ貼り付ける機能を追加
+- 開発ビルドのバージョン表示へ git 短縮ハッシュを自動付与（`v0.2.0-dev@<hash>`、タグ一致時は `v0.2.0`）およびリリース手順書（`docs/release.md`）を追加
+- アクティブターミナルの画面・スクロールバックをクリアする `Cmd+K` ショートカットを追加
+- バックグラウンドスロットで 5 秒以上動作していた出力が完了・入力待ちへ遷移した際に macOS デスクトップ通知を送信するよう対応
+- Claude Code / agy / Codex 向けのライフサイクルフック通知 CLI（`tent hook`）・デーモンプロトコル v5（`TENT_PANE_ID` / `TENT_SOCKET` 注入・AI プロセス自動判別）・設定ガイド（`docs/ai-hooks.md`）を追加
+- メインパネル下端フッターで、分割ペイン内の最新更新ペイン時刻を強調表示するよう対応
+- ターミナルペイン（スクロールバック含む・ハイライト＆前後移動）および内蔵ブラウザペインで使える `Cmd+F` ペイン内検索機能を追加
+- 上部ステータスバーに TenT 本体＋常駐デーモンの合計メモリ使用量モニターバー（1.0 GiB を 80% 基準ラインとし、超過時に赤色警告）を追加
+
+### Fixed
+- GUI 側デーモン受信チャネルの有界化（バックプレッシャー有効化）・GUI 側のスクロールバック上限を 10MB からデーモン側と同じ 1MB へ削減（新規ペインおよび Replay 復元失敗時のフォールバック経路）・ブラウザサムネイルの GPU テクスチャ再利用＆キャプチャ間隔緩和＆`autoreleasepool` 適用・ファイルプロミス D&D の `NSOperationQueue` 再利用により、長時間稼働・大量出力時のメモリ膨張／リークを修正
+- 内蔵ブラウザ（`WKWebView`）上のリンク・ボタン等でマウスカーソルがポインタ等に切り替わらない問題を修正（`WinitView::resetCursorRects` から表示中の子 `WKWebView` 領域を除外）
+- 内蔵ブラウザ（`WKWebView`）フォーカス中に基本的な編集ショートカット（`Cmd+C` / `Cmd+V` / `Cmd+Shift+V` / `Cmd+X` / `Cmd+A` / `Cmd+Z` / `Cmd+Shift+Z`）が効くように修正
+- リサイズによる折り返し変化・ビューポート上部の処理中表示・再出力後の古い通知フラグ保持によるターミナル状態（黄色／オレンジ）の偽陽性を修正
+- 不可視 PTY 再描画や AI TUI の下部 UI 更新によるターミナル状態（緑／黄／時刻）の偽陽性を修正（AI フック受信セッションでは PTY 出力由来の汎用判定を抑止）
+- `tent hook` が stdin JSON のトップレベルフィールドを厳密に解析し、`SubagentStop` / `SubagentStart`・トップレベル `agent_id` 付きの非許可待ち `waiting`/`idle`・`agy` のバックグラウンド残存（`fullyIdle: false`、`USER_CANCELED` を除く）を無視するよう修正（`PermissionRequest` / `Notification` の許可待ちと `working` は維持）
+- `PermissionRequest` フックを持たない `agy` でパーミッション確認プロンプトが出た際に緑（作業中）のまま残る問題を修正（`Working` 中の無出力 1.2 秒以上＋アクティブ画面の `agy` 確認ダイアログ選択肢ペア検知による補完）
+
 ## [0.1.22] - 2026-11-27
 
 ### Added

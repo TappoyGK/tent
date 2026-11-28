@@ -15,6 +15,30 @@ pub enum SplitAxis {
     Horizontal,
 }
 
+/// 分割ペイン間の境界線情報（マウスホバー・ドラッグリサイズ用）
+#[derive(Clone, Debug)]
+pub struct SplitDivider {
+    /// ルートから対象 `PaneNode::Split` までの経路（false = first, true = second）
+    pub path: Vec<bool>,
+    pub axis: SplitAxis,
+    /// 対象 `Split` ノードが占有する親領域矩形
+    pub parent_rect: Rect,
+}
+
+/// ドラッグ中のポインタ座標から分割比率（`0.1..=0.9`）を算出する
+pub fn ratio_from_pointer(axis: SplitAxis, parent_rect: Rect, gap: f32, px: f32, py: f32) -> f32 {
+    match axis {
+        SplitAxis::Vertical => {
+            let avail = (parent_rect.w - gap).max(2.0);
+            ((px - parent_rect.x - gap * 0.5) / avail).clamp(0.1, 0.9)
+        }
+        SplitAxis::Horizontal => {
+            let avail = (parent_rect.h - gap).max(2.0);
+            ((py - parent_rect.y - gap * 0.5) / avail).clamp(0.1, 0.9)
+        }
+    }
+}
+
 /// スロットの表示モード（ペイン分割ビュー ⇔ スロット専用フルブラウザ）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SlotViewMode {
@@ -202,6 +226,336 @@ impl PaneNode {
                 };
                 first.compute_rects(r1, gap, out);
                 second.compute_rects(r2, gap, out);
+            }
+        }
+    }
+
+    /// 指定座標 `(px, py)` が分割境界線（幅 `hit_half_thickness * 2`）上にあれば該当境界情報を返す
+    pub fn hit_test_divider(
+        &self,
+        area: Rect,
+        gap: f32,
+        hit_half_thickness: f32,
+        px: f32,
+        py: f32,
+    ) -> Option<SplitDivider> {
+        let mut path = Vec::new();
+        self.hit_test_divider_inner(area, gap, hit_half_thickness, px, py, &mut path)
+    }
+
+    fn hit_test_divider_inner(
+        &self,
+        area: Rect,
+        gap: f32,
+        hit_half_thickness: f32,
+        px: f32,
+        py: f32,
+        path: &mut Vec<bool>,
+    ) -> Option<SplitDivider> {
+        let PaneNode::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } = self
+        else {
+            return None;
+        };
+
+        let half = hit_half_thickness.max(gap * 0.5);
+        let (r1, r2, hit_rect) = match axis {
+            SplitAxis::Vertical => {
+                let avail = (area.w - gap).max(2.0);
+                let w1 = (avail * *ratio).max(1.0);
+                let w2 = (avail - w1).max(1.0);
+                let center_x = area.x + w1 + gap * 0.5;
+                (
+                    Rect::new(area.x, area.y, w1, area.h),
+                    Rect::new(area.x + w1 + gap, area.y, w2, area.h),
+                    Rect::new(center_x - half, area.y, half * 2.0, area.h),
+                )
+            }
+            SplitAxis::Horizontal => {
+                let avail = (area.h - gap).max(2.0);
+                let h1 = (avail * *ratio).max(1.0);
+                let h2 = (avail - h1).max(1.0);
+                let center_y = area.y + h1 + gap * 0.5;
+                (
+                    Rect::new(area.x, area.y, area.w, h1),
+                    Rect::new(area.x, area.y + h1 + gap, area.w, h2),
+                    Rect::new(area.x, center_y - half, area.w, half * 2.0),
+                )
+            }
+        };
+
+        if hit_rect.contains(px, py) {
+            return Some(SplitDivider {
+                path: path.clone(),
+                axis: *axis,
+                parent_rect: area,
+            });
+        }
+
+        path.push(false);
+        if let Some(found) = first.hit_test_divider_inner(r1, gap, hit_half_thickness, px, py, path)
+        {
+            return Some(found);
+        }
+        path.pop();
+
+        path.push(true);
+        let found = second.hit_test_divider_inner(r2, gap, hit_half_thickness, px, py, path);
+        path.pop();
+        found
+    }
+
+    /// 指定軸におけるこのサブツリーの最小必要サイズを返す。
+    /// 内側の分割が持つ現在の `ratio` を保ったまま、すべての葉が `min_leaf` 以上になるための
+    /// 必要十分下限を計算する。
+    fn min_extent(&self, target_axis: SplitAxis, gap: f32, min_leaf: f32) -> f32 {
+        match self {
+            PaneNode::Leaf(_) => min_leaf,
+            PaneNode::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => {
+                let a = first.min_extent(target_axis, gap, min_leaf);
+                let b = second.min_extent(target_axis, gap, min_leaf);
+                if *axis == target_axis {
+                    let r = ratio.clamp(0.01, 0.99);
+                    gap + (a / r).max(b / (1.0 - r))
+                } else {
+                    a.max(b)
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn clamp_split_ratio(
+        axis: SplitAxis,
+        first: &PaneNode,
+        second: &PaneNode,
+        parent_rect: Rect,
+        gap: f32,
+        min_leaf_size: (f32, f32),
+        current_ratio: f32,
+        desired: f32,
+    ) -> f32 {
+        let (avail, min_leaf) = match axis {
+            SplitAxis::Vertical => ((parent_rect.w - gap).max(2.0), min_leaf_size.0),
+            SplitAxis::Horizontal => ((parent_rect.h - gap).max(2.0), min_leaf_size.1),
+        };
+        let min_first = first.min_extent(axis, gap, min_leaf);
+        let min_second = second.min_extent(axis, gap, min_leaf);
+        let min_r = (min_first / avail).clamp(0.1, 0.9);
+        let max_r = (1.0 - min_second / avail).clamp(0.1, 0.9);
+        if min_r <= max_r {
+            desired.clamp(min_r, max_r)
+        } else {
+            current_ratio
+        }
+    }
+
+    /// 経路 `path` で指定された `Split` ノードの比率を、全葉ペインが最小サイズ（`min_leaf_w` × `min_leaf_h`）
+    /// を下回らない範囲にクランプして更新する
+    pub fn set_split_ratio(
+        &mut self,
+        path: &[bool],
+        ratio: f32,
+        area: Rect,
+        gap: f32,
+        min_leaf_w: f32,
+        min_leaf_h: f32,
+    ) -> bool {
+        match (self, path.split_first()) {
+            (
+                PaneNode::Split {
+                    axis,
+                    ratio: r,
+                    first,
+                    second,
+                },
+                None,
+            ) => {
+                let clamped = Self::clamp_split_ratio(
+                    *axis,
+                    first,
+                    second,
+                    area,
+                    gap,
+                    (min_leaf_w, min_leaf_h),
+                    *r,
+                    ratio,
+                );
+                if (*r - clamped).abs() > 1e-4 {
+                    *r = clamped;
+                    true
+                } else {
+                    false
+                }
+            }
+            (
+                PaneNode::Split {
+                    axis,
+                    ratio: r,
+                    first,
+                    second,
+                },
+                Some((go_second, rest)),
+            ) => {
+                let (r1, r2) = match axis {
+                    SplitAxis::Vertical => {
+                        let avail = (area.w - gap).max(2.0);
+                        let w1 = (avail * *r).max(1.0);
+                        let w2 = (avail - w1).max(1.0);
+                        (
+                            Rect::new(area.x, area.y, w1, area.h),
+                            Rect::new(area.x + w1 + gap, area.y, w2, area.h),
+                        )
+                    }
+                    SplitAxis::Horizontal => {
+                        let avail = (area.h - gap).max(2.0);
+                        let h1 = (avail * *r).max(1.0);
+                        let h2 = (avail - h1).max(1.0);
+                        (
+                            Rect::new(area.x, area.y, area.w, h1),
+                            Rect::new(area.x, area.y + h1 + gap, area.w, h2),
+                        )
+                    }
+                };
+                if *go_second {
+                    second.set_split_ratio(rest, ratio, r2, gap, min_leaf_w, min_leaf_h)
+                } else {
+                    first.set_split_ratio(rest, ratio, r1, gap, min_leaf_w, min_leaf_h)
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// `target_id` を含む最も内側の指定軸 `Split` ノードの比率を、全葉ペインの最小サイズを守りつつ `delta` 調整する
+    #[allow(clippy::too_many_arguments)]
+    pub fn resize_pane_axis(
+        &mut self,
+        target_id: PaneId,
+        axis: SplitAxis,
+        delta: f32,
+        area: Rect,
+        gap: f32,
+        min_leaf_w: f32,
+        min_leaf_h: f32,
+    ) -> bool {
+        let mut path = Vec::new();
+        let Some(target_split_path) = self.find_nearest_split_path(target_id, axis, &mut path)
+        else {
+            return false;
+        };
+        let mut cur_area = area;
+        let mut node: &mut PaneNode = self;
+        for go_second in target_split_path {
+            match node {
+                PaneNode::Split {
+                    axis: a,
+                    ratio: r,
+                    first,
+                    second,
+                } => {
+                    let (r1, r2) = match a {
+                        SplitAxis::Vertical => {
+                            let avail = (cur_area.w - gap).max(2.0);
+                            let w1 = (avail * *r).max(1.0);
+                            let w2 = (avail - w1).max(1.0);
+                            (
+                                Rect::new(cur_area.x, cur_area.y, w1, cur_area.h),
+                                Rect::new(cur_area.x + w1 + gap, cur_area.y, w2, cur_area.h),
+                            )
+                        }
+                        SplitAxis::Horizontal => {
+                            let avail = (cur_area.h - gap).max(2.0);
+                            let h1 = (avail * *r).max(1.0);
+                            let h2 = (avail - h1).max(1.0);
+                            (
+                                Rect::new(cur_area.x, cur_area.y, cur_area.w, h1),
+                                Rect::new(cur_area.x, cur_area.y + h1 + gap, cur_area.w, h2),
+                            )
+                        }
+                    };
+                    if go_second {
+                        cur_area = r2;
+                        node = second;
+                    } else {
+                        cur_area = r1;
+                        node = first;
+                    }
+                }
+                PaneNode::Leaf(_) => return false,
+            }
+        }
+        if let PaneNode::Split {
+            axis: a,
+            ratio,
+            first,
+            second,
+        } = node
+        {
+            let next = Self::clamp_split_ratio(
+                *a,
+                first,
+                second,
+                cur_area,
+                gap,
+                (min_leaf_w, min_leaf_h),
+                *ratio,
+                *ratio + delta,
+            );
+            if (*ratio - next).abs() > 1e-4 {
+                *ratio = next;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn find_nearest_split_path(
+        &self,
+        target_id: PaneId,
+        target_axis: SplitAxis,
+        cur_path: &mut Vec<bool>,
+    ) -> Option<Vec<bool>> {
+        match self {
+            PaneNode::Leaf(_) => None,
+            PaneNode::Split {
+                axis,
+                first,
+                second,
+                ..
+            } => {
+                let in_first = first.pane(target_id).is_some();
+                let in_second = !in_first && second.pane(target_id).is_some();
+                if !in_first && !in_second {
+                    return None;
+                }
+                let child_res = if in_first {
+                    cur_path.push(false);
+                    let r = first.find_nearest_split_path(target_id, target_axis, cur_path);
+                    cur_path.pop();
+                    r
+                } else {
+                    cur_path.push(true);
+                    let r = second.find_nearest_split_path(target_id, target_axis, cur_path);
+                    cur_path.pop();
+                    r
+                };
+                if child_res.is_some() {
+                    child_res
+                } else if *axis == target_axis {
+                    Some(cur_path.clone())
+                } else {
+                    None
+                }
             }
         }
     }

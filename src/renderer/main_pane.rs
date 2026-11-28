@@ -185,6 +185,29 @@ impl Renderer {
                 );
             }
 
+            // ペイン内検索マッチのハイライト
+            if let Some(ref sh) = overlays.search_highlights
+                && sh.pane_id == pid
+            {
+                for &(row, c0, c1, is_current) in &sh.matches {
+                    if c1 >= c0 {
+                        let sx = prect.x + (c0 as f32) * self.cell_w;
+                        let sy = prect.y + (row as f32) * self.cell_h;
+                        let sw = ((c1 - c0 + 1) as f32) * self.cell_w;
+                        let color = if is_current {
+                            [0.95, 0.52, 0.16, 0.65]
+                        } else {
+                            [0.85, 0.72, 0.20, 0.30]
+                        };
+                        self.push_rect(
+                            rects,
+                            Rect::new(sx, sy, sw.min((prect.right() - sx).max(0.0)), self.cell_h),
+                            color,
+                        );
+                    }
+                }
+            }
+
             // マウス選択範囲のハイライト
             if let Some(sel) = overlays.selection
                 && sel.pane_id == pid

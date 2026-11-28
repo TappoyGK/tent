@@ -12,12 +12,13 @@ use std::time::Duration;
 use crate::terminal_pane::PaneId;
 
 use super::protocol::{ClientMsg, read_daemon_event, write_client_msg};
-use super::{DAEMON_PROTOCOL_VERSION, DaemonEvent, ReplayedPane};
+use super::{AiHookState, AiTool, DAEMON_PROTOCOL_VERSION, DaemonEvent, ReplayedPane};
 
 /// GUI 側からデーモンへ非同期コマンドを送るハンドル
 #[derive(Clone)]
 pub struct DaemonClient {
     cmd_tx: Sender<ClientMsg>,
+    server_version: u32,
 }
 
 /// 初回接続ハンドシェイクの結果
@@ -27,6 +28,8 @@ pub struct AttachResult {
     pub next_pane_id: PaneId,
     /// 常駐デーモンが現行バイナリと異なるプロトコルバージョンの場合 true
     pub daemon_version_mismatch: bool,
+    /// 接続先常駐デーモンの PID（メモリ使用量モニタリング用）
+    pub daemon_pid: Option<i32>,
 }
 
 impl DaemonClient {
@@ -56,6 +59,7 @@ impl DaemonClient {
             Err(e) => return Err(e),
         };
 
+        let daemon_pid = peer_pid_of_stream(&stream);
         let mut reader = stream.try_clone()?;
         let mut writer = stream;
 
@@ -112,10 +116,14 @@ impl DaemonClient {
             })?;
 
         Ok(AttachResult {
-            client: DaemonClient { cmd_tx },
+            client: DaemonClient {
+                cmd_tx,
+                server_version,
+            },
             replayed_panes,
             next_pane_id,
             daemon_version_mismatch,
+            daemon_pid,
         })
     }
 
@@ -150,10 +158,23 @@ impl DaemonClient {
         let _ = self.cmd_tx.send(ClientMsg::QueryCwds);
     }
 
+    pub fn supports_clear(&self) -> bool {
+        self.server_version >= 4
+    }
+
+    pub fn clear_pane(&self, pane_id: PaneId) {
+        if self.supports_clear() {
+            let _ = self.cmd_tx.send(ClientMsg::Clear { pane_id });
+        }
+    }
+
     #[cfg(test)]
     pub fn dummy_for_test() -> Self {
         let (cmd_tx, _cmd_rx) = mpsc::channel();
-        Self { cmd_tx }
+        Self {
+            cmd_tx,
+            server_version: 0,
+        }
     }
 }
 
@@ -166,6 +187,41 @@ pub(super) fn normalize_post_handshake_event(ev: DaemonEvent, server_version: u3
         return DaemonEvent::Resync(rp);
     }
     ev
+}
+
+fn peer_pid_of_stream(stream: &UnixStream) -> Option<i32> {
+    let mut peer_pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            std::ptr::from_mut(&mut peer_pid).cast(),
+            &raw mut len,
+        )
+    };
+    (rc == 0 && peer_pid > 0).then_some(peer_pid)
+}
+
+/// 単発 CLI（`tent hook`）から常駐デーモンへ AI フック状態イベントを送信する。
+/// デーモン未起動やソケット切断時は呼び出し元の AI フックを妨げないよう短時間でエラー返却する。
+pub fn send_hook_event(
+    sock_path: &Path,
+    pane_id: PaneId,
+    state: AiHookState,
+    tool: Option<AiTool>,
+) -> io::Result<()> {
+    let mut stream = UnixStream::connect(sock_path)?;
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+    write_client_msg(
+        &mut stream,
+        &ClientMsg::HookEvent {
+            pane_id,
+            state,
+            tool,
+        },
+    )
 }
 
 /// 指定ソケットで待ち受けている常駐デーモンをピンポイントで停止する（明示的なアップグレード用）。

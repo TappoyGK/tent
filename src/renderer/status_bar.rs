@@ -81,19 +81,23 @@ impl Renderer {
             self.clock_text = clock_key;
         }
 
-        // アプリバージョン表記（v0.1.0 等）を更新
-        let ver_key = (scale_factor * 100.0).round() as u32;
+        // アプリバージョン表記（リリース版は v0.2.0、開発版は v0.2.0-dev@2adc49c 等）を更新
+        let ver_key =
+            ((scale_factor * 100.0).round() as u32) * 2 + u32::from(overlays.version_copied);
         if self.version_cache_key != ver_key {
             let ver_font_size = (10.5 * scale_factor).round().max(9.0);
             let ver_metrics = Metrics::new(ver_font_size, (ver_font_size * 1.35).ceil());
             self.version_buffer.set_metrics(ver_metrics);
             self.version_buffer
                 .set_size(Some(sb_ctrl.version_rect.w), Some(sb_ctrl.version_rect.h));
+            let (ver_text, ver_color) = if overlays.version_copied {
+                ("Copied!", Color::rgb(0x5c, 0xd6, 0x8d))
+            } else {
+                (env!("TENT_DISPLAY_VERSION"), Color::rgb(0x6e, 0x7a, 0x92))
+            };
             self.version_buffer.set_text(
-                concat!("v", env!("CARGO_PKG_VERSION")),
-                &Attrs::new()
-                    .family(Family::Name("Menlo"))
-                    .color(Color::rgb(0x6e, 0x7a, 0x92)),
+                ver_text,
+                &Attrs::new().family(Family::Name("Menlo")).color(ver_color),
                 Shaping::Basic,
                 None,
             );
@@ -223,6 +227,84 @@ impl Renderer {
                 self.timer_buffer
                     .shape_until_scroll(&mut self.font_system, false);
                 self.timer_cache_key = tkey;
+            }
+        }
+
+        // メモリ使用量モニターバー描画（80% = 1.0GiB の目安ライン、超過時は赤で警告）
+        if sb_ctrl.mem_bar_rect.w > 1.0 && !overlays.memory.label.is_empty() {
+            let mr = sb_ctrl.mem_bar_rect;
+            let over = overlays.memory.is_over_budget;
+            let track_bg = if over {
+                [0.26, 0.09, 0.09, 1.0]
+            } else {
+                [0.08, 0.10, 0.14, 1.0]
+            };
+            let track_border = if over {
+                [0.96, 0.36, 0.32, 1.0]
+            } else {
+                [0.22, 0.26, 0.34, 1.0]
+            };
+            self.push_rect(rects, mr, track_bg);
+
+            let frac = overlays.memory.fraction.clamp(0.0, 1.0);
+            if frac > 0.0 {
+                let fill_w = (mr.w * frac).min(mr.w);
+                let fill_color = if over {
+                    [0.90, 0.26, 0.24, 0.92]
+                } else if frac >= 0.60 {
+                    [0.84, 0.60, 0.20, 0.85]
+                } else {
+                    [0.22, 0.64, 0.52, 0.80]
+                };
+                self.push_rect(rects, Rect::new(mr.x, mr.y, fill_w, mr.h), fill_color);
+            }
+
+            // 80%（1.0 GiB）しきい値ラインの縦目盛り
+            let tick_w = (1.5 * scale_factor).max(1.0);
+            let tick_x = mr.x + mr.w * 0.80;
+            let tick_color = if over {
+                [1.0, 0.82, 0.78, 0.95]
+            } else {
+                [0.52, 0.58, 0.70, 0.90]
+            };
+            self.push_rect(
+                rects,
+                Rect::new(
+                    tick_x - tick_w * 0.5,
+                    mr.y + 1.5 * scale_factor,
+                    tick_w,
+                    (mr.h - 3.0 * scale_factor).max(2.0),
+                ),
+                tick_color,
+            );
+            self.push_border(rects, mr, 1.0 * scale_factor, track_border);
+
+            let scale_key = (scale_factor * 100.0).round() as u32;
+            if self.mem_cache_key.0 != overlays.memory.label
+                || self.mem_cache_key.1 != over
+                || self.mem_cache_key.2 != scale_key
+            {
+                let mfs = (10.0 * scale_factor).round().max(9.0);
+                let mmetrics = Metrics::new(mfs, (mfs * 1.3).ceil());
+                self.mem_buffer.set_metrics(mmetrics);
+                self.mem_buffer.set_size(Some(mr.w), Some(mr.h));
+                let mcolor = if over {
+                    Color::rgb(0xff, 0xe2, 0xdc)
+                } else {
+                    Color::rgb(0xe4, 0xec, 0xf8)
+                };
+                self.mem_buffer.set_text(
+                    &overlays.memory.label,
+                    &Attrs::new()
+                        .family(Family::Name("Menlo"))
+                        .color(mcolor)
+                        .weight(Weight::BOLD),
+                    Shaping::Basic,
+                    None,
+                );
+                self.mem_buffer
+                    .shape_until_scroll(&mut self.font_system, false);
+                self.mem_cache_key = (overlays.memory.label.clone(), over, scale_key);
             }
         }
 
@@ -483,6 +565,8 @@ pub(super) fn push_status_bar_text_areas<'a>(
     version_buffer: &'a Buffer,
     timer_buffer: &'a Buffer,
     timer_label: &str,
+    mem_buffer: &'a Buffer,
+    mem_label: &str,
     url_bar_buffer: &'a Buffer,
     status_btn_buffers: &'a [Buffer; 8],
     layout: &AppLayout,
@@ -554,6 +638,22 @@ pub(super) fn push_status_bar_text_areas<'a>(
             scale: 1.0,
             bounds: safe_bounds(tr.x, tr.y, tr.right(), tr.bottom()),
             default_color: Color::rgb(0xf0, 0xf6, 0xff),
+            custom_glyphs: &[],
+        });
+    }
+
+    if sb_ctrl.mem_bar_rect.w > 1.0 && !mem_label.is_empty() {
+        let mr = sb_ctrl.mem_bar_rect;
+        let char_w = (10.0 * scale_factor).round().max(9.0) * 0.62;
+        let label_w = (mem_label.len() as f32) * char_w;
+        let left = (mr.x + (mr.w - label_w) * 0.5).max(mr.x + 3.0 * scale_factor);
+        text_areas.push(TextArea {
+            buffer: mem_buffer,
+            left,
+            top: mr.y + 3.0 * scale_factor,
+            scale: 1.0,
+            bounds: safe_bounds(mr.x, mr.y, mr.right(), mr.bottom()),
+            default_color: Color::rgb(0xe4, 0xec, 0xf8),
             custom_glyphs: &[],
         });
     }

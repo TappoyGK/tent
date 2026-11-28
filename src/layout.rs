@@ -79,6 +79,7 @@ pub enum StatusBarHit {
     SplitBrowser,
     ToggleHelp,
     UpgradeDaemon,
+    Version,
     Timer,
     TimerIcon,
 }
@@ -99,6 +100,7 @@ pub struct StatusBarControls {
     pub upgrade_daemon_rect: Rect,
     pub timer_rect: Rect,
     pub timer_icon_rect: Rect,
+    pub mem_bar_rect: Rect,
     pub text_right_limit: f32,
 }
 
@@ -108,6 +110,7 @@ pub struct AppLayout {
     pub window_h: f32,
     pub main_rect: Rect,
     pub main_status_rect: Rect,
+    pub main_footer_rect: Rect,
     pub main_inner_rect: Rect,
     pub sidebar_rect: Rect,
     pub sidebar_state: SidebarState,
@@ -150,12 +153,14 @@ impl AppLayout {
         let main_rect = Rect::new(0.0, 0.0, main_w, h);
         let status_h = pad + toggle_h;
         let main_status_rect = Rect::new(0.0, 0.0, main_w, status_h);
+        let footer_h = (20.0 * scale).min((h - status_h).max(0.0));
+        let main_footer_rect = Rect::new(0.0, (h - footer_h).max(status_h), main_w, footer_h);
         let main_pad = 8.0 * scale;
         let main_inner_rect = Rect::new(
             main_rect.x + main_pad,
             main_status_rect.bottom() + main_pad,
             (main_rect.w - main_pad * 2.0).max(1.0),
-            (main_rect.h - main_status_rect.h - main_pad * 2.0).max(1.0),
+            (main_footer_rect.y - main_status_rect.bottom() - main_pad * 2.0).max(1.0),
         );
 
         let sidebar_rect = Rect::new(main_w, 0.0, sidebar_w, h);
@@ -206,6 +211,7 @@ impl AppLayout {
             window_h: h,
             main_rect,
             main_status_rect,
+            main_footer_rect,
             main_inner_rect,
             sidebar_rect,
             sidebar_state,
@@ -249,7 +255,8 @@ impl AppLayout {
         let ext_w = 36.0 * scale;
         let help_w = 22.0 * scale;
         let upgrade_w = 68.0 * scale;
-        let version_w = 48.0 * scale;
+        let version_chars = env!("TENT_DISPLAY_VERSION").len().max(7) as f32;
+        let version_w = (version_chars * 6.6 + 6.0) * scale;
         let clock_w = 208.0 * scale;
 
         // Wi-Fi＋バッテリー＋日時を右端へ右寄せ配置し、その左側にバージョンと操作ボタン群を並べる
@@ -295,7 +302,22 @@ impl AppLayout {
             } else {
                 (Rect::default(), Rect::default())
             };
-        let text_right_limit = if timer_rect.w > 0.0 {
+        let after_timer_x = if timer_rect.w > 0.0 {
+            icon_x
+        } else {
+            after_upgrade_x
+        };
+        // メモリ使用量モニターバー（80% = 1.0GiB、100% = 1.25GiB）をタイマーの左隣に配置
+        let mem_w = 76.0 * scale;
+        let mem_x = (after_timer_x - gap * 2.0 - mem_w).max(bar.x);
+        let mem_bar_rect = if after_timer_x - bar.x >= mem_w + 150.0 * scale {
+            Rect::new(mem_x, btn_y, mem_w, btn_h)
+        } else {
+            Rect::default()
+        };
+        let text_right_limit = if mem_bar_rect.w > 0.0 {
+            (mem_x - gap * 2.0).max(bar.x)
+        } else if timer_rect.w > 0.0 {
             (icon_x - gap * 2.0).max(bar.x)
         } else {
             (after_upgrade_x - gap).max(bar.x)
@@ -311,6 +333,7 @@ impl AppLayout {
                 upgrade_daemon_rect,
                 timer_rect,
                 timer_icon_rect,
+                mem_bar_rect,
                 text_right_limit,
                 ..StatusBarControls::default()
             };
@@ -342,6 +365,7 @@ impl AppLayout {
             upgrade_daemon_rect,
             timer_rect,
             timer_icon_rect,
+            mem_bar_rect,
             text_right_limit,
         }
     }
@@ -367,6 +391,9 @@ impl AppLayout {
         }
         if show_daemon_upgrade && c.upgrade_daemon_rect.contains(px, py) {
             return Some(StatusBarHit::UpgradeDaemon);
+        }
+        if c.version_rect.contains(px, py) {
+            return Some(StatusBarHit::Version);
         }
         if c.help_rect.contains(px, py) {
             return Some(StatusBarHit::ToggleHelp);

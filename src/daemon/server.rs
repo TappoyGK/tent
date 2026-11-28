@@ -15,7 +15,7 @@ use crate::macos;
 use crate::terminal_pane::PaneId;
 
 use super::protocol::{ClientMsg, read_client_msg, write_daemon_event};
-use super::{DAEMON_PROTOCOL_VERSION, DaemonEvent, ReplayedPane, encode_terminal_snapshot};
+use super::{AiTool, DAEMON_PROTOCOL_VERSION, DaemonEvent, ReplayedPane, encode_terminal_snapshot};
 
 // =========================================================================
 // デーモンサーバー実装 (`tent --daemon`)
@@ -49,6 +49,7 @@ struct DaemonPane {
     cols: u16,
     rows: u16,
     cwd: PathBuf,
+    last_ai_tool: Option<AiTool>,
     terminal: SendTerminal,
 }
 
@@ -77,6 +78,23 @@ impl DaemonPane {
             self.cwd = path;
         }
         self.cwd.clone()
+    }
+
+    /// ペインのフォアグラウンドプロセスから監視対象 AI ツール（Claude Code / agy / Codex）を判別する。
+    /// ログインシェル自身へ戻ったら `None` へ解除し、AI の子コマンドが一時的にフォアグラウンドになっても
+    /// 直前の AI 種別を維持する。
+    fn current_ai_tool(&mut self) -> Option<AiTool> {
+        let fg_pid = self.pty_master.process_group_leader();
+        if fg_pid.is_none() || fg_pid == self.child_pid {
+            self.last_ai_tool = None;
+            return None;
+        }
+        if let Some(pid) = fg_pid
+            && let Some(tool) = macos::detect_ai_tool_for_pid(pid)
+        {
+            self.last_ai_tool = Some(tool);
+        }
+        self.last_ai_tool
     }
 }
 
@@ -268,14 +286,21 @@ impl ClientOutbox {
 pub(super) struct DaemonState {
     panes: HashMap<PaneId, DaemonPane>,
     next_pane_id: PaneId,
+    sock_path: PathBuf,
     pub(super) client_outbox: Option<ClientOutbox>,
 }
 
 impl DaemonState {
+    #[cfg(test)]
     pub(super) fn new() -> Self {
+        Self::with_socket_path(super::default_socket_path())
+    }
+
+    pub(super) fn with_socket_path(sock_path: PathBuf) -> Self {
         Self {
             panes: HashMap::new(),
             next_pane_id: 1,
+            sock_path,
             client_outbox: None,
         }
     }
@@ -323,7 +348,9 @@ pub fn run_daemon_server(sock_path: &Path) -> io::Result<()> {
     let listener = UnixListener::bind(sock_path)?;
     // 他ユーザーから PTY ソケットへ接続できないよう所有者限定（0600）に設定
     let _ = fs::set_permissions(sock_path, fs::Permissions::from_mode(0o600));
-    let state = Arc::new(Mutex::new(DaemonState::new()));
+    let state = Arc::new(Mutex::new(DaemonState::with_socket_path(
+        sock_path.to_path_buf(),
+    )));
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else {
@@ -364,9 +391,11 @@ fn handle_client_connection(mut reader_stream: UnixStream, state: Arc<Mutex<Daem
                 // アトミックに行うことで、ハンドシェイク中の Output/Exited の欠落・二重適用を完全に防ぐ
                 if let Ok(mut st) = state.lock() {
                     let mut replays = Vec::with_capacity(st.panes.len());
+                    let mut ai_tools = Vec::with_capacity(st.panes.len());
                     for (&pid, dp) in st.panes.iter_mut() {
                         let cwd = dp.current_cwd();
                         let bytes = dp.snapshot_vt_bytes();
+                        ai_tools.push((pid, dp.current_ai_tool()));
                         replays.push(ReplayedPane {
                             pane_id: pid,
                             cols: dp.cols,
@@ -383,6 +412,9 @@ fn handle_client_connection(mut reader_stream: UnixStream, state: Arc<Mutex<Daem
                         next_pane_id: next_id,
                         protocol_version: DAEMON_PROTOCOL_VERSION,
                     });
+                    if !ai_tools.is_empty() {
+                        outbox.push_event(DaemonEvent::AiToolList(ai_tools));
+                    }
                     st.client_outbox = Some(outbox.clone());
                 }
             }
@@ -437,14 +469,53 @@ fn handle_client_connection(mut reader_stream: UnixStream, state: Arc<Mutex<Daem
                 }
             }
             ClientMsg::QueryCwds => {
-                let cwds = {
+                let (cwds, ai_tools) = {
                     let mut st = state.lock().unwrap();
-                    st.panes
-                        .iter_mut()
-                        .map(|(&pid, dp)| (pid, dp.current_cwd()))
-                        .collect::<Vec<_>>()
+                    let mut cwds = Vec::with_capacity(st.panes.len());
+                    let mut ai_tools = Vec::with_capacity(st.panes.len());
+                    for (&pid, dp) in st.panes.iter_mut() {
+                        cwds.push((pid, dp.current_cwd()));
+                        ai_tools.push((pid, dp.current_ai_tool()));
+                    }
+                    (cwds, ai_tools)
                 };
                 outbox.push_event(DaemonEvent::CwdList(cwds));
+                outbox.push_event(DaemonEvent::AiToolList(ai_tools));
+            }
+            ClientMsg::Clear { pane_id } => {
+                const CLEAR_SEQ: &[u8] = b"\x1b[3J\x1b[2J\x1b[H";
+                if let Ok(mut st) = state.lock() {
+                    let cleared = if let Some(dp) = st.panes.get_mut(&pane_id) {
+                        dp.terminal.vt_write(CLEAR_SEQ);
+                        true
+                    } else {
+                        false
+                    };
+                    if cleared {
+                        st.emit_output(pane_id, CLEAR_SEQ.to_vec());
+                    }
+                }
+            }
+            ClientMsg::HookEvent {
+                pane_id,
+                state: hook_state,
+                tool,
+            } => {
+                if let Ok(mut st) = state.lock() {
+                    let resolved_tool = if let Some(dp) = st.panes.get_mut(&pane_id) {
+                        if let Some(t) = tool {
+                            dp.last_ai_tool = Some(t);
+                        }
+                        tool.or(dp.last_ai_tool)
+                    } else {
+                        tool
+                    };
+                    st.emit(DaemonEvent::HookEvent {
+                        pane_id,
+                        state: hook_state,
+                        tool: resolved_tool,
+                    });
+                }
             }
         }
     }
@@ -472,7 +543,6 @@ fn spawn_daemon_pane(
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
     let mut cmd = CommandBuilder::new(&shell);
-    cmd.arg("-l");
     if cwd.is_dir() {
         cmd.cwd(&cwd);
     } else if let Some(home) = std::env::var_os("HOME") {
@@ -487,12 +557,39 @@ fn spawn_daemon_pane(
     }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    cmd.env("TENT_PANE_ID", pane_id.to_string());
+    if let Ok(st) = state.lock() {
+        cmd.env("TENT_SOCKET", &st.sock_path);
+    }
     if let Ok(terminfo_dir) = ghostty_vt::terminfo::dir() {
         cmd.env("TERMINFO", terminfo_dir);
         cmd.env("TERM", "xterm-ghostty");
     }
     if let Ok(res_dir) = ghostty_vt::shell_integration::resources_dir() {
-        cmd.env("GHOSTTY_RESOURCES_DIR", res_dir);
+        let existing_zdotdir = std::env::var("ZDOTDIR").ok();
+        let existing_env = std::env::var("ENV").ok();
+        let existing_xdg = std::env::var("XDG_DATA_DIRS").ok();
+        let bash_major = if Path::new(&shell).file_name().and_then(|s| s.to_str()) == Some("bash") {
+            detect_bash_major_version(&shell)
+        } else {
+            None
+        };
+        let launch = build_shell_integration_launch(
+            &shell,
+            &res_dir,
+            existing_zdotdir.as_deref(),
+            existing_env.as_deref(),
+            existing_xdg.as_deref(),
+            bash_major,
+        );
+        for arg in launch.args {
+            cmd.arg(arg);
+        }
+        for (k, v) in launch.envs {
+            cmd.env(k, v);
+        }
+    } else {
+        cmd.arg("-l");
     }
 
     let Ok(mut child) = pair.slave.spawn_command(cmd) else {
@@ -534,6 +631,7 @@ fn spawn_daemon_pane(
                 cols,
                 rows,
                 cwd,
+                last_ai_tool: None,
                 terminal: SendTerminal(terminal),
             },
         );
@@ -580,4 +678,113 @@ fn spawn_daemon_pane(
                 }
             }
         });
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct ShellIntegrationLaunch {
+    pub(super) args: Vec<String>,
+    pub(super) envs: Vec<(String, String)>,
+}
+
+/// bash のメジャーバージョン（`BASH_VERSINFO[0]`）取得用コマンドへ
+/// ロケール・`BASH_ENV`・`ENV` を無効化する設定を適用する
+pub(super) fn configure_bash_version_command(cmd: &mut std::process::Command) {
+    cmd.env_remove("BASH_ENV")
+        .env_remove("ENV")
+        .env("LC_ALL", "C")
+        .args([
+            "--noprofile",
+            "--norc",
+            "-c",
+            "printf '%s' \"${BASH_VERSINFO[0]}\"",
+        ]);
+}
+
+/// ロケールやユーザー設定（`BASH_ENV` / `ENV` / rc）に依存せず bash のメジャーバージョンを取得する
+pub(super) fn detect_bash_major_version(shell: &str) -> Option<u32> {
+    let mut cmd = std::process::Command::new(shell);
+    configure_bash_version_command(&mut cmd);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout.trim().parse::<u32>().ok()
+}
+
+/// Ghostty 同梱のシェル統合スクリプト（OSC 133）を透過的に注入するための
+/// 起動引数（順序付き）と環境変数を生成する。
+pub(super) fn build_shell_integration_launch(
+    shell: &str,
+    res_dir: &Path,
+    existing_zdotdir: Option<&str>,
+    existing_env: Option<&str>,
+    existing_xdg_data_dirs: Option<&str>,
+    bash_major_version: Option<u32>,
+) -> ShellIntegrationLaunch {
+    let shell_name = Path::new(shell)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(shell);
+    let mut launch = ShellIntegrationLaunch {
+        args: vec!["-l".to_string()],
+        envs: vec![(
+            "GHOSTTY_RESOURCES_DIR".to_string(),
+            res_dir.to_string_lossy().into_owned(),
+        )],
+    };
+    let si_dir = res_dir.join("shell-integration");
+
+    match shell_name {
+        "zsh" => {
+            let zsh_dir = si_dir.join("zsh");
+            if zsh_dir.join(".zshenv").is_file() {
+                if let Some(prev) = existing_zdotdir {
+                    launch
+                        .envs
+                        .push(("GHOSTTY_ZSH_ZDOTDIR".to_string(), prev.to_string()));
+                }
+                launch.envs.push((
+                    "ZDOTDIR".to_string(),
+                    zsh_dir.to_string_lossy().into_owned(),
+                ));
+            }
+        }
+        "bash" => {
+            // Ghostty の bash シェル統合は bash 4.0 以上が必須（macOS 標準の 3.2 では未対応）。
+            // また bash の仕様上 `--posix` は `-l` より前に置く必要がある。
+            let bash_script = si_dir.join("bash").join("ghostty.bash");
+            if bash_major_version.is_some_and(|v| v >= 4) && bash_script.is_file() {
+                launch.args = vec!["--posix".to_string(), "-l".to_string()];
+                launch
+                    .envs
+                    .push(("GHOSTTY_BASH_INJECT".to_string(), "1".to_string()));
+                if let Some(prev) = existing_env
+                    && !prev.is_empty()
+                {
+                    launch
+                        .envs
+                        .push(("GHOSTTY_BASH_ENV".to_string(), prev.to_string()));
+                }
+                launch.envs.push((
+                    "ENV".to_string(),
+                    bash_script.to_string_lossy().into_owned(),
+                ));
+            }
+        }
+        "fish" => {
+            let fish_dir = si_dir.join("fish");
+            if fish_dir.is_dir() {
+                let fish_str = fish_dir.to_string_lossy();
+                let merged = match existing_xdg_data_dirs {
+                    Some(prev) if !prev.is_empty() => format!("{fish_str}:{prev}"),
+                    _ => fish_str.into_owned(),
+                };
+                launch.envs.push(("XDG_DATA_DIRS".to_string(), merged));
+            }
+        }
+        _ => {}
+    }
+
+    launch
 }

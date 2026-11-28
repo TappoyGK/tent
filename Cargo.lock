@@ -3468,7 +3468,7 @@ dependencies = [
 
 [[package]]
 name = "tent"
-version = "0.1.22"
+version = "0.2.0-dev"
 dependencies = [
  "block2 0.6.2",
  "bytemuck",

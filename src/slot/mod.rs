@@ -13,7 +13,7 @@ use crate::key_map::FocusDir;
 use crate::layout::Rect;
 use crate::terminal_pane::{PaneId, TerminalPane};
 
-pub use pane_tree::{Pane, PaneNode, SlotViewMode, SplitAxis};
+pub use pane_tree::{Pane, PaneNode, SlotViewMode, SplitAxis, SplitDivider, ratio_from_pointer};
 pub use slot_item::Slot;
 
 use pane_tree::{remove_node, select_next_pane, split_node_mut};
@@ -273,14 +273,15 @@ impl Workspace {
         false
     }
 
-    pub fn update_waiting_states(&mut self, now: Instant) -> bool {
+    pub fn update_waiting_states(&mut self, now: Instant, window_focused: bool) -> bool {
         let active = self.active_slot;
         let mut changed = false;
         for (idx, slot) in self.slots.iter_mut().enumerate() {
             let is_active = idx == active;
+            let slot_label = Slot::number_label(idx);
             if let Some(root) = &mut slot.root {
                 root.for_each_terminal_mut(&mut |p| {
-                    if p.update_waiting_state(now, is_active) {
+                    if p.update_waiting_state(now, is_active, window_focused, Some(slot_label)) {
                         changed = true;
                     }
                 });
@@ -413,6 +414,73 @@ impl Workspace {
         }
     }
 
+    /// アクティブスロットの分割境界線に対するヒットテスト
+    pub fn hit_test_divider(
+        &self,
+        px: f32,
+        py: f32,
+        hit_half_thickness: f32,
+    ) -> Option<SplitDivider> {
+        let slot = &self.slots[self.active_slot];
+        let tree = match slot.view_mode {
+            SlotViewMode::Panes => slot.root.as_ref(),
+            SlotViewMode::Browser => slot.browser_root.as_ref(),
+        }?;
+        tree.hit_test_divider(self.main_area, self.pane_gap, hit_half_thickness, px, py)
+    }
+
+    /// アクティブスロットの指定分割ノードの比率を更新し、ペインを再レイアウトする
+    pub fn set_active_split_ratio(&mut self, path: &[bool], ratio: f32) -> bool {
+        let (area, gap, cw, ch) = (self.main_area, self.pane_gap, self.cell_w, self.cell_h);
+        let min_w = cw * 10.0;
+        let min_h = ch * 4.0;
+        let slot = &mut self.slots[self.active_slot];
+        let changed = match slot.view_mode {
+            SlotViewMode::Panes => slot
+                .root
+                .as_mut()
+                .is_some_and(|r| r.set_split_ratio(path, ratio, area, gap, min_w, min_h)),
+            SlotViewMode::Browser => slot
+                .browser_root
+                .as_mut()
+                .is_some_and(|r| r.set_split_ratio(path, ratio, area, gap, min_w, min_h)),
+        };
+        if changed && slot.view_mode == SlotViewMode::Panes {
+            slot.resize_to_area(area, gap, cw, ch);
+        }
+        changed
+    }
+
+    /// フォーカス中ペインに最も近い該当軸の分割境界をキーボード操作で調整する
+    pub fn resize_focused_pane_dir(&mut self, dir: FocusDir, step: f32) -> bool {
+        let (axis, delta) = match dir {
+            FocusDir::Left => (SplitAxis::Vertical, -step),
+            FocusDir::Right => (SplitAxis::Vertical, step),
+            FocusDir::Up => (SplitAxis::Horizontal, -step),
+            FocusDir::Down => (SplitAxis::Horizontal, step),
+            FocusDir::Prev | FocusDir::Next => return false,
+        };
+        let (area, gap, cw, ch) = (self.main_area, self.pane_gap, self.cell_w, self.cell_h);
+        let min_w = cw * 10.0;
+        let min_h = ch * 4.0;
+        let slot = &mut self.slots[self.active_slot];
+        let Some(target_id) = slot.active_focused_pane() else {
+            return false;
+        };
+        let changed = match slot.view_mode {
+            SlotViewMode::Panes => slot.root.as_mut().is_some_and(|r| {
+                r.resize_pane_axis(target_id, axis, delta, area, gap, min_w, min_h)
+            }),
+            SlotViewMode::Browser => slot.browser_root.as_mut().is_some_and(|r| {
+                r.resize_pane_axis(target_id, axis, delta, area, gap, min_w, min_h)
+            }),
+        };
+        if changed && slot.view_mode == SlotViewMode::Panes {
+            slot.resize_to_area(area, gap, cw, ch);
+        }
+        changed
+    }
+
     pub fn focus_pane_dir(&mut self, dir: FocusDir) {
         let slot = &mut self.slots[self.active_slot];
         let mut rects = slot.compute_pane_rects(self.main_area, self.pane_gap);
@@ -515,6 +583,45 @@ impl Workspace {
             }
         }
         changed
+    }
+
+    pub fn apply_ai_tool_updates(
+        &mut self,
+        updates: Vec<(PaneId, Option<crate::daemon::AiTool>)>,
+    ) -> bool {
+        let mut changed = false;
+        for (pane_id, tool) in updates {
+            for slot in &mut self.slots {
+                if let Some(root) = &mut slot.root
+                    && let Some(pane) = root.terminal_pane_mut(pane_id)
+                {
+                    if pane.update_ai_tool_from_daemon(tool) {
+                        changed = true;
+                    }
+                    break;
+                }
+            }
+        }
+        changed
+    }
+
+    pub fn apply_hook_event(
+        &mut self,
+        pane_id: PaneId,
+        state: crate::daemon::AiHookState,
+        tool: Option<crate::daemon::AiTool>,
+        window_focused: bool,
+    ) -> bool {
+        for (idx, slot) in self.slots.iter_mut().enumerate() {
+            if let Some(root) = &mut slot.root
+                && let Some(pane) = root.terminal_pane_mut(pane_id)
+            {
+                let is_active = idx == self.active_slot;
+                let label = Slot::number_label(idx);
+                return pane.apply_ai_hook_event(state, tool, is_active, window_focused, label);
+            }
+        }
+        false
     }
 
     pub fn has_any_active_output(&self, now: Instant) -> bool {

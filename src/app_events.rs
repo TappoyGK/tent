@@ -10,9 +10,14 @@ use crate::browser::current_macos_modifiers;
 use crate::key_map::{AppShortcut, encode_key_event, match_app_shortcut};
 use crate::layout::{SidebarHit, StatusBarHit};
 use crate::macos;
-use crate::renderer::{RenderOverlays, SelectionOverlay, UrlHoverOverlay};
-use crate::slot::Workspace;
-use crate::{SelectionState, SlotDragState, TentApp};
+use crate::renderer::{
+    RenderOverlays, SearchBarOverlay, SearchHighlightOverlay, SelectionOverlay, UrlHoverOverlay,
+};
+use crate::slot::{Workspace, ratio_from_pointer};
+use crate::{
+    ClickTracker, DividerDragState, MULTI_CLICK_INTERVAL, SelectionMode, SelectionState,
+    SlotDragState, TentApp,
+};
 
 impl TentApp {
     pub(crate) fn handle_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
@@ -23,6 +28,11 @@ impl TentApp {
             }
             WindowEvent::Focused(focused) => {
                 self.window_focused = focused;
+                if !focused && self.divider_drag.take().is_some() {
+                    self.hovered_divider = None;
+                    self.save_state();
+                    self.update_cursor_icon();
+                }
             }
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 self.recompute_layout_and_resize();
@@ -35,15 +45,60 @@ impl TentApp {
                 let px = position.x as f32;
                 let py = position.y as f32;
                 self.cursor_pos = (px, py);
+
+                // 分割ペイン境界線のドラッグリサイズ中
+                if let Some(drag) = self.divider_drag.as_ref() {
+                    let path = drag.path.clone();
+                    let axis = drag.axis;
+                    let parent_rect = drag.parent_rect;
+                    let gap = self.pane_gap();
+                    let ratio = ratio_from_pointer(axis, parent_rect, gap, px, py);
+                    let changed = self
+                        .workspace
+                        .as_mut()
+                        .is_some_and(|ws| ws.set_active_split_ratio(&path, ratio));
+                    if changed {
+                        self.sync_browsers();
+                        self.request_redraw_now();
+                    }
+                    return;
+                }
+
                 self.update_url_hover();
 
-                // Focus-follows-mouse: 分割ペイン上にカーソルが乗ったら即フォーカス切替
+                // 分割ペイン境界線ホバー時のリサイズカーソル表示
                 let is_selecting = self.selection.as_ref().is_some_and(|s| s.active);
+                let next_divider = if !self.show_help
+                    && self.slot_drag.is_none()
+                    && !self.status_timer.dragging
+                    && !is_selecting
+                {
+                    let scale = self
+                        .window
+                        .as_ref()
+                        .map(|w| w.scale_factor() as f32)
+                        .unwrap_or(1.0);
+                    let hit_half = (self.pane_gap() * 0.5).max(5.0 * scale);
+                    self.workspace
+                        .as_ref()
+                        .and_then(|ws| ws.hit_test_divider(px, py, hit_half))
+                        .map(|d| d.axis)
+                } else {
+                    None
+                };
+                if self.hovered_divider != next_divider {
+                    self.hovered_divider = next_divider;
+                    self.update_cursor_icon();
+                }
+
+                // Focus-follows-mouse: 分割ペイン上にカーソルが乗ったら即フォーカス切替
                 if self.window_focused
                     && !self.show_help
                     && self.slot_drag.is_none()
                     && !is_selecting
+                    && self.hovered_divider.is_none()
                     && self.url_bar_edit.is_none()
+                    && self.search.is_none()
                 {
                     let needs_focus = self.workspace.as_ref().is_some_and(|ws| {
                         ws.pane_at(px, py)
@@ -93,15 +148,11 @@ impl TentApp {
                     }
                 }
 
-                if let Some(sel) = self.selection.as_ref()
+                if let Some(sel) = self.selection.as_mut()
                     && sel.active
                 {
-                    let rect = sel.pane_rect;
-                    let cell = self.pixel_to_cell(rect, px, py);
-                    if let Some(sel_mut) = self.selection.as_mut()
-                        && sel_mut.end != cell
-                    {
-                        sel_mut.end = cell;
+                    sel.has_dragged = true;
+                    if self.extend_selection_to_cursor(px, py) {
                         self.request_redraw_now();
                     }
                 }
@@ -184,6 +235,12 @@ impl TentApp {
                         }
                         StatusBarHit::ToggleHelp => {
                             self.handle_shortcut(AppShortcut::ToggleHelp);
+                        }
+                        StatusBarHit::Version => {
+                            macos::write_clipboard_text(env!("TENT_DISPLAY_VERSION"));
+                            self.version_copied_until =
+                                Some(Instant::now() + std::time::Duration::from_millis(1200));
+                            self.request_redraw_now();
                         }
                         StatusBarHit::TimerIcon => {
                             // 砂時計クリック: 前回と同じ分数で即座にタイマーを開始
@@ -273,6 +330,25 @@ impl TentApp {
                         });
                     }
                     None => {
+                        // 分割ペイン境界線のドラッグリサイズ開始判定
+                        let hit_half = (self.pane_gap() * 0.5).max(5.0 * scale);
+                        if let Some(div) = self
+                            .workspace
+                            .as_ref()
+                            .and_then(|ws| ws.hit_test_divider(px, py, hit_half))
+                        {
+                            self.selection = None;
+                            self.divider_drag = Some(DividerDragState {
+                                path: div.path,
+                                axis: div.axis,
+                                parent_rect: div.parent_rect,
+                            });
+                            self.hovered_divider = Some(div.axis);
+                            self.update_cursor_icon();
+                            self.request_redraw_now();
+                            return;
+                        }
+
                         if self.modifiers.super_key() {
                             self.update_url_hover();
                             if let Some((_, ref m)) = self.hovered_url {
@@ -284,6 +360,7 @@ impl TentApp {
                                     // Cmd+クリック（デフォルト）: TenT 組み込みブラウザで開く
                                     if let Some(ws) = self.workspace.as_mut() {
                                         let bid = ws.open_url_in_active_browser(&url);
+                                        self.close_search();
                                         self.sync_browsers();
                                         self.browsers.navigate(bid, &url);
                                         self.save_state();
@@ -296,20 +373,76 @@ impl TentApp {
                         if let Some(ws) = self.workspace.as_mut()
                             && let Some((pid, prect)) = ws.focus_pane_at(px, py)
                         {
-                            let is_terminal = ws
-                                .active_slot_ref()
-                                .root
+                            if self
+                                .search
                                 .as_ref()
+                                .is_some_and(|s| s.target.pane_id() != pid)
+                            {
+                                self.close_search();
+                            }
+                            let vp_cell = self.pixel_to_cell(prect, px, py);
+                            let now = Instant::now();
+                            let click_tol = 8.0 * scale;
+                            let click_count = match &self.last_click {
+                                Some(prev)
+                                    if prev.pane_id == pid
+                                        && now.duration_since(prev.time)
+                                            <= MULTI_CLICK_INTERVAL
+                                        && (px - prev.pos.0).hypot(py - prev.pos.1)
+                                            <= click_tol =>
+                                {
+                                    (prev.count % 3) + 1
+                                }
+                                _ => 1,
+                            };
+                            self.last_click = Some(ClickTracker {
+                                time: now,
+                                pane_id: pid,
+                                pos: (px, py),
+                                count: click_count,
+                            });
+
+                            let mode = match click_count {
+                                2 => SelectionMode::Word,
+                                3 => SelectionMode::Line,
+                                _ => SelectionMode::Char,
+                            };
+
+                            let selection_bounds = self
+                                .workspace
+                                .as_ref()
+                                .and_then(|ws| ws.active_slot_ref().root.as_ref())
                                 .and_then(|r| r.terminal_pane(pid))
-                                .is_some();
-                            if is_terminal {
-                                let cell = self.pixel_to_cell(prect, px, py);
+                                .and_then(|pane| {
+                                    let (col, srow) = pane.viewport_cell_to_screen(vp_cell);
+                                    let (start_pt, end_pt) = match mode {
+                                        SelectionMode::Char => ((col, srow), (col, srow)),
+                                        SelectionMode::Word => {
+                                            let (ws_col, we_col) =
+                                                pane.word_bounds_at_screen(col, srow);
+                                            ((ws_col, srow), (we_col, srow))
+                                        }
+                                        SelectionMode::Line => pane.line_bounds_at_screen(srow),
+                                    };
+                                    Some((
+                                        pane.track_screen_point(start_pt)?,
+                                        pane.track_screen_point(end_pt)?,
+                                        pane.track_screen_point(start_pt)?,
+                                        pane.track_screen_point(end_pt)?,
+                                    ))
+                                });
+                            if let Some((anchor_start, anchor_end, start, end)) = selection_bounds {
+                                self.last_autoscroll = now;
                                 self.selection = Some(SelectionState {
                                     pane_id: pid,
                                     pane_rect: prect,
-                                    start: cell,
-                                    end: cell,
+                                    mode,
+                                    anchor_start,
+                                    anchor_end,
+                                    start,
+                                    end,
                                     active: true,
+                                    has_dragged: false,
                                 });
                             }
                             self.sync_browsers();
@@ -323,6 +456,24 @@ impl TentApp {
                 button: MouseButton::Left,
                 ..
             } => {
+                if self.divider_drag.take().is_some() {
+                    let (px, py) = self.cursor_pos;
+                    let scale = self
+                        .window
+                        .as_ref()
+                        .map(|w| w.scale_factor() as f32)
+                        .unwrap_or(1.0);
+                    let hit_half = (self.pane_gap() * 0.5).max(5.0 * scale);
+                    self.hovered_divider = self
+                        .workspace
+                        .as_ref()
+                        .and_then(|ws| ws.hit_test_divider(px, py, hit_half))
+                        .map(|d| d.axis);
+                    self.save_state();
+                    self.update_cursor_icon();
+                    self.request_redraw_now();
+                    return;
+                }
                 if self.status_timer.dragging {
                     self.status_timer.dragging = false;
                     let mins = self.status_timer.drag_minutes;
@@ -338,13 +489,21 @@ impl TentApp {
                             if let Some(ws) = self.workspace.as_mut() {
                                 ws.swap_slots(drag.source_slot, target);
                             }
+                            self.close_search();
                             self.sync_browsers();
                             self.save_state();
                         }
                     } else {
+                        let slot_changed = self
+                            .workspace
+                            .as_ref()
+                            .is_some_and(|ws| ws.active_slot != drag.source_slot);
                         if let Some(ws) = self.workspace.as_mut() {
                             ws.select_slot(drag.source_slot);
                             self.selection = None;
+                        }
+                        if slot_changed {
+                            self.close_search();
                         }
                         self.sync_browsers();
                         self.save_state();
@@ -356,7 +515,23 @@ impl TentApp {
                     && sel.active
                 {
                     sel.active = false;
-                    if sel.start == sel.end {
+                    let empty_char_click = if sel.mode == SelectionMode::Char {
+                        if !sel.has_dragged {
+                            true
+                        } else {
+                            self.workspace
+                                .as_ref()
+                                .and_then(|ws| ws.active_slot_ref().root.as_ref())
+                                .and_then(|r| r.terminal_pane(sel.pane_id))
+                                .is_none_or(|pane| {
+                                    pane.resolve_tracked_point(&sel.start)
+                                        == pane.resolve_tracked_point(&sel.end)
+                                })
+                        }
+                    } else {
+                        false
+                    };
+                    if empty_char_click {
                         self.selection = None;
                         self.request_redraw_now();
                     }
@@ -427,6 +602,17 @@ impl TentApp {
                     self.handle_url_bar_key(&event);
                     return;
                 }
+                if self.search.is_some() {
+                    // 検索バー編集中でもスロット切替・Cmd+F 全選択等のアプリショートカットは通す
+                    if let Some(shortcut) = match_app_shortcut(&event, self.modifiers)
+                        && !matches!(shortcut, AppShortcut::Copy | AppShortcut::Paste)
+                    {
+                        self.handle_shortcut(shortcut);
+                        return;
+                    }
+                    self.handle_search_key(&event);
+                    return;
+                }
                 if let Some(shortcut) = match_app_shortcut(&event, self.modifiers) {
                     self.handle_shortcut(shortcut);
                     if self.restart_requested {
@@ -473,6 +659,13 @@ impl TentApp {
                                 edit.select_all = false;
                             }
                             edit.text.push_str(&text);
+                        } else if let Some(search) = self.search.as_mut() {
+                            if search.select_all {
+                                search.query.clear();
+                                search.select_all = false;
+                            }
+                            search.query.push_str(&text);
+                            self.update_search_results(true);
                         } else if let Some(ws) = self.workspace.as_mut()
                             && let Some(pane) = ws.active_pane_mut()
                         {
@@ -509,6 +702,7 @@ impl TentApp {
             }
             WindowEvent::RedrawRequested => {
                 self.drain_daemon_events();
+                self.sync_search_matches_if_needed(false);
                 self.last_redraw = Instant::now();
                 self.pending_redraw = false;
 
@@ -530,15 +724,25 @@ impl TentApp {
                         .as_ref()
                         .filter(|d| d.is_dragging)
                         .and_then(|d| d.hover_slot),
-                    selection: self
-                        .selection
-                        .as_ref()
-                        .filter(|s| s.start != s.end)
-                        .map(|s| SelectionOverlay {
+                    selection: self.selection.as_ref().and_then(|s| {
+                        let pane = self
+                            .workspace
+                            .as_ref()?
+                            .active_slot_ref()
+                            .root
+                            .as_ref()?
+                            .terminal_pane(s.pane_id)?;
+                        let (pa, pb) = pane.resolve_tracked_selection_range(&s.start, &s.end)?;
+                        if s.mode == SelectionMode::Char && pa == pb {
+                            return None;
+                        }
+                        let (start, end) = pane.screen_selection_to_viewport(pa, pb)?;
+                        Some(SelectionOverlay {
                             pane_id: s.pane_id,
-                            start: s.start,
-                            end: s.end,
-                        }),
+                            start,
+                            end,
+                        })
+                    }),
                     hovered_url: self.hovered_url.as_ref().map(|(pid, m)| UrlHoverOverlay {
                         pane_id: *pid,
                         row: m.row,
@@ -549,6 +753,70 @@ impl TentApp {
                         .url_bar_edit
                         .as_ref()
                         .map(|e| (e.text.as_str(), e.select_all)),
+                    search_highlights: self.search.as_ref().and_then(|s| {
+                        let crate::SearchTarget::Terminal(pid) = s.target else {
+                            return None;
+                        };
+                        if s.matches.is_empty() {
+                            return None;
+                        }
+                        let pane = self
+                            .workspace
+                            .as_ref()?
+                            .active_slot_ref()
+                            .root
+                            .as_ref()?
+                            .terminal_pane(pid)?;
+                        let vp_top = pane.viewport_top_screen_row();
+                        let vp_bottom =
+                            vp_top.saturating_add(u32::from(pane.rows.saturating_sub(1)));
+                        let max_col = pane.cols.saturating_sub(1);
+                        let mut visible: Vec<(u16, u16, u16, bool)> = Vec::new();
+                        for (idx, m) in s.matches.iter().enumerate() {
+                            if m.end_row < vp_top || m.start_row > vp_bottom {
+                                continue;
+                            }
+                            let is_current = s.current_match == Some(idx);
+                            let row_from = m.start_row.max(vp_top);
+                            let row_to = m.end_row.min(vp_bottom);
+                            for r in row_from..=row_to {
+                                let c0 = if r == m.start_row { m.start_col } else { 0 };
+                                let c1 = if r == m.end_row { m.end_col } else { max_col };
+                                visible.push(((r - vp_top) as u16, c0, c1, is_current));
+                            }
+                        }
+                        if visible.is_empty() {
+                            None
+                        } else {
+                            Some(SearchHighlightOverlay {
+                                pane_id: pid,
+                                matches: visible,
+                            })
+                        }
+                    }),
+                    search_bar: self.search.as_ref().map(|s| {
+                        let count_label = if s.target.is_browser() {
+                            if s.query.is_empty() {
+                                String::new()
+                            } else {
+                                "Enter/⇧Enter".to_string()
+                            }
+                        } else if s.query.is_empty() {
+                            String::new()
+                        } else if s.matches.is_empty() {
+                            "0/0".to_string()
+                        } else {
+                            let cur = s.current_match.map_or(1, |i| i + 1);
+                            format!("{cur}/{}", s.matches.len())
+                        };
+                        SearchBarOverlay {
+                            pane_id: s.target.pane_id(),
+                            is_browser: s.target.is_browser(),
+                            query: s.query.as_str(),
+                            select_all: s.select_all,
+                            count_label,
+                        }
+                    }),
                     battery: self.battery_status.lock().ok().and_then(|g| *g),
                     wifi: self.wifi_status.lock().ok().and_then(|g| *g),
                     show_help: self.show_help,
@@ -556,7 +824,11 @@ impl TentApp {
                     daemon_upgrade_confirm: self
                         .daemon_upgrade_confirm_until
                         .is_some_and(|d| Instant::now() < d),
+                    version_copied: self
+                        .version_copied_until
+                        .is_some_and(|d| Instant::now() < d),
                     timer: self.status_timer.overlay(Instant::now()),
+                    memory: &self.memory_overlay,
                 };
 
                 let mut outcome = None;
