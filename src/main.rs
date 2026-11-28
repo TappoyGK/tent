@@ -1,7 +1,10 @@
 mod app_events;
+mod app_handler;
 mod app_shortcuts;
+mod app_state;
 mod browser;
 mod daemon;
+mod hook_cli;
 mod key_map;
 mod layout;
 mod macos;
@@ -12,285 +15,91 @@ mod terminal_pane;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ghostty_vt::key::Encoder;
-use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
-use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
-use winit::window::{CursorIcon, Window, WindowId};
+use winit::window::{CursorIcon, Window};
 
-use crate::browser::{BrowserManager, current_macos_modifiers, install_macos_shortcut_monitor};
+pub(crate) use crate::app_state::{
+    ClickTracker, DividerDragState, SEARCH_RESYNC_INTERVAL, SearchState, SearchTarget,
+    SelectionMode, SelectionState, SlotDragState, StatusTimerState, UrlBarEdit,
+    selection_autoscroll_delta,
+};
+use crate::browser::BrowserManager;
 use crate::daemon::{DaemonClient, DaemonEvent, default_socket_path};
 use crate::layout::{AppLayout, Rect, SidebarState};
 use crate::renderer::Renderer;
 use crate::slot::Workspace;
 use crate::state::{SavedState, WindowGeometry};
-use crate::terminal_pane::{AppEvent, PaneId, SearchMatch, TrackedGridRef, UrlMatch};
+use crate::terminal_pane::{AppEvent, PaneId, UrlMatch};
 
-const FRAME_INTERVAL: Duration = Duration::from_millis(16);
-const CWD_POLL_INTERVAL: Duration = Duration::from_millis(1000);
-const BATTERY_POLL_INTERVAL: Duration = Duration::from_secs(30);
-const SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(2000);
-const RESTORE_STEP_INTERVAL: Duration = Duration::from_millis(350);
+pub(crate) const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+pub(crate) const CWD_POLL_INTERVAL: Duration = Duration::from_millis(1000);
+pub(crate) const BATTERY_POLL_INTERVAL: Duration = Duration::from_secs(30);
+pub(crate) const SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(2000);
+pub(crate) const RESTORE_STEP_INTERVAL: Duration = Duration::from_millis(350);
 const PTY_DRAIN_BUDGET: Duration = Duration::from_millis(8);
-const DAEMON_EVENT_QUEUE_CAPACITY: usize = 64;
-const MEMORY_POLL_INTERVAL: Duration = Duration::from_secs(2);
-const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(400);
-const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(50);
+pub(crate) const DAEMON_EVENT_QUEUE_CAPACITY: usize = 64;
+pub(crate) const MEMORY_POLL_INTERVAL: Duration = Duration::from_secs(2);
+pub(crate) const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(400);
+pub(crate) const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(50);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SelectionMode {
-    Char,
-    Word,
-    Line,
-}
-
-struct ClickTracker {
-    time: Instant,
-    pane_id: PaneId,
-    pos: (f32, f32),
-    count: u8,
-}
-
-struct SlotDragState {
-    source_slot: usize,
-    start_pos: (f32, f32),
-    is_dragging: bool,
-    hover_slot: Option<usize>,
-}
-
-struct DividerDragState {
-    path: Vec<bool>,
-    axis: crate::slot::SplitAxis,
-    parent_rect: Rect,
-}
-
-struct SelectionState {
-    pane_id: PaneId,
-    pane_rect: Rect,
-    mode: SelectionMode,
-    anchor_start: TrackedGridRef,
-    anchor_end: TrackedGridRef,
-    start: TrackedGridRef,
-    end: TrackedGridRef,
-    active: bool,
-    has_dragged: bool,
-}
-
-/// ドラッグ選択中のカーソル Y 座標がペインの上下端より外に出たとき、自動スクロール行数（負=上, 正=下）を返す
-pub(crate) fn selection_autoscroll_delta(py: f32, pane_rect: Rect, cell_h: f32) -> isize {
-    if pane_rect.h <= 1.0 {
-        return 0;
-    }
-    let ch = cell_h.max(1.0);
-    if py < pane_rect.y {
-        let overshoot = ((pane_rect.y - py) / ch).floor().max(0.0) as isize;
-        -(1 + overshoot).min(4)
-    } else if py > pane_rect.bottom() {
-        let overshoot = ((py - pane_rect.bottom()) / ch).floor().max(0.0) as isize;
-        (1 + overshoot).min(4)
-    } else {
-        0
-    }
-}
-
-struct UrlBarEdit {
-    pane_id: PaneId,
-    text: String,
-    select_all: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SearchTarget {
-    Terminal(PaneId),
-    Browser(PaneId),
-}
-
-impl SearchTarget {
-    pub(crate) fn pane_id(self) -> PaneId {
-        match self {
-            Self::Terminal(id) | Self::Browser(id) => id,
-        }
-    }
-
-    pub(crate) fn is_browser(self) -> bool {
-        matches!(self, Self::Browser(_))
-    }
-}
-
-/// 出力継続中の自動再検索スロットル間隔（毎フレーム全走査による描画詰まりを防止）
-pub(crate) const SEARCH_RESYNC_INTERVAL: Duration = Duration::from_millis(300);
-
-pub(crate) struct SearchState {
-    pub(crate) target: SearchTarget,
-    pub(crate) query: String,
-    pub(crate) select_all: bool,
-    pub(crate) matches: Vec<SearchMatch>,
-    pub(crate) current_match: Option<usize>,
-    /// 現在マッチ開始位置を追跡するピン（スクロールバック削除・リフロー追従用）
-    pub(crate) current_pin: Option<TrackedGridRef>,
-    /// 最後に検索を実行した時点の `TerminalPane::content_generation`
-    pub(crate) content_generation: u64,
-    /// 最後に再検索を実行した時刻（出力継続中のスロットル用）
-    pub(crate) last_sync_at: Instant,
-}
-
-#[derive(Default)]
-struct StatusTimerState {
-    dragging: bool,
-    drag_rect: Rect,
-    drag_minutes: u32,
-    last_minutes: u32,
-    total_secs: f32,
-    end_at: Option<Instant>,
-    finished: bool,
-    last_anim_step: Option<Instant>,
-    anim_tick: u32,
-}
-
-impl StatusTimerState {
-    fn start(&mut self, mins: u32, now: Instant) {
-        if mins > 0 {
-            let secs = u64::from(mins) * 60;
-            self.last_minutes = mins;
-            self.total_secs = secs as f32;
-            self.end_at = Some(now + Duration::from_secs(secs));
-            self.last_anim_step = Some(now);
-            self.anim_tick = 0;
-            self.finished = false;
-        } else {
-            self.total_secs = 0.0;
-            self.end_at = None;
-            self.last_anim_step = None;
-            self.finished = false;
-        }
-    }
-    /// 右端=0分、左端=60分としてカーソル X 座標から分数を算出する。
-    /// 通常時は 5 / 15 / 25 / 45 分付近（±2.5分）でスナップし、Shift 押下時は 1 分刻みで自由設定する。
-    fn minutes_from_x(rect: Rect, px: f32, disable_snap: bool) -> u32 {
-        if rect.w <= 0.0 {
-            return 0;
-        }
-        let ratio = ((rect.right() - px) / rect.w).clamp(0.0, 1.0);
-        let raw = ratio * 60.0;
-        if !disable_snap {
-            for snap in [5.0f32, 15.0, 25.0, 45.0] {
-                if (raw - snap).abs() <= 2.5 {
-                    return snap as u32;
-                }
-            }
-        }
-        raw.round().clamp(0.0, 60.0) as u32
-    }
-
-    fn overlay(&self, now: Instant) -> crate::renderer::TimerOverlay {
-        if self.dragging {
-            let m = self.drag_minutes;
-            return crate::renderer::TimerOverlay {
-                fraction: (m as f32) / 60.0,
-                progress: 1.0,
-                label: if m > 0 {
-                    format!("{m}m")
-                } else {
-                    String::new()
-                },
-                is_dragging: true,
-                is_running: false,
-                is_finished: false,
-                anim_tick: 0,
-            };
-        }
-        if let Some(end) = self.end_at
-            && now < end
-        {
-            let rem_secs = end.duration_since(now).as_secs_f32();
-            let rem_mins = (rem_secs / 60.0).ceil() as u32;
-            let progress = if self.total_secs > 0.0 {
-                (rem_secs / self.total_secs).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            return crate::renderer::TimerOverlay {
-                fraction: (rem_secs / 3600.0).clamp(0.0, 1.0),
-                progress,
-                label: format!("{rem_mins}m"),
-                is_dragging: false,
-                is_running: true,
-                is_finished: false,
-                anim_tick: self.anim_tick,
-            };
-        }
-        if self.finished {
-            return crate::renderer::TimerOverlay {
-                fraction: 0.0,
-                progress: 0.0,
-                label: "0m".to_string(),
-                is_dragging: false,
-                is_running: false,
-                is_finished: true,
-                anim_tick: 0,
-            };
-        }
-        crate::renderer::TimerOverlay::default()
-    }
-}
-
-struct TentApp {
-    proxy: EventLoopProxy<AppEvent>,
-    initial_state: Option<SavedState>,
-    daemon: Option<DaemonClient>,
+pub(crate) struct TentApp {
+    pub(crate) proxy: EventLoopProxy<AppEvent>,
+    pub(crate) initial_state: Option<SavedState>,
+    pub(crate) daemon: Option<DaemonClient>,
     /// 初回接続時に取得した常駐デーモンの PID（メモリ合算用。デーモン異常終了後に PID が再利用される可能性は極めて低いため接続時値を保持）
-    daemon_pid: Option<i32>,
-    daemon_rx: Option<Receiver<DaemonEvent>>,
+    pub(crate) daemon_pid: Option<i32>,
+    pub(crate) daemon_rx: Option<Receiver<DaemonEvent>>,
 
-    window: Option<Arc<Window>>,
-    renderer: Option<Renderer>,
-    workspace: Option<Workspace>,
-    browsers: BrowserManager,
-    layout: Option<AppLayout>,
-    sidebar_state: SidebarState,
-    key_encoder: Encoder,
+    pub(crate) window: Option<Arc<Window>>,
+    pub(crate) renderer: Option<Renderer>,
+    pub(crate) workspace: Option<Workspace>,
+    pub(crate) browsers: BrowserManager,
+    pub(crate) layout: Option<AppLayout>,
+    pub(crate) sidebar_state: SidebarState,
+    pub(crate) key_encoder: Encoder,
 
-    modifiers: ModifiersState,
-    cursor_pos: (f32, f32),
-    window_focused: bool,
-    last_redraw: Instant,
-    last_cwd_poll: Instant,
-    last_battery_poll: Instant,
-    battery_status: Arc<Mutex<Option<macos::BatteryStatus>>>,
-    wifi_status: Arc<Mutex<Option<macos::WifiStatus>>>,
-    last_memory_poll: Instant,
-    memory_overlay: crate::renderer::MemoryOverlay,
-    last_snapshot_poll: Instant,
-    last_restore_step: Instant,
-    restore_queue: VecDeque<usize>,
-    was_any_outputting: bool,
-    pending_redraw: bool,
-    ime_preedit: String,
-    last_ime_area: Option<(i32, i32, u32, u32)>,
-    scroll_accum_px: f32,
+    pub(crate) modifiers: ModifiersState,
+    pub(crate) cursor_pos: (f32, f32),
+    pub(crate) window_focused: bool,
+    pub(crate) last_redraw: Instant,
+    pub(crate) last_cwd_poll: Instant,
+    pub(crate) last_battery_poll: Instant,
+    pub(crate) battery_status: Arc<Mutex<Option<macos::BatteryStatus>>>,
+    pub(crate) wifi_status: Arc<Mutex<Option<macos::WifiStatus>>>,
+    pub(crate) last_memory_poll: Instant,
+    pub(crate) memory_overlay: crate::renderer::MemoryOverlay,
+    pub(crate) last_snapshot_poll: Instant,
+    pub(crate) last_restore_step: Instant,
+    pub(crate) restore_queue: VecDeque<usize>,
+    pub(crate) was_any_outputting: bool,
+    pub(crate) pending_redraw: bool,
+    pub(crate) ime_preedit: String,
+    pub(crate) last_ime_area: Option<(i32, i32, u32, u32)>,
+    pub(crate) scroll_accum_px: f32,
 
-    slot_drag: Option<SlotDragState>,
-    divider_drag: Option<DividerDragState>,
-    hovered_divider: Option<crate::slot::SplitAxis>,
-    cursor_kind: macos::AppCursorKind,
-    selection: Option<SelectionState>,
-    last_click: Option<ClickTracker>,
-    last_autoscroll: Instant,
-    hovered_url: Option<(PaneId, UrlMatch)>,
-    url_bar_edit: Option<UrlBarEdit>,
-    search: Option<SearchState>,
-    show_help: bool,
-    restart_requested: bool,
-    daemon_version_mismatch: bool,
-    daemon_upgrade_confirm_until: Option<Instant>,
-    version_copied_until: Option<Instant>,
-    status_timer: StatusTimerState,
+    pub(crate) slot_drag: Option<SlotDragState>,
+    pub(crate) divider_drag: Option<DividerDragState>,
+    pub(crate) hovered_divider: Option<crate::slot::SplitAxis>,
+    pub(crate) cursor_kind: macos::AppCursorKind,
+    pub(crate) selection: Option<SelectionState>,
+    pub(crate) last_click: Option<ClickTracker>,
+    pub(crate) last_autoscroll: Instant,
+    pub(crate) hovered_url: Option<(PaneId, UrlMatch)>,
+    pub(crate) url_bar_edit: Option<UrlBarEdit>,
+    pub(crate) search: Option<SearchState>,
+    pub(crate) show_help: bool,
+    pub(crate) restart_requested: bool,
+    pub(crate) daemon_version_mismatch: bool,
+    pub(crate) daemon_upgrade_confirm_until: Option<Instant>,
+    pub(crate) version_copied_until: Option<Instant>,
+    pub(crate) status_timer: StatusTimerState,
 }
 
 impl TentApp {
@@ -350,7 +159,7 @@ impl TentApp {
         }
     }
 
-    fn pane_gap(&self) -> f32 {
+    pub(crate) fn pane_gap(&self) -> f32 {
         let scale = self
             .window
             .as_ref()
@@ -375,7 +184,7 @@ impl TentApp {
     }
 
     /// WKWebView の最新 URL（YouTube 等の SPA 遷移含む）を Workspace へ同期する
-    fn sync_live_browser_urls(&mut self) -> bool {
+    pub(crate) fn sync_live_browser_urls(&mut self) -> bool {
         let Some(ws) = self.workspace.as_mut() else {
             return false;
         };
@@ -388,7 +197,7 @@ impl TentApp {
         changed
     }
 
-    fn save_state(&mut self) {
+    pub(crate) fn save_state(&mut self) {
         self.sync_live_browser_urls();
         if let Some(ws) = &self.workspace {
             let state = SavedState {
@@ -402,7 +211,7 @@ impl TentApp {
     }
 
     /// 現在のアクティブスロットのブラウザ表示・位置・破棄を WKWebView へ同期する
-    fn sync_browsers(&mut self) {
+    pub(crate) fn sync_browsers(&mut self) {
         let (Some(window), Some(ws)) = (&self.window, &self.workspace) else {
             return;
         };
@@ -439,7 +248,7 @@ impl TentApp {
         }
     }
 
-    fn drain_daemon_events(&mut self) -> bool {
+    pub(crate) fn drain_daemon_events(&mut self) -> bool {
         let (Some(rx), Some(workspace)) = (self.daemon_rx.as_ref(), self.workspace.as_mut()) else {
             return false;
         };
@@ -508,7 +317,7 @@ impl TentApp {
         changed
     }
 
-    fn recompute_layout_and_resize(&mut self) {
+    pub(crate) fn recompute_layout_and_resize(&mut self) {
         let Some(window) = &self.window else {
             return;
         };
@@ -532,14 +341,14 @@ impl TentApp {
         self.request_redraw_now();
     }
 
-    fn request_redraw_now(&mut self) {
+    pub(crate) fn request_redraw_now(&mut self) {
         self.pending_redraw = false;
         if let Some(window) = &self.window {
             window.request_redraw();
         }
     }
 
-    fn request_redraw_throttled(&mut self) {
+    pub(crate) fn request_redraw_throttled(&mut self) {
         let now = Instant::now();
         if now.duration_since(self.last_redraw) >= FRAME_INTERVAL {
             self.request_redraw_now();
@@ -548,7 +357,7 @@ impl TentApp {
         }
     }
 
-    fn update_control_flow(&self, event_loop: &ActiveEventLoop) {
+    pub(crate) fn update_control_flow(&self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
         if self.pending_redraw {
             let next = self.last_redraw + FRAME_INTERVAL;
@@ -585,7 +394,7 @@ impl TentApp {
     }
 
     /// 出力・リサイズ等により再検索が保留中であれば、次に自動再検索すべき時刻を返す
-    fn search_resync_due_at(&self) -> Option<Instant> {
+    pub(crate) fn search_resync_due_at(&self) -> Option<Instant> {
         let search = self.search.as_ref()?;
         let SearchTarget::Terminal(pid) = search.target else {
             return None;
@@ -607,7 +416,7 @@ impl TentApp {
         }
     }
 
-    fn can_autoscroll_selection(&self) -> bool {
+    pub(crate) fn can_autoscroll_selection(&self) -> bool {
         let Some(sel) = &self.selection else {
             return false;
         };
@@ -625,7 +434,7 @@ impl TentApp {
             .is_some_and(|pane| !pane.is_alt_screen())
     }
 
-    fn pixel_to_cell(&self, pane_rect: Rect, px: f32, py: f32) -> (u16, u16) {
+    pub(crate) fn pixel_to_cell(&self, pane_rect: Rect, px: f32, py: f32) -> (u16, u16) {
         let Some(renderer) = &self.renderer else {
             return (0, 0);
         };
@@ -703,7 +512,7 @@ impl TentApp {
         }
     }
 
-    fn update_url_hover(&mut self) {
+    pub(crate) fn update_url_hover(&mut self) {
         let next = if self.modifiers.super_key() && self.slot_drag.is_none() {
             let (px, py) = self.cursor_pos;
             let hit = self.workspace.as_ref().and_then(|ws| ws.pane_at(px, py));
@@ -757,766 +566,7 @@ impl TentApp {
     }
 }
 
-impl ApplicationHandler<AppEvent> for TentApp {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
-        }
-
-        let saved = self
-            .initial_state
-            .take()
-            .unwrap_or_else(SavedState::default_home);
-        self.sidebar_state = saved.sidebar_state;
-
-        let mut attrs = Window::default_attributes().with_title("TenT");
-        if let Some(geom) = saved.window_geometry {
-            attrs = attrs
-                .with_inner_size(LogicalSize::new(
-                    f64::from(geom.width),
-                    f64::from(geom.height),
-                ))
-                .with_position(LogicalPosition::new(geom.x, geom.y));
-        } else {
-            attrs = attrs.with_inner_size(LogicalSize::new(1440.0, 880.0));
-        }
-        let window = Arc::new(
-            event_loop
-                .create_window(attrs)
-                .expect("failed to create window"),
-        );
-        window.set_ime_allowed(true);
-
-        // Dock / Cmd+Tab に TenT のカスタムアイコンを適用
-        macos::install_app_icon();
-        // WKWebView フォーカス中でも Cmd+1..0 / Cmd+B / Cmd+L 等を拾えるようにする
-        install_macos_shortcut_monitor(self.proxy.clone());
-        // Finder ファイル・スクショ右下サムネイル等の D&D を確実に受け取る
-        macos::install_file_drop_handler(&window, self.proxy.clone());
-        // WKWebView 上の CSS カーソル（リンクのポインタ等）が WinitView に上書きされないようにする
-        macos::install_cursor_rect_passthrough(&window);
-
-        let scale = window.scale_factor() as f32;
-        let gap = (6.0 * scale).round();
-        let size = window.inner_size();
-        let layout = AppLayout::compute(size.width, size.height, scale, self.sidebar_state);
-
-        let renderer =
-            Renderer::new(Arc::clone(&window), scale).expect("failed to initialize wgpu renderer");
-
-        // デーモンへ接続（未起動なら自動デタッチ起動）し、生きたペインをすべて再接続
-        // スリープや描画停止中に GUI 側キューが際限なく膨張するのを防ぐため有界チャネルを使用し、
-        // 詰まった際はデーモン側の 16MB ガード＋自動スナップショット再同期へバックプレッシャーを返す
-        let (ev_tx, ev_rx) = mpsc::sync_channel::<DaemonEvent>(DAEMON_EVENT_QUEUE_CAPACITY);
-        let proxy_for_daemon = self.proxy.clone();
-        let sock_path = default_socket_path();
-        let attach = DaemonClient::connect_or_spawn(&sock_path, true, move |ev| {
-            let _ = ev_tx.send(ev);
-            let _ = proxy_for_daemon.send_event(AppEvent::DaemonReady);
-        })
-        .expect("failed to connect to tent daemon");
-
-        let workspace = Workspace::from_session(
-            layout.main_inner_rect,
-            gap,
-            renderer.cell_w,
-            renderer.cell_h,
-            saved.slots,
-            saved.active_slot,
-            attach.replayed_panes,
-            attach.next_pane_id,
-            attach.client.clone(),
-        );
-
-        let restore_queue: VecDeque<usize> = workspace.slots_needing_restore().into();
-
-        self.daemon = Some(attach.client);
-        self.daemon_pid = attach.daemon_pid;
-        self.daemon_rx = Some(ev_rx);
-        self.daemon_version_mismatch = attach.daemon_version_mismatch;
-        self.window = Some(window);
-        self.renderer = Some(renderer);
-        self.workspace = Some(workspace);
-        self.layout = Some(layout);
-        self.restore_queue = restore_queue;
-        self.last_restore_step = Instant::now();
-
-        self.sync_browsers();
-        self.save_state();
-        self.request_redraw_now();
-    }
-
-    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        self.save_state();
-        if self.restart_requested {
-            spawn_replacement_instance();
-        }
-    }
-
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
-        match event {
-            AppEvent::DaemonReady => {
-                if self.drain_daemon_events() {
-                    self.request_redraw_throttled();
-                }
-                self.update_control_flow(event_loop);
-            }
-            AppEvent::Shortcut(shortcut) => {
-                self.modifiers = current_macos_modifiers();
-                self.handle_shortcut(shortcut);
-                if self.restart_requested {
-                    event_loop.exit();
-                    return;
-                }
-                self.update_control_flow(event_loop);
-            }
-            AppEvent::WebViewClicked { px, py } => {
-                let mut changed = self.url_bar_edit.take().is_some();
-                if self.search.is_some() {
-                    self.close_search();
-                    changed = true;
-                }
-                if let Some(ws) = self.workspace.as_mut()
-                    && ws.focus_pane_at(px, py).is_some()
-                {
-                    changed = true;
-                }
-                if changed {
-                    self.request_redraw_now();
-                }
-            }
-            AppEvent::WebViewHovered { px, py } => {
-                if !self.window_focused
-                    || self.show_help
-                    || self.slot_drag.is_some()
-                    || self.url_bar_edit.is_some()
-                    || self.search.is_some()
-                {
-                    return;
-                }
-                let needs_focus = self.workspace.as_ref().is_some_and(|ws| {
-                    ws.pane_at(px, py).is_some_and(|(pid, _)| {
-                        ws.active_slot_ref().active_focused_pane() != Some(pid)
-                    })
-                });
-                if needs_focus {
-                    if let Some(ws) = self.workspace.as_mut() {
-                        ws.focus_pane_at(px, py);
-                    }
-                    self.sync_browsers();
-                    self.request_redraw_now();
-                }
-            }
-            AppEvent::BrowserUrlChanged { pane_id, url } => {
-                // サブフレームの URL で上書きされないよう、実メインフレームの URL を優先して同期
-                let live_changed = self.sync_live_browser_urls();
-                let mut changed = live_changed;
-                if !live_changed
-                    && (url.starts_with("http://") || url.starts_with("https://"))
-                    && let Some(ws) = self.workspace.as_mut()
-                    && ws.update_browser_url(pane_id, url)
-                {
-                    changed = true;
-                }
-                if changed {
-                    self.last_snapshot_poll =
-                        Instant::now() - SNAPSHOT_POLL_INTERVAL + Duration::from_millis(500);
-                    self.save_state();
-                    self.request_redraw_now();
-                }
-            }
-            AppEvent::BrowserTitleChanged { pane_id, title } => {
-                let url_changed = self.sync_live_browser_urls();
-                let title_changed = self
-                    .workspace
-                    .as_mut()
-                    .is_some_and(|ws| ws.update_browser_title(pane_id, title));
-                if url_changed {
-                    self.save_state();
-                }
-                if url_changed || title_changed {
-                    self.last_snapshot_poll =
-                        Instant::now() - SNAPSHOT_POLL_INTERVAL + Duration::from_millis(300);
-                    self.request_redraw_now();
-                }
-            }
-            AppEvent::BrowserSnapshot {
-                pane_id,
-                width,
-                height,
-                rgba,
-            } => {
-                if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.update_browser_snapshot(pane_id, width, height, &rgba);
-                    self.request_redraw_now();
-                }
-            }
-            AppEvent::BrowserAudioState {
-                pane_id,
-                is_playing,
-            } => {
-                if let Some(ws) = self.workspace.as_mut()
-                    && ws.update_browser_audio(pane_id, is_playing)
-                {
-                    self.request_redraw_now();
-                }
-            }
-            AppEvent::BrowserOpenNewWindow { pane_id, url } => {
-                // target="_blank" や window.open() のリンクは同じブラウザタブ内で開く（戻るで戻れる）
-                if let Some(ws) = self.workspace.as_mut() {
-                    ws.update_browser_url(pane_id, url.clone());
-                }
-                self.browsers.navigate(pane_id, &url);
-                self.save_state();
-                self.request_redraw_now();
-            }
-            AppEvent::BrowserSwipePreview {
-                dir,
-                progress,
-                ready,
-            } => {
-                if let Some(b) = self.workspace.as_ref().and_then(Workspace::focused_browser) {
-                    self.browsers.set_swipe_preview(b.id, dir, progress, ready);
-                }
-            }
-            AppEvent::DragHover { px, py } => {
-                if let Some(ws) = self.workspace.as_mut() {
-                    let needs_focus = ws
-                        .pane_at(px, py)
-                        .is_some_and(|(pid, _)| ws.active_slot_ref().focused_pane != Some(pid));
-                    if needs_focus {
-                        ws.focus_pane_at(px, py);
-                        self.request_redraw_now();
-                    }
-                }
-            }
-            AppEvent::DroppedFiles { paths, pos } => {
-                if paths.is_empty() {
-                    return;
-                }
-                let mut escaped = String::new();
-                for path in &paths {
-                    escaped.push_str(&macos::shell_escape_path(path));
-                    escaped.push(' ');
-                }
-                if let Some(ws) = self.workspace.as_mut() {
-                    if let Some((px, py)) = pos {
-                        ws.focus_pane_at(px, py);
-                    }
-                    if ws.active_slot_ref().is_dormant() {
-                        let idx = ws.active_slot;
-                        ws.ensure_slot_started(idx);
-                    }
-                    if let Some(pane) = ws.active_pane_mut() {
-                        pane.terminal
-                            .scroll_viewport(ghostty_vt::terminal::ScrollViewport::Bottom);
-                        pane.mark_dirty();
-                        pane.paste_text(&escaped);
-                        self.request_redraw_now();
-                    }
-                }
-            }
-        }
-    }
-
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let now = Instant::now();
-        let mut need_redraw = false;
-
-        if self.drain_daemon_events() {
-            self.request_redraw_throttled();
-        } else if self.pending_redraw && now.duration_since(self.last_redraw) >= FRAME_INTERVAL {
-            need_redraw = true;
-        }
-
-        if let Some(ws) = self.workspace.as_mut() {
-            if ws.update_waiting_states(now) {
-                need_redraw = true;
-            }
-            let now_outputting = ws.has_any_active_output(now);
-            if self.was_any_outputting && !now_outputting {
-                need_redraw = true;
-            }
-            self.was_any_outputting = now_outputting;
-        }
-
-        if self.search_resync_due_at().is_some_and(|due| now >= due) {
-            need_redraw = true;
-        }
-
-        // 起動後の段階的セッション復旧（アクティブスロットの後、残りスロットを1つずつ順次復旧）
-        if !self.restore_queue.is_empty()
-            && now.duration_since(self.last_restore_step) >= RESTORE_STEP_INTERVAL
-            && let Some(slot_idx) = self.restore_queue.pop_front()
-        {
-            self.last_restore_step = now;
-            if let Some(ws) = self.workspace.as_mut() {
-                if ws.slots[slot_idx].saved_tree.is_some() && ws.slots[slot_idx].root.is_none() {
-                    ws.ensure_slot_started(slot_idx);
-                }
-                let slot_browsers = ws.browsers_in_slot(slot_idx);
-                if let Some(window) = &self.window {
-                    let scale = window.scale_factor();
-                    for (bid, rect, url) in slot_browsers {
-                        self.browsers.warm_up_hidden(window, bid, rect, &url, scale);
-                    }
-                }
-                need_redraw = true;
-            }
-        }
-
-        if now.duration_since(self.last_cwd_poll) >= CWD_POLL_INTERVAL {
-            self.last_cwd_poll = now;
-            if let Some(daemon) = &self.daemon {
-                daemon.query_cwds();
-            }
-            if self.browsers.has_any_views() {
-                self.browsers.poll_audio_states();
-            }
-            if self.sync_live_browser_urls() {
-                self.save_state();
-            }
-            if now.duration_since(self.last_memory_poll) >= MEMORY_POLL_INTERVAL {
-                self.last_memory_poll = now;
-                let self_bytes =
-                    macos::get_pid_memory_bytes(std::process::id() as i32).unwrap_or(0);
-                let daemon_bytes = self
-                    .daemon_pid
-                    .and_then(macos::get_pid_memory_bytes)
-                    .unwrap_or(0);
-                self.memory_overlay = crate::renderer::MemoryOverlay::from_bytes(
-                    self_bytes.saturating_add(daemon_bytes),
-                );
-            }
-            if now.duration_since(self.last_battery_poll) >= BATTERY_POLL_INTERVAL {
-                self.last_battery_poll = now;
-                let batt_slot = Arc::clone(&self.battery_status);
-                let wifi_slot = Arc::clone(&self.wifi_status);
-                std::thread::spawn(move || {
-                    let batt = macos::read_battery_status();
-                    if let Ok(mut guard) = batt_slot.lock() {
-                        *guard = batt;
-                    }
-                    let wifi = macos::read_wifi_status();
-                    if let Ok(mut guard) = wifi_slot.lock() {
-                        *guard = Some(wifi);
-                    }
-                });
-            }
-            // 上部ステータスバーの秒表示時計を更新
-            need_redraw = true;
-        }
-
-        if self.browsers.has_any_views()
-            && now.duration_since(self.last_snapshot_poll) >= SNAPSHOT_POLL_INTERVAL
-        {
-            self.last_snapshot_poll = now;
-            if let Some(ws) = &self.workspace {
-                let mut target_ids = Vec::new();
-                for (i, slot) in ws.slots.iter().enumerate() {
-                    if self.sidebar_state.is_col_collapsed(i / 5) {
-                        continue;
-                    }
-                    if slot.view_mode == crate::slot::SlotViewMode::Browser {
-                        if let Some(broot) = &slot.browser_root {
-                            broot.for_each_browser(&mut |b| target_ids.push(b.id));
-                        }
-                    } else if let Some(root) = &slot.root {
-                        root.for_each_browser(&mut |b| target_ids.push(b.id));
-                    }
-                }
-                self.browsers.capture_snapshots(&target_ids);
-            }
-        }
-
-        if let Some(deadline) = self.daemon_upgrade_confirm_until
-            && now >= deadline
-        {
-            self.daemon_upgrade_confirm_until = None;
-            need_redraw = true;
-        }
-        if let Some(deadline) = self.version_copied_until
-            && now >= deadline
-        {
-            self.version_copied_until = None;
-            need_redraw = true;
-        }
-
-        if let Some(end) = self.status_timer.end_at {
-            if now >= end {
-                self.status_timer.end_at = None;
-                self.status_timer.last_anim_step = None;
-                self.status_timer.finished = true;
-                macos::play_system_bell();
-                macos::send_notification(
-                    "TenT Timer".to_string(),
-                    "タイマーが終了しました".to_string(),
-                );
-                need_redraw = true;
-            } else if self
-                .status_timer
-                .last_anim_step
-                .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(150))
-            {
-                self.status_timer.last_anim_step = Some(now);
-                self.status_timer.anim_tick = self.status_timer.anim_tick.wrapping_add(1);
-                need_redraw = true;
-            }
-        }
-
-        // ドラッグ選択中のペイン上下端オートスクロール（ペイン外へのドラッグ時のみ）
-        if self.can_autoscroll_selection()
-            && now.duration_since(self.last_autoscroll) >= AUTOSCROLL_INTERVAL
-        {
-            self.last_autoscroll = now;
-            if let Some(sel) = &self.selection {
-                let pid = sel.pane_id;
-                let cell_h = self.renderer.as_ref().map(|r| r.cell_h).unwrap_or(20.0);
-                let delta = selection_autoscroll_delta(self.cursor_pos.1, sel.pane_rect, cell_h);
-                let mut moved = false;
-                if delta != 0
-                    && let Some(ws) = self.workspace.as_mut()
-                    && let Some(root) = ws.active_slot_mut().root.as_mut()
-                    && let Some(pane) = root.terminal_pane_mut(pid)
-                    && !pane.is_alt_screen()
-                {
-                    let before_top = pane.viewport_top_screen_row();
-                    pane.terminal
-                        .scroll_viewport(ghostty_vt::terminal::ScrollViewport::Delta(delta));
-                    let after_top = pane.viewport_top_screen_row();
-                    if after_top != before_top {
-                        pane.mark_dirty();
-                        moved = true;
-                    }
-                }
-                if moved {
-                    let (px, py) = self.cursor_pos;
-                    let _ = self.extend_selection_to_cursor(px, py);
-                    need_redraw = true;
-                }
-            }
-        }
-
-        if need_redraw {
-            self.request_redraw_now();
-        }
-        self.update_control_flow(event_loop);
-    }
-
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
-        event: WindowEvent,
-    ) {
-        self.handle_window_event(event_loop, event);
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum TopLevelJsonValue {
-    Str(String),
-    Bool(bool),
-    Null,
-    Other,
-}
-
-fn skip_json_ws(bytes: &[u8], mut i: usize) -> usize {
-    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\r' | b'\n') {
-        i += 1;
-    }
-    i
-}
-
-/// JSON 文字列リテラル（開始の `"` 位置から）を読み取り、デコード済み文字列と終了の次のバイト位置を返す
-fn parse_json_string(input: &str, start: usize) -> Option<(String, usize)> {
-    let bytes = input.as_bytes();
-    if bytes.get(start) != Some(&b'"') {
-        return None;
-    }
-    let mut out = String::new();
-    let mut i = start + 1;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' => return Some((out, i + 1)),
-            b'\\' => {
-                i += 1;
-                let esc = *bytes.get(i)?;
-                match esc {
-                    b'"' => out.push('"'),
-                    b'\\' => out.push('\\'),
-                    b'/' => out.push('/'),
-                    b'b' => out.push('\u{0008}'),
-                    b'f' => out.push('\u{000C}'),
-                    b'n' => out.push('\n'),
-                    b'r' => out.push('\r'),
-                    b't' => out.push('\t'),
-                    b'u' => {
-                        let hex = input.get(i + 1..i + 5)?;
-                        let code = u16::from_str_radix(hex, 16).ok()?;
-                        if let Some(ch) = char::from_u32(u32::from(code)) {
-                            out.push(ch);
-                        }
-                        i += 4;
-                    }
-                    _ => return None,
-                }
-                i += 1;
-            }
-            _ => {
-                let ch = input[i..].chars().next()?;
-                out.push(ch);
-                i += ch.len_utf8();
-            }
-        }
-    }
-    None
-}
-
-/// ネストされた JSON オブジェクトまたは配列（開始の `{` / `[` 位置から）を対応する閉じ括弧の次までスキップする
-fn skip_json_nested(input: &str, start: usize) -> Option<usize> {
-    let bytes = input.as_bytes();
-    let mut i = start;
-    let mut depth = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' => {
-                let (_, next) = parse_json_string(input, i)?;
-                i = next;
-            }
-            b'{' | b'[' => {
-                depth += 1;
-                i += 1;
-            }
-            b'}' | b']' => {
-                depth = depth.checked_sub(1)?;
-                i += 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    None
-}
-
-/// JSON オブジェクトのトップレベルフィールドのみを解析する軽量パーサ（ネスト内の同名キーは拾わない）
-fn parse_top_level_json_object(input: &str) -> Vec<(String, TopLevelJsonValue)> {
-    let bytes = input.as_bytes();
-    let mut i = skip_json_ws(bytes, 0);
-    if bytes.get(i) != Some(&b'{') {
-        return Vec::new();
-    }
-    i = skip_json_ws(bytes, i + 1);
-    let mut fields = Vec::new();
-    if bytes.get(i) == Some(&b'}') {
-        return fields;
-    }
-
-    while i < bytes.len() {
-        let Some((key, next)) = parse_json_string(input, i) else {
-            break;
-        };
-        i = skip_json_ws(bytes, next);
-        if bytes.get(i) != Some(&b':') {
-            break;
-        }
-        i = skip_json_ws(bytes, i + 1);
-
-        let val = match bytes.get(i).copied() {
-            Some(b'"') => {
-                let Some((s, next)) = parse_json_string(input, i) else {
-                    break;
-                };
-                i = next;
-                TopLevelJsonValue::Str(s)
-            }
-            Some(b'{') | Some(b'[') => {
-                let Some(next) = skip_json_nested(input, i) else {
-                    break;
-                };
-                i = next;
-                TopLevelJsonValue::Other
-            }
-            Some(_) => {
-                let val_start = i;
-                while i < bytes.len()
-                    && !matches!(bytes[i], b',' | b'}' | b' ' | b'\t' | b'\r' | b'\n')
-                {
-                    i += 1;
-                }
-                match &input[val_start..i] {
-                    "true" => TopLevelJsonValue::Bool(true),
-                    "false" => TopLevelJsonValue::Bool(false),
-                    "null" => TopLevelJsonValue::Null,
-                    _ => TopLevelJsonValue::Other,
-                }
-            }
-            None => break,
-        };
-        fields.push((key, val));
-
-        i = skip_json_ws(bytes, i);
-        match bytes.get(i).copied() {
-            Some(b',') => i = skip_json_ws(bytes, i + 1),
-            Some(b'}') => break,
-            _ => break,
-        }
-    }
-    fields
-}
-
-fn json_top_str<'a>(fields: &'a [(String, TopLevelJsonValue)], key: &str) -> Option<&'a str> {
-    fields.iter().find_map(|(k, v)| match v {
-        TopLevelJsonValue::Str(s) if k == key => Some(s.as_str()),
-        _ => None,
-    })
-}
-
-fn json_top_bool(fields: &[(String, TopLevelJsonValue)], key: &str) -> Option<bool> {
-    fields.iter().find_map(|(k, v)| match v {
-        TopLevelJsonValue::Bool(b) if k == key => Some(*b),
-        _ => None,
-    })
-}
-
-fn agy_hook_stdout_json(event_override: Option<&str>, stdin_payload: &str) -> &'static str {
-    // agy の PreToolUse 契約は decision フィールドを必須とするため、PreToolUse 時は {"decision":"allow"} を返す
-    let is_pre_tool_use = event_override.is_some_and(|e| {
-        matches!(
-            e.to_ascii_lowercase().as_str(),
-            "pre-tool-use" | "pretooluse"
-        )
-    }) || {
-        let fields = parse_top_level_json_object(stdin_payload);
-        json_top_str(&fields, "hookEventName") == Some("PreToolUse")
-    };
-    if is_pre_tool_use {
-        "{\"decision\":\"allow\"}"
-    } else {
-        "{}"
-    }
-}
-
-fn resolve_hook_state_from_stdin(
-    base_state: daemon::AiHookState,
-    tool: Option<daemon::AiTool>,
-    stdin_payload: &str,
-) -> Option<daemon::AiHookState> {
-    let fields = parse_top_level_json_object(stdin_payload);
-
-    // agy の Stop フックはユーザー自身が Ctrl+C 等でキャンセルした場合にも発火するため、
-    // terminationReason が USER_CANCELED なら fullyIdle の値にかかわらず Idle としてクリアする
-    if base_state == daemon::AiHookState::Waiting
-        && tool == Some(daemon::AiTool::Agy)
-        && json_top_str(&fields, "terminationReason") == Some("USER_CANCELED")
-    {
-        return Some(daemon::AiHookState::Idle);
-    }
-
-    // Claude Code / Codex のサブエージェント専用イベント（SubagentStop / SubagentStart）は無視する
-    let hook_event_name = json_top_str(&fields, "hook_event_name");
-    if matches!(hook_event_name, Some("SubagentStop" | "SubagentStart")) {
-        return None;
-    }
-
-    // Claude Code / Codex でトップレベルに非空の agent_id があるサブエージェント由来イベントは、
-    // ユーザー許可待ち（PermissionRequest / Notification）と作業中（Working）は親ペインへ通し、
-    // サブエージェントの完了／終了（Stop / StopFailure / Idle 等）のみ無視する
-    if matches!(tool, Some(daemon::AiTool::Claude | daemon::AiTool::Codex))
-        && json_top_str(&fields, "agent_id").is_some_and(|id| !id.is_empty())
-    {
-        let is_user_prompt = matches!(hook_event_name, Some("PermissionRequest" | "Notification"));
-        if !is_user_prompt && base_state != daemon::AiHookState::Working {
-            return None;
-        }
-    }
-
-    // agy の Stop フックでバックグラウンドタスクがまだ残っている（fullyIdle: false）場合は
-    // 入力待ち（黄）にせず作業中（緑）のまま維持する
-    if base_state == daemon::AiHookState::Waiting
-        && tool == Some(daemon::AiTool::Agy)
-        && json_top_bool(&fields, "fullyIdle") == Some(false)
-    {
-        return None;
-    }
-
-    Some(base_state)
-}
-
-/// AI フックから呼び出される軽量 CLI (`tent hook <working|waiting|idle> [--tool claude|agy|codex] [--event pre-tool-use]`)。
-/// TenT 外で実行された場合やデーモン未接続時は何もせず正常終了（exit 0）し、AI の動作を絶対に妨げない。
-fn run_hook_cli(mut args: impl Iterator<Item = String>) {
-    use std::io::{IsTerminal, Read};
-
-    let state_arg = args.next();
-    let base_state = state_arg
-        .as_deref()
-        .and_then(daemon::AiHookState::parse_name);
-    let mut tool: Option<daemon::AiTool> = None;
-    let mut event_override: Option<String> = None;
-    let mut pane_id_override: Option<PaneId> = None;
-    let mut sock_override: Option<PathBuf> = None;
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--tool" => {
-                if let Some(val) = args.next() {
-                    tool = daemon::AiTool::parse_name(&val);
-                }
-            }
-            "--event" => {
-                event_override = args.next();
-            }
-            "--pane-id" => {
-                if let Some(val) = args.next() {
-                    pane_id_override = val.parse::<PaneId>().ok();
-                }
-            }
-            "--socket" => {
-                if let Some(val) = args.next() {
-                    sock_override = Some(PathBuf::from(val));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // パイプ経由で渡されたフック JSON を読み込む（TTY からの手動実行時はブロックしない）
-    let mut stdin_payload = String::new();
-    if !std::io::stdin().is_terminal() {
-        let _ = std::io::stdin()
-            .take(64 * 1024)
-            .read_to_string(&mut stdin_payload);
-    }
-
-    if let Some(base_state) = base_state
-        && let Some(state) = resolve_hook_state_from_stdin(base_state, tool, &stdin_payload)
-    {
-        let pane_id = pane_id_override.or_else(|| {
-            std::env::var("TENT_PANE_ID")
-                .ok()
-                .and_then(|s| s.parse::<PaneId>().ok())
-        });
-        if let Some(pane_id) = pane_id {
-            let sock_path = sock_override
-                .or_else(|| std::env::var_os("TENT_SOCKET").map(PathBuf::from))
-                .unwrap_or_else(default_socket_path);
-            let _ = daemon::send_hook_event(&sock_path, pane_id, state, tool);
-        }
-    }
-
-    // agy のフック契約は stdout に有効な JSON オブジェクトを返すことを要求する（不正引数時も含む）
-    if tool == Some(daemon::AiTool::Agy) {
-        println!(
-            "{}",
-            agy_hook_stdout_json(event_override.as_deref(), &stdin_payload)
-        );
-    }
-}
-
-fn spawn_replacement_instance() {
+pub(crate) fn spawn_replacement_instance() {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -1573,7 +623,7 @@ fn main() {
             return;
         }
         Some("hook") => {
-            run_hook_cli(args);
+            hook_cli::run_hook_cli(args);
             return;
         }
         _ => {}
@@ -1590,258 +640,6 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_status_timer_snap_and_shift_override() {
-        let rect = Rect::new(100.0, 0.0, 120.0, 20.0); // 2px = 1分, right=220 (0m), left=100 (60m)
-        // 右端 = 0分、左端 = 60分
-        assert_eq!(StatusTimerState::minutes_from_x(rect, 220.0, false), 0);
-        assert_eq!(StatusTimerState::minutes_from_x(rect, 100.0, false), 60);
-
-        // 23分相当 (220 - 46 = 174) は通常ドラッグで 25分にスナップ
-        assert_eq!(StatusTimerState::minutes_from_x(rect, 174.0, false), 25);
-        // Shift+ドラッグでスナップ無効 → 23分のまま
-        assert_eq!(StatusTimerState::minutes_from_x(rect, 174.0, true), 23);
-
-        // 5 / 15 / 45 分のスナップ確認
-        assert_eq!(StatusTimerState::minutes_from_x(rect, 212.0, false), 5); // 4分 → 5分
-        assert_eq!(StatusTimerState::minutes_from_x(rect, 188.0, false), 15); // 16分 → 15分
-        assert_eq!(StatusTimerState::minutes_from_x(rect, 132.0, false), 45); // 44分 → 45分
-    }
-
-    #[test]
-    fn test_selection_autoscroll_delta() {
-        let pane = Rect::new(0.0, 100.0, 400.0, 300.0); // y: 100..400
-        let cell_h = 20.0;
-
-        // ペイン内部（最上行の上半分・最下行の下半分を含む）ではスクロールしない
-        assert_eq!(selection_autoscroll_delta(100.0, pane, cell_h), 0);
-        assert_eq!(selection_autoscroll_delta(105.0, pane, cell_h), 0);
-        assert_eq!(selection_autoscroll_delta(250.0, pane, cell_h), 0);
-        assert_eq!(selection_autoscroll_delta(395.0, pane, cell_h), 0);
-        assert_eq!(selection_autoscroll_delta(400.0, pane, cell_h), 0);
-
-        // ペイン上端の外は負方向（上スクロール）
-        assert_eq!(selection_autoscroll_delta(95.0, pane, cell_h), -1);
-        assert!(selection_autoscroll_delta(60.0, pane, cell_h) < -1);
-        assert_eq!(selection_autoscroll_delta(-500.0, pane, cell_h), -4);
-
-        // ペイン下端の外は正方向（下スクロール）
-        assert_eq!(selection_autoscroll_delta(405.0, pane, cell_h), 1);
-        assert!(selection_autoscroll_delta(440.0, pane, cell_h) > 1);
-        assert_eq!(selection_autoscroll_delta(1000.0, pane, cell_h), 4);
-    }
-
-    #[test]
-    fn test_hook_cli_helpers_and_ai_process_detection() {
-        use std::path::Path;
-
-        use crate::daemon::{AiHookState, AiTool};
-
-        // agy の Stop フックは USER_CANCELED なら fullyIdle に関わらず Idle、
-        // それ以外で fullyIdle: false なら無視（None）、fullyIdle: true なら Waiting
-        assert_eq!(
-            resolve_hook_state_from_stdin(
-                AiHookState::Waiting,
-                Some(AiTool::Agy),
-                r#"{"terminationReason":"USER_CANCELED","fullyIdle":false}"#,
-            ),
-            Some(AiHookState::Idle)
-        );
-        assert_eq!(
-            resolve_hook_state_from_stdin(
-                AiHookState::Waiting,
-                Some(AiTool::Agy),
-                r#"{"terminationReason":"NO_TOOL_CALL","fullyIdle":true}"#,
-            ),
-            Some(AiHookState::Waiting)
-        );
-        assert_eq!(
-            resolve_hook_state_from_stdin(
-                AiHookState::Waiting,
-                Some(AiTool::Agy),
-                r#"{"terminationReason":"NO_TOOL_CALL","fullyIdle": false}"#,
-            ),
-            None
-        );
-
-        // Claude Code / Codex の SubagentStop / SubagentStart は無視（None）
-        assert_eq!(
-            resolve_hook_state_from_stdin(
-                AiHookState::Waiting,
-                Some(AiTool::Claude),
-                r#"{"hook_event_name":"SubagentStop","agent_id":"sub-123"}"#,
-            ),
-            None
-        );
-        assert_eq!(
-            resolve_hook_state_from_stdin(
-                AiHookState::Waiting,
-                Some(AiTool::Codex),
-                r#"{"hook_event_name":"SubagentStop","agent_id":"agent-9"}"#,
-            ),
-            None
-        );
-        // サブエージェントの許可待ち（PermissionRequest / Notification）は黄色（Waiting）として通す
-        assert_eq!(
-            resolve_hook_state_from_stdin(
-                AiHookState::Waiting,
-                Some(AiTool::Claude),
-                r#"{"hook_event_name":"PermissionRequest","agent_id":"a1b2","agent_type":"general-purpose","tool_name":"Bash"}"#,
-            ),
-            Some(AiHookState::Waiting)
-        );
-        assert_eq!(
-            resolve_hook_state_from_stdin(
-                AiHookState::Waiting,
-                Some(AiTool::Claude),
-                r#"{"hook_event_name":"Notification","agent_id":"a1b2"}"#,
-            ),
-            Some(AiHookState::Waiting)
-        );
-        // サブエージェントの PostToolUse（working）はそのまま作業中として通す
-        assert_eq!(
-            resolve_hook_state_from_stdin(
-                AiHookState::Working,
-                Some(AiTool::Claude),
-                r#"{"hook_event_name":"PostToolUse","agent_id":"a1b2","tool_name":"Bash"}"#,
-            ),
-            Some(AiHookState::Working)
-        );
-        // Claude Code の stop_hook_active: true は「継続後の最終 Stop」なので Waiting として通す
-        assert_eq!(
-            resolve_hook_state_from_stdin(
-                AiHookState::Waiting,
-                Some(AiTool::Claude),
-                r#"{"hook_event_name":"Stop","stop_hook_active":true,"last_assistant_message":"done"}"#,
-            ),
-            Some(AiHookState::Waiting)
-        );
-        // agent_id が null の場合はメインエージェント扱いとして通る
-        assert_eq!(
-            resolve_hook_state_from_stdin(
-                AiHookState::Waiting,
-                Some(AiTool::Claude),
-                r#"{"hook_event_name":"Stop","agent_id": null}"#,
-            ),
-            Some(AiHookState::Waiting)
-        );
-        // ネスト内の同名キー・文字列（tool_input / tool_response / meta）には誤反応しないこと
-        assert_eq!(
-            resolve_hook_state_from_stdin(
-                AiHookState::Waiting,
-                Some(AiTool::Claude),
-                r#"{"hook_event_name":"PermissionRequest","tool_name":"mcp__x__call","tool_input":{"agent_id":"bot-42"}}"#,
-            ),
-            Some(AiHookState::Waiting)
-        );
-        assert_eq!(
-            resolve_hook_state_from_stdin(
-                AiHookState::Working,
-                Some(AiTool::Claude),
-                r#"{"hook_event_name":"PostToolUse","tool_name":"Agent","tool_response":{"status":"completed","agentId":"a9f"}}"#,
-            ),
-            Some(AiHookState::Working)
-        );
-        assert_eq!(
-            resolve_hook_state_from_stdin(
-                AiHookState::Waiting,
-                Some(AiTool::Claude),
-                r#"{"hook_event_name":"Stop","tool_input":{"event":"SubagentStop"}}"#,
-            ),
-            Some(AiHookState::Waiting)
-        );
-        assert_eq!(
-            resolve_hook_state_from_stdin(
-                AiHookState::Waiting,
-                Some(AiTool::Agy),
-                r#"{"meta":{"fullyIdle":false},"fullyIdle":true}"#,
-            ),
-            Some(AiHookState::Waiting)
-        );
-
-        // agy の PreToolUse だけは {"decision":"allow"} を返す（明示 --event または stdin）
-        assert_eq!(
-            agy_hook_stdout_json(Some("pre-tool-use"), ""),
-            r#"{"decision":"allow"}"#
-        );
-        assert_eq!(
-            agy_hook_stdout_json(
-                None,
-                r#"{"hookEventName":"PreToolUse","toolCall":{"name":"ask_question"}}"#,
-            ),
-            r#"{"decision":"allow"}"#
-        );
-        assert_eq!(
-            agy_hook_stdout_json(None, r#"{"hookEventName":"Stop"}"#),
-            "{}"
-        );
-
-        // プロセス名・ネイティブ版バージョンパス・コマンドラインからの AI 3 ツール判別
-        assert_eq!(
-            macos::detect_ai_tool_from_process(Some(Path::new("/Users/me/.local/bin/agy")), &[]),
-            Some(AiTool::Agy)
-        );
-        assert_eq!(
-            macos::detect_ai_tool_from_process(Some(Path::new("/opt/homebrew/bin/codex")), &[]),
-            Some(AiTool::Codex)
-        );
-        assert_eq!(
-            macos::detect_ai_tool_from_process(
-                Some(Path::new("/Users/x/.local/share/claude/versions/2.1.332")),
-                &[],
-            ),
-            Some(AiTool::Claude)
-        );
-        assert_eq!(
-            macos::detect_ai_tool_from_process(
-                Some(Path::new("/bin/sleep")),
-                &["/Users/x/.local/bin/claude".to_string(), "5".to_string()],
-            ),
-            Some(AiTool::Claude)
-        );
-        assert_eq!(
-            macos::detect_ai_tool_from_process(
-                Some(Path::new("/opt/homebrew/bin/node")),
-                &[
-                    "node".to_string(),
-                    "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/cli.js".to_string(),
-                ],
-            ),
-            Some(AiTool::Claude)
-        );
-        // 誤検出しないこと（一般スクリプトや別プロジェクトパス）
-        assert_eq!(
-            macos::detect_ai_tool_from_process(
-                Some(Path::new("/opt/homebrew/bin/node")),
-                &["node".to_string(), "/Users/x/proj/claude".to_string()],
-            ),
-            None
-        );
-        assert_eq!(
-            macos::detect_ai_tool_from_process(
-                Some(Path::new("/usr/bin/python3")),
-                &[
-                    "python3".to_string(),
-                    "-m".to_string(),
-                    "http.server".to_string(),
-                    "/srv/codex".to_string(),
-                ],
-            ),
-            None
-        );
-        assert_eq!(
-            macos::detect_ai_tool_from_process(
-                Some(Path::new("/Users/x/src/claude-code/target/debug/mytool")),
-                &[],
-            ),
-            None
-        );
-        assert_eq!(
-            macos::detect_ai_tool_from_process(Some(Path::new("/bin/zsh")), &[]),
-            None
-        );
-    }
 
     #[test]
     fn test_memory_overlay_budget_threshold_and_formatting() {
