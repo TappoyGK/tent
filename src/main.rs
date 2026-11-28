@@ -127,6 +127,10 @@ pub(crate) struct SearchState {
     pub(crate) select_all: bool,
     pub(crate) matches: Vec<SearchMatch>,
     pub(crate) current_match: Option<usize>,
+    /// 現在マッチ開始位置を追跡するピン（スクロールバック削除・リフロー追従用）
+    pub(crate) current_pin: Option<TrackedGridRef>,
+    /// 最後に検索を実行した時点の `TerminalPane::content_generation`
+    pub(crate) content_generation: u64,
 }
 
 #[derive(Default)]
@@ -826,6 +830,10 @@ impl ApplicationHandler<AppEvent> for TentApp {
             }
             AppEvent::WebViewClicked { px, py } => {
                 let mut changed = self.url_bar_edit.take().is_some();
+                if self.search.is_some() {
+                    self.close_search();
+                    changed = true;
+                }
                 if let Some(ws) = self.workspace.as_mut()
                     && ws.focus_pane_at(px, py).is_some()
                 {
@@ -840,6 +848,7 @@ impl ApplicationHandler<AppEvent> for TentApp {
                     || self.show_help
                     || self.slot_drag.is_some()
                     || self.url_bar_edit.is_some()
+                    || self.search.is_some()
                 {
                     return;
                 }

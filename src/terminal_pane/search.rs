@@ -2,11 +2,12 @@ use ghostty_vt::Terminal;
 use ghostty_vt::screen::CellWide;
 use ghostty_vt::terminal::{Point, PointCoordinate};
 
-/// 検索結果 1 件の `Point::Screen` 絶対座標範囲（同一行内の開始列〜終了列）
+/// 検索結果 1 件の `Point::Screen` 絶対座標範囲（ソフトラップ跨ぎの複数行に対応）
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SearchMatch {
-    pub screen_row: u32,
+    pub start_row: u32,
     pub start_col: u16,
+    pub end_row: u32,
     pub end_col: u16,
 }
 
@@ -15,6 +16,7 @@ const MAX_SEARCH_MATCHES: usize = 10_000;
 
 /// 端末のスクロールバック＋アクティブ画面全体（`0..total_rows`）から
 /// 大文字・小文字を区別せずに `query` を検索し、マッチ一覧を上から順に返す。
+/// ソフトラップで折り返された物理行は 1 つの論理行として連結して検索する。
 pub(super) fn search_terminal_screen(
     terminal: &Terminal,
     cols: u16,
@@ -28,7 +30,9 @@ pub(super) fn search_terminal_screen(
         return Vec::new();
     }
 
-    let needle_lower = query.to_lowercase();
+    // 画面側と同じ `char::to_lowercase` を使って文字単位で小文字化する
+    // （ギリシャ語語末シグマなど `str::to_lowercase` との差異による不一致を防ぐ）
+    let needle_lower: String = query.chars().flat_map(char::to_lowercase).collect();
     if needle_lower.is_empty() {
         return Vec::new();
     }
@@ -37,22 +41,25 @@ pub(super) fn search_terminal_screen(
     let mut matches = Vec::new();
     let mut grapheme_buf = ['\0'; 16];
     let mut lower_line = String::with_capacity(usize::from(cols) * 2);
-    // lower_line の各バイトオフセットに対応するセル列範囲 (start_col, end_col)
-    let mut byte_to_col: Vec<(u16, u16)> = Vec::with_capacity(usize::from(cols) * 2);
+    // lower_line の各バイトオフセットに対応する `(screen_row, start_col, end_col)`
+    let mut byte_to_pos: Vec<(u32, u16, u16)> = Vec::with_capacity(usize::from(cols) * 2);
+    let mut pending_spaces: Vec<(u32, u16)> = Vec::new();
+    let mut has_non_space = false;
 
     for row_idx in 0..total_rows {
-        lower_line.clear();
-        byte_to_col.clear();
-
-        let mut has_non_space = false;
-        let mut pending_spaces: Vec<u16> = Vec::new();
+        let is_wrapped = terminal
+            .grid_ref(Point::Screen(PointCoordinate { x: 0, y: row_idx }))
+            .ok()
+            .and_then(|gr| gr.row().ok())
+            .and_then(|r| r.is_wrapped().ok())
+            .unwrap_or(false);
 
         for col_idx in 0..cols {
             let Ok(gr) = terminal.grid_ref(Point::Screen(PointCoordinate {
                 x: col_idx,
                 y: row_idx,
             })) else {
-                pending_spaces.push(col_idx);
+                pending_spaces.push((row_idx, col_idx));
                 continue;
             };
             let wide = gr
@@ -65,14 +72,14 @@ pub(super) fn search_terminal_screen(
             }
             let len = gr.graphemes(&mut grapheme_buf).unwrap_or(0);
             if len == 0 || (len == 1 && grapheme_buf[0] == ' ') {
-                pending_spaces.push(col_idx);
+                pending_spaces.push((row_idx, col_idx));
                 continue;
             }
 
             // 溜めていた行中スペースを確定
-            for sp_col in pending_spaces.drain(..) {
+            for (sp_row, sp_col) in pending_spaces.drain(..) {
                 lower_line.push(' ');
-                byte_to_col.push((sp_col, sp_col));
+                byte_to_pos.push((sp_row, sp_col, sp_col));
             }
             has_non_space = true;
 
@@ -88,43 +95,76 @@ pub(super) fn search_terminal_screen(
                     lower_line.push(lc);
                     let added = lower_line.len() - before;
                     for _ in 0..added {
-                        byte_to_col.push((col_idx, end_col));
+                        byte_to_pos.push((row_idx, col_idx, end_col));
                     }
                 }
             }
         }
 
-        if !has_non_space || lower_line.len() < needle_len {
+        // ソフトラップで次の物理行へ続く場合は論理行を連結したまま継続する
+        if is_wrapped && row_idx + 1 < total_rows {
             continue;
         }
 
-        let mut search_from = 0usize;
-        while search_from + needle_len <= lower_line.len() {
-            let Some(rel) = lower_line[search_from..].find(&needle_lower) else {
-                break;
-            };
-            let abs_start = search_from + rel;
-            let abs_end = abs_start + needle_len;
-            if let (Some(&(sc, _)), Some(&(_, ec))) =
-                (byte_to_col.get(abs_start), byte_to_col.get(abs_end - 1))
-            {
-                matches.push(SearchMatch {
-                    screen_row: row_idx,
-                    start_col: sc,
-                    end_col: ec,
-                });
-                if matches.len() >= MAX_SEARCH_MATCHES {
-                    return matches;
+        // 論理行の終端：末尾の余白スペースは捨ててから検索を実行
+        pending_spaces.clear();
+
+        if has_non_space && lower_line.len() >= needle_len {
+            let mut search_from = 0usize;
+            while search_from + needle_len <= lower_line.len() {
+                let Some(rel) = lower_line[search_from..].find(&needle_lower) else {
+                    break;
+                };
+                let abs_start = search_from + rel;
+                let abs_end = abs_start + needle_len;
+                if let (Some(&(sr, sc, _)), Some(&(er, _, ec))) =
+                    (byte_to_pos.get(abs_start), byte_to_pos.get(abs_end - 1))
+                {
+                    matches.push(SearchMatch {
+                        start_row: sr,
+                        start_col: sc,
+                        end_row: er,
+                        end_col: ec,
+                    });
+                    if matches.len() >= MAX_SEARCH_MATCHES {
+                        return matches;
+                    }
                 }
+                // 非重複マッチとしてマッチ末尾から次を検索する（ブラウザの window.find と整合）
+                search_from = abs_end;
             }
-            // 重複マッチも拾いつつ確実に次の文字境界へ進める
-            let step = lower_line[abs_start..]
-                .chars()
-                .next()
-                .map_or(1, char::len_utf8);
-            search_from = abs_start + step;
         }
+
+        lower_line.clear();
+        byte_to_pos.clear();
+        has_non_space = false;
     }
 
     matches
+}
+
+/// 再検索後のマッチ一覧に対して、追跡ピンから解決した前回座標 `prev_pos` に最も対応するインデックスを返す。
+pub fn resolve_tracked_search_match_index(
+    matches: &[SearchMatch],
+    prev_pos: Option<(u16, u32)>,
+    had_current: bool,
+) -> Option<usize> {
+    if matches.is_empty() {
+        return None;
+    }
+    if let Some((pcol, prow)) = prev_pos {
+        if let Some(exact) = matches
+            .iter()
+            .position(|m| m.start_row == prow && m.start_col == pcol)
+        {
+            return Some(exact);
+        }
+        let idx = matches.partition_point(|m| (m.start_row, m.start_col) < (prow, pcol));
+        return Some(idx.min(matches.len() - 1));
+    }
+    if had_current {
+        Some(0)
+    } else {
+        Some(matches.len() - 1)
+    }
 }

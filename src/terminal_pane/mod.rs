@@ -21,7 +21,7 @@ use ghostty_vt::{Event as VtEvent, RenderState, Terminal, TerminalOptions};
 use crate::daemon::{AiHookState, AiTool, DaemonClient, ReplayedPane};
 use crate::macos;
 
-pub use search::SearchMatch;
+pub use search::{SearchMatch, resolve_tracked_search_match_index};
 pub use selection::UrlMatch;
 use selection::{
     extract_selection_from_screen, extract_selection_from_terminal, find_url_at_cell,
@@ -137,6 +137,8 @@ pub struct TerminalPane {
     minimap_dirty: bool,
     /// 描画キャッシュ無効化用の世代カウンタ
     pub generation: u64,
+    /// 画面内容・リサイズ変化の検知用世代カウンタ（スクロールだけでは増えない）
+    pub content_generation: u64,
 }
 
 impl TerminalPane {
@@ -223,6 +225,7 @@ impl TerminalPane {
             },
             minimap_dirty: true,
             generation: 1,
+            content_generation: 1,
         })
     }
 
@@ -297,6 +300,7 @@ impl TerminalPane {
             },
             minimap_dirty: true,
             generation: 1,
+            content_generation: 1,
         };
         pane.mark_screen_seen();
         Ok(pane)
@@ -517,6 +521,7 @@ impl TerminalPane {
                 self.last_output_at = Local::now();
                 self.last_output_instant = Some(Instant::now());
             }
+            self.content_generation = self.content_generation.wrapping_add(1);
             self.mark_dirty();
         }
     }
@@ -625,6 +630,7 @@ impl TerminalPane {
         }
         self.minimap_dirty = true;
         self.generation = self.generation.wrapping_add(1);
+        self.content_generation = self.content_generation.wrapping_add(1);
 
         let events: Vec<VtEvent> = self.terminal.events().collect();
         let mut saw_bell = false;
@@ -705,6 +711,7 @@ impl TerminalPane {
             self.write_input(b"\x0c");
         }
         self.mark_screen_seen();
+        self.content_generation = self.content_generation.wrapping_add(1);
         self.mark_dirty();
     }
 
@@ -742,6 +749,7 @@ impl TerminalPane {
             self.mark_screen_seen();
         }
         self.daemon.resize_pane(self.id, cols, rows);
+        self.content_generation = self.content_generation.wrapping_add(1);
         self.mark_dirty();
     }
 

@@ -127,7 +127,7 @@ impl Renderer {
                     "  Cmd+Shift+Click  URL を外部ブラウザで開く\n",
                     "  File D&D         スクショ等のパスを貼り付け\n",
                     "  Cmd+C / Cmd+V    コピー / ペースト\n",
-                    "  Cmd+F            ペイン内検索（Enter / Shift+Enter / Esc）\n",
+                    "  Cmd+F            ペイン内検索（Enter / Shift+Enter / Cmd+G / Esc）\n",
                     "  Cmd+K            画面・スクロールバックをクリア\n",
                     "  Cmd+Opt+R        TenT 本体再起動\n",
                     "  Cmd+/ / Cmd+?    このヘルプを表示 / 閉じる\n",

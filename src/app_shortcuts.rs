@@ -164,6 +164,8 @@ impl TentApp {
             select_all: has_initial,
             matches: Vec::new(),
             current_match: None,
+            current_pin: None,
+            content_generation: 0,
         });
         if target.is_browser() {
             self.browsers.focus_parent();
@@ -191,6 +193,74 @@ impl TentApp {
         }
     }
 
+    /// 出力追加・スクロールバック先頭パージ・リサイズ等で端末内容が変化していれば再検索し、
+    /// 追跡ピンを使って現在のマッチ位置を座標ベースで引き継ぐ。
+    /// 対象ペインが現在のアクティブスロットに存在しない場合は検索を閉じる。
+    pub(crate) fn sync_search_matches_if_needed(&mut self) {
+        let Some(target) = self.search.as_ref().map(|s| s.target) else {
+            return;
+        };
+        match target {
+            SearchTarget::Terminal(pid) => {
+                let pane_exists = self
+                    .workspace
+                    .as_ref()
+                    .and_then(|ws| ws.active_slot_ref().root.as_ref())
+                    .and_then(|r| r.terminal_pane(pid))
+                    .is_some();
+                if !pane_exists {
+                    self.close_search();
+                    return;
+                }
+                let Some(search) = self.search.as_mut() else {
+                    return;
+                };
+                if search.query.is_empty() {
+                    return;
+                }
+                let Some(pane) = self
+                    .workspace
+                    .as_ref()
+                    .and_then(|ws| ws.active_slot_ref().root.as_ref())
+                    .and_then(|r| r.terminal_pane(pid))
+                else {
+                    return;
+                };
+                if pane.content_generation == search.content_generation {
+                    return;
+                }
+                let prev_pos = search
+                    .current_pin
+                    .as_ref()
+                    .and_then(|pin| pane.resolve_tracked_point(pin));
+                let had_current = search.current_match.is_some();
+                let found = pane.search_screen(&search.query);
+                let next_idx = crate::terminal_pane::resolve_tracked_search_match_index(
+                    &found,
+                    prev_pos,
+                    had_current,
+                );
+                let next_pin = next_idx
+                    .and_then(|i| found.get(i))
+                    .and_then(|m| pane.track_screen_point((m.start_col, m.start_row)));
+                search.matches = found;
+                search.current_match = next_idx;
+                search.current_pin = next_pin;
+                search.content_generation = pane.content_generation;
+            }
+            SearchTarget::Browser(pid) => {
+                let pane_exists = self
+                    .workspace
+                    .as_ref()
+                    .and_then(Workspace::focused_browser)
+                    .is_some_and(|b| b.id == pid);
+                if !pane_exists {
+                    self.close_search();
+                }
+            }
+        }
+    }
+
     pub(crate) fn update_search_results(&mut self, jump_to_match: bool) {
         let Some(search) = self.search.as_mut() else {
             return;
@@ -199,13 +269,19 @@ impl TentApp {
         match search.target {
             SearchTarget::Terminal(pid) => {
                 let mut found = Vec::new();
+                let mut current_pin = None;
+                let mut content_generation = 0;
                 if let Some(ws) = self.workspace.as_mut()
                     && let Some(root) = ws.active_slot_mut().root.as_mut()
                     && let Some(pane) = root.terminal_pane_mut(pid)
                 {
+                    content_generation = pane.content_generation;
                     found = pane.search_screen(&query);
-                    if jump_to_match && let Some(last) = found.last() {
-                        pane.scroll_to_screen_row(last.screen_row);
+                    if let Some(last) = found.last() {
+                        current_pin = pane.track_screen_point((last.start_col, last.start_row));
+                        if jump_to_match {
+                            pane.scroll_to_screen_row(last.start_row);
+                        }
                     }
                 }
                 search.current_match = if found.is_empty() {
@@ -213,6 +289,8 @@ impl TentApp {
                 } else {
                     Some(found.len() - 1)
                 };
+                search.current_pin = current_pin;
+                search.content_generation = content_generation;
                 search.matches = found;
             }
             SearchTarget::Browser(pid) => {
@@ -222,29 +300,16 @@ impl TentApp {
     }
 
     pub(crate) fn step_search_match(&mut self, backwards: bool) {
+        self.sync_search_matches_if_needed();
         let Some(search) = self.search.as_mut() else {
             return;
         };
         match search.target {
             SearchTarget::Terminal(pid) => {
-                if search.query.is_empty() {
+                if search.query.is_empty() || search.matches.is_empty() {
                     return;
                 }
-                // 新規出力でスクロールバックが変化している可能性があるため最新結果へ更新
-                let query = search.query.clone();
-                let mut found = Vec::new();
-                if let Some(ws) = self.workspace.as_mut()
-                    && let Some(root) = ws.active_slot_mut().root.as_mut()
-                    && let Some(pane) = root.terminal_pane_mut(pid)
-                {
-                    found = pane.search_screen(&query);
-                }
-                if found.is_empty() {
-                    search.matches.clear();
-                    search.current_match = None;
-                    return;
-                }
-                let len = found.len();
+                let len = search.matches.len();
                 let next_idx = match search.current_match {
                     Some(cur) if cur < len => {
                         if backwards {
@@ -261,14 +326,15 @@ impl TentApp {
                         }
                     }
                 };
-                let target_row = found[next_idx].screen_row;
-                search.matches = found;
+                let target_match = search.matches[next_idx];
                 search.current_match = Some(next_idx);
                 if let Some(ws) = self.workspace.as_mut()
                     && let Some(root) = ws.active_slot_mut().root.as_mut()
                     && let Some(pane) = root.terminal_pane_mut(pid)
                 {
-                    pane.scroll_to_screen_row(target_row);
+                    search.current_pin =
+                        pane.track_screen_point((target_match.start_col, target_match.start_row));
+                    pane.scroll_to_screen_row(target_match.start_row);
                 }
             }
             SearchTarget::Browser(pid) => {

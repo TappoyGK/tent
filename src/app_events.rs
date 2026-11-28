@@ -360,6 +360,7 @@ impl TentApp {
                                     // Cmd+クリック（デフォルト）: TenT 組み込みブラウザで開く
                                     if let Some(ws) = self.workspace.as_mut() {
                                         let bid = ws.open_url_in_active_browser(&url);
+                                        self.close_search();
                                         self.sync_browsers();
                                         self.browsers.navigate(bid, &url);
                                         self.save_state();
@@ -372,6 +373,13 @@ impl TentApp {
                         if let Some(ws) = self.workspace.as_mut()
                             && let Some((pid, prect)) = ws.focus_pane_at(px, py)
                         {
+                            if self
+                                .search
+                                .as_ref()
+                                .is_some_and(|s| s.target.pane_id() != pid)
+                            {
+                                self.close_search();
+                            }
                             let vp_cell = self.pixel_to_cell(prect, px, py);
                             let now = Instant::now();
                             let click_tol = 8.0 * scale;
@@ -481,13 +489,21 @@ impl TentApp {
                             if let Some(ws) = self.workspace.as_mut() {
                                 ws.swap_slots(drag.source_slot, target);
                             }
+                            self.close_search();
                             self.sync_browsers();
                             self.save_state();
                         }
                     } else {
+                        let slot_changed = self
+                            .workspace
+                            .as_ref()
+                            .is_some_and(|ws| ws.active_slot != drag.source_slot);
                         if let Some(ws) = self.workspace.as_mut() {
                             ws.select_slot(drag.source_slot);
                             self.selection = None;
+                        }
+                        if slot_changed {
+                            self.close_search();
                         }
                         self.sync_browsers();
                         self.save_state();
@@ -587,12 +603,9 @@ impl TentApp {
                     return;
                 }
                 if self.search.is_some() {
-                    // 検索バー編集中でもスロット切替等のアプリショートカットは通す
+                    // 検索バー編集中でもスロット切替・Cmd+F 全選択等のアプリショートカットは通す
                     if let Some(shortcut) = match_app_shortcut(&event, self.modifiers)
-                        && !matches!(
-                            shortcut,
-                            AppShortcut::Copy | AppShortcut::Paste | AppShortcut::Find
-                        )
+                        && !matches!(shortcut, AppShortcut::Copy | AppShortcut::Paste)
                     {
                         self.handle_shortcut(shortcut);
                         return;
@@ -689,6 +702,7 @@ impl TentApp {
             }
             WindowEvent::RedrawRequested => {
                 self.drain_daemon_events();
+                self.sync_search_matches_if_needed();
                 self.last_redraw = Instant::now();
                 self.pending_redraw = false;
 
@@ -756,20 +770,21 @@ impl TentApp {
                         let vp_top = pane.viewport_top_screen_row();
                         let vp_bottom =
                             vp_top.saturating_add(u32::from(pane.rows.saturating_sub(1)));
-                        let visible: Vec<(u16, u16, u16, bool)> = s
-                            .matches
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, m)| m.screen_row >= vp_top && m.screen_row <= vp_bottom)
-                            .map(|(idx, m)| {
-                                (
-                                    (m.screen_row - vp_top) as u16,
-                                    m.start_col,
-                                    m.end_col,
-                                    s.current_match == Some(idx),
-                                )
-                            })
-                            .collect();
+                        let max_col = pane.cols.saturating_sub(1);
+                        let mut visible: Vec<(u16, u16, u16, bool)> = Vec::new();
+                        for (idx, m) in s.matches.iter().enumerate() {
+                            if m.end_row < vp_top || m.start_row > vp_bottom {
+                                continue;
+                            }
+                            let is_current = s.current_match == Some(idx);
+                            let row_from = m.start_row.max(vp_top);
+                            let row_to = m.end_row.min(vp_bottom);
+                            for r in row_from..=row_to {
+                                let c0 = if r == m.start_row { m.start_col } else { 0 };
+                                let c1 = if r == m.end_row { m.end_col } else { max_col };
+                                visible.push(((r - vp_top) as u16, c0, c1, is_current));
+                            }
+                        }
                         if visible.is_empty() {
                             None
                         } else {
