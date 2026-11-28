@@ -4,6 +4,43 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 
+/// 指定 PID の物理メモリフットプリント（バイト）を macOS `proc_pid_rusage` で取得する。
+/// アクティビティモニタの「メモリ」欄と同じ `ri_phys_footprint` を優先し、0 の場合は `ri_resident_size` を使う。
+pub fn get_pid_memory_bytes(pid: i32) -> Option<u64> {
+    if pid <= 0 {
+        return None;
+    }
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v2>::zeroed();
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid,
+            libc::RUSAGE_INFO_V2,
+            info.as_mut_ptr().cast::<libc::rusage_info_t>(),
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    let bytes = if info.ri_phys_footprint > 0 {
+        info.ri_phys_footprint
+    } else {
+        info.ri_resident_size
+    };
+    (bytes > 0).then_some(bytes)
+}
+
+/// バイト数をステータスバー向けの短い表記（例: `185M`, `1.2G`）へ整形する
+pub fn format_memory_bytes(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    if bytes as f64 >= GIB {
+        format!("{:.1}G", bytes as f64 / GIB)
+    } else {
+        format!("{}M", ((bytes as f64) / MIB).round() as u64)
+    }
+}
+
 /// 指定 PID のカレントディレクトリを macOS libc::proc_pidinfo で高速取得する
 pub fn get_pid_cwd(pid: i32) -> Option<PathBuf> {
     if pid <= 0 {
@@ -935,9 +972,14 @@ pub fn install_file_drop_handler(
                 let _ = std::fs::create_dir_all(&drop_dir);
                 let dir_str = NSString::from_str(&drop_dir.to_string_lossy());
                 let dest_url = NSURL::fileURLWithPath_isDirectory(&dir_str, true);
-                // Apple 推奨: mainQueue ではなくバックグラウンド NSOperationQueue を渡す（デッドロック防止）
-                let bg_queue: Option<Retained<AnyObject>> = unsafe { msg_send![queue_cls, new] };
-                if let Some(queue) = bg_queue {
+                // Apple 推奨: mainQueue ではなく単一のバックグラウンド NSOperationQueue を再利用（毎回リークさせない）
+                static PROMISE_QUEUE: OnceLock<usize> = OnceLock::new();
+                let queue_ptr = *PROMISE_QUEUE.get_or_init(|| {
+                    let q: Option<Retained<AnyObject>> = unsafe { msg_send![queue_cls, new] };
+                    q.map_or(0, |r| Retained::into_raw(r) as usize)
+                });
+                if queue_ptr != 0 {
+                    let queue = queue_ptr as *const AnyObject;
                     for receiver in receivers.iter() {
                         let block =
                             RcBlock::new(move |file_url: NonNull<NSURL>, err: *mut AnyObject| {
@@ -969,13 +1011,11 @@ pub fn install_file_drop_handler(
                                 &*receiver,
                                 receivePromisedFilesAtDestination: &*dest_url,
                                 options: &*empty_opts,
-                                operationQueue: &*queue,
+                                operationQueue: queue,
                                 reader: &*block
                             ];
                         }
                     }
-                    // 非同期コールバック完了までキューを保持
-                    std::mem::forget(queue);
                     return Bool::YES;
                 }
             }

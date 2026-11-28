@@ -103,6 +103,37 @@ pub struct SearchBarOverlay<'a> {
     pub count_label: String,
 }
 
+/// ステータスバーのメモリ使用量バー表示状態
+/// 80% ライン = 1.0 GiB（GPU 込みの実測目安）、100% フルスケール = 1.25 GiB
+#[derive(Clone, Debug, Default)]
+pub struct MemoryOverlay {
+    /// フルスケール（1.25 GiB）に対する使用率（0.0..=1.0）
+    pub fraction: f32,
+    /// 80% 警告ライン（1.0 GiB）を超過しているか
+    pub is_over_budget: bool,
+    /// バー中央に表示する現在値ラベル（例: "480M", "1.2G"）
+    pub label: String,
+}
+
+impl MemoryOverlay {
+    /// ターミナル＋デーモン合計（GPU/Metal フットプリント込み）の基準ライン（1.0 GiB = バーの 80%）
+    pub const BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+    /// バーの 100% フルスケール（1.25 GiB = 1.0 GiB / 0.8）
+    pub const FULL_SCALE_BYTES: u64 = 1280 * 1024 * 1024;
+
+    pub fn from_bytes(bytes: u64) -> Self {
+        if bytes == 0 {
+            return Self::default();
+        }
+        let fraction = (bytes as f64 / Self::FULL_SCALE_BYTES as f64).clamp(0.0, 1.0) as f32;
+        Self {
+            fraction,
+            is_over_budget: bytes > Self::BUDGET_BYTES,
+            label: crate::macos::format_memory_bytes(bytes),
+        }
+    }
+}
+
 /// 描画時のオーバーレイ状態（IME・D&D・テキスト選択・URLホバー・URLバー編集・検索・システム状態・ヘルプ）
 pub struct RenderOverlays<'a> {
     pub ime_preedit: &'a str,
@@ -120,6 +151,7 @@ pub struct RenderOverlays<'a> {
     pub daemon_upgrade_confirm: bool,
     pub version_copied: bool,
     pub timer: TimerOverlay,
+    pub memory: &'a MemoryOverlay,
 }
 
 /// 1フレーム描画の戻り値
@@ -149,7 +181,7 @@ pub struct Renderer {
     image_sampler: wgpu::Sampler,
     image_instance_buffer: wgpu::Buffer,
     image_instance_capacity: usize,
-    browser_textures: HashMap<PaneId, (wgpu::Texture, wgpu::BindGroup)>,
+    browser_textures: HashMap<PaneId, (wgpu::Texture, wgpu::BindGroup, u32, u32)>,
 
     font_system: FontSystem,
     swash_cache: SwashCache,
@@ -189,6 +221,8 @@ pub struct Renderer {
     version_cache_key: u32,
     timer_buffer: Buffer,
     timer_cache_key: String,
+    mem_buffer: Buffer,
+    mem_cache_key: (String, bool, u32),
     status_btn_buffers: [Buffer; 8],
     status_btn_labels: [String; 8],
 
@@ -474,6 +508,8 @@ impl Renderer {
         version_buffer.set_wrap(Wrap::None);
         let mut timer_buffer = Buffer::new(&mut font_system, card_metrics);
         timer_buffer.set_wrap(Wrap::None);
+        let mut mem_buffer = Buffer::new(&mut font_system, card_metrics);
+        mem_buffer.set_wrap(Wrap::None);
         let status_btn_buffers: [Buffer; 8] = std::array::from_fn(|_| {
             let mut b = Buffer::new(&mut font_system, card_metrics);
             b.set_wrap(Wrap::None);
@@ -531,6 +567,8 @@ impl Renderer {
             version_cache_key: 0,
             timer_buffer,
             timer_cache_key: String::new(),
+            mem_buffer,
+            mem_cache_key: (String::new(), false, 0),
             status_btn_buffers,
             status_btn_labels: std::array::from_fn(|_| String::new()),
             footer_buffers: Vec::new(),
@@ -556,6 +594,37 @@ impl Renderer {
         if width == 0 || height == 0 || rgba.len() < (width as usize * height as usize * 4) {
             return;
         }
+        let write_pixels = |texture: &wgpu::Texture| {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                rgba,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width * 4),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        };
+
+        // 同じ解像度の既存テクスチャがあれば再利用し、不要な GPU テクスチャ再確保を避ける
+        if let Some((texture, _, cur_w, cur_h)) = self.browser_textures.get(&pane_id)
+            && *cur_w == width
+            && *cur_h == height
+        {
+            write_pixels(texture);
+            return;
+        }
+
         let tex_format = if self.is_srgb {
             wgpu::TextureFormat::Rgba8UnormSrgb
         } else {
@@ -575,25 +644,7 @@ impl Renderer {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(width * 4),
-                rows_per_image: Some(height),
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
+        write_pixels(&texture);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("browser_thumb_bg"),
@@ -609,7 +660,8 @@ impl Renderer {
                 },
             ],
         });
-        self.browser_textures.insert(pane_id, (texture, bind_group));
+        self.browser_textures
+            .insert(pane_id, (texture, bind_group, width, height));
     }
 
     pub fn retain_browser_textures(&mut self, live_ids: &[PaneId]) {
@@ -649,6 +701,7 @@ impl Renderer {
         self.main_status_cache_key = (String::new(), 0);
         self.url_bar_cache_key = (String::new(), false, 0);
         self.clock_text.clear();
+        self.mem_cache_key.2 = 0;
         self.status_btn_labels = std::array::from_fn(|_| String::new());
         for key in &mut self.footer_cache_keys {
             key.2 = 0;
@@ -811,6 +864,8 @@ impl Renderer {
             &self.version_buffer,
             &self.timer_buffer,
             &overlays.timer.label,
+            &self.mem_buffer,
+            &overlays.memory.label,
             &self.url_bar_buffer,
             &self.status_btn_buffers,
             layout,
@@ -954,7 +1009,7 @@ impl Renderer {
                 pass.set_bind_group(0, &self.uniform_bind_group, &[]);
                 pass.set_vertex_buffer(0, self.image_instance_buffer.slice(..));
                 for (idx, (pid, _)) in image_draws.iter().enumerate() {
-                    if let Some((_, bg)) = self.browser_textures.get(pid) {
+                    if let Some((_, bg, _, _)) = self.browser_textures.get(pid) {
                         pass.set_bind_group(1, bg, &[]);
                         let i = idx as u32;
                         pass.draw(0..6, i..(i + 1));

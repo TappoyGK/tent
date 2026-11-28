@@ -164,7 +164,7 @@ impl TerminalPane {
         let mut terminal = Terminal::new(TerminalOptions {
             cols: cols.max(10),
             rows: rows.max(4),
-            ..Default::default()
+            max_scrollback: 1_000_000,
         })?;
         Self::apply_default_colors(&mut terminal);
         Ok(terminal)

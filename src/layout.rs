@@ -100,6 +100,7 @@ pub struct StatusBarControls {
     pub upgrade_daemon_rect: Rect,
     pub timer_rect: Rect,
     pub timer_icon_rect: Rect,
+    pub mem_bar_rect: Rect,
     pub text_right_limit: f32,
 }
 
@@ -301,7 +302,22 @@ impl AppLayout {
             } else {
                 (Rect::default(), Rect::default())
             };
-        let text_right_limit = if timer_rect.w > 0.0 {
+        let after_timer_x = if timer_rect.w > 0.0 {
+            icon_x
+        } else {
+            after_upgrade_x
+        };
+        // メモリ使用量モニターバー（80% = 1.0GiB、100% = 1.25GiB）をタイマーの左隣に配置
+        let mem_w = 76.0 * scale;
+        let mem_x = (after_timer_x - gap * 2.0 - mem_w).max(bar.x);
+        let mem_bar_rect = if after_timer_x - bar.x >= mem_w + 150.0 * scale {
+            Rect::new(mem_x, btn_y, mem_w, btn_h)
+        } else {
+            Rect::default()
+        };
+        let text_right_limit = if mem_bar_rect.w > 0.0 {
+            (mem_x - gap * 2.0).max(bar.x)
+        } else if timer_rect.w > 0.0 {
             (icon_x - gap * 2.0).max(bar.x)
         } else {
             (after_upgrade_x - gap).max(bar.x)
@@ -317,6 +333,7 @@ impl AppLayout {
                 upgrade_daemon_rect,
                 timer_rect,
                 timer_icon_rect,
+                mem_bar_rect,
                 text_right_limit,
                 ..StatusBarControls::default()
             };
@@ -348,6 +365,7 @@ impl AppLayout {
             upgrade_daemon_rect,
             timer_rect,
             timer_icon_rect,
+            mem_bar_rect,
             text_right_limit,
         }
     }
