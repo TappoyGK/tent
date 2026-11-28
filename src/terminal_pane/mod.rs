@@ -43,6 +43,8 @@ const BACKGROUND_NOTIFY_MIN_DURATION: Duration = Duration::from_secs(5);
 const ACTIVE_OUTPUT_FAST_PATH: Duration = Duration::from_millis(50);
 /// DEC Mode 2026 (Synchronized Output) で描画ホールドを許可する最大時間（固まり防止）
 const SYNC_OUTPUT_MAX_HOLD: Duration = Duration::from_secs(1);
+/// agy の Working 中にパーミッション確認プロンプトが安定表示されてから Waiting へ遷移するまでの時間
+const AGY_PERMISSION_PROMPT_IDLE: Duration = Duration::from_millis(1200);
 
 /// イベントループへのカスタム通知
 #[derive(Debug, Clone)]
@@ -130,6 +132,23 @@ pub struct TerminalPane {
     pub ai_hook_state: Option<AiHookState>,
     /// AI が Working 状態に入った時刻（長時間処理の OS 通知判定用）
     ai_working_since: Option<Instant>,
+    /// 直近の PTY バイト受信時刻（AI フック管理モード中の無出力時間計測専用）
+    last_pty_output_instant: Option<Instant>,
+    /// agy の画面パーミッション確認プロンプト検知によって Waiting へ昇格したか
+    /// （スロット確認 `clear_attention` で Waiting を消したあとも、ユーザー応答・ダイアログ消去まで保持する）
+    ai_permission_prompt_detected: bool,
+    /// 現在 Waiting として検知中の agy パーミッション確認プロンプトの署名（別ダイアログ切替通知用）
+    detected_agy_permission_prompt: Option<status::AgyPermissionPromptSignature>,
+    /// 現在画面に観測中の agy パーミッション確認プロンプト候補と初回観測時刻（ダイアログの 1.2 秒安定判定用）
+    agy_prompt_candidate: Option<(status::AgyPermissionPromptSignature, Instant)>,
+    /// 直前に確定・キャンセル応答済みとした agy パーミッション確認プロンプトの署名（1.2 秒間 None が続くまで保持）
+    dismissed_agy_permission_prompt: Option<status::AgyPermissionPromptSignature>,
+    /// agy パーミッション確認プロンプトを最後に検査した `content_generation`
+    last_agy_prompt_checked_gen: Option<u64>,
+    /// 最後の `detect_agy_permission_prompt()` 結果キャッシュ
+    last_agy_prompt_snapshot: Option<status::AgyPermissionPromptSignature>,
+    /// 画面検知による Waiting 中にダイアログが検出不能（None）になり始めた時刻（一瞬の描き替え除外用）
+    agy_prompt_absent_since: Option<Instant>,
     last_seen_line_hashes: Vec<Option<u64>>,
     last_seen_total_rows: usize,
     last_active_line_hashes: Vec<Option<u64>>,
@@ -215,6 +234,14 @@ impl TerminalPane {
             ai_hook_active: false,
             ai_hook_state: None,
             ai_working_since: None,
+            last_pty_output_instant: None,
+            ai_permission_prompt_detected: false,
+            detected_agy_permission_prompt: None,
+            agy_prompt_candidate: None,
+            dismissed_agy_permission_prompt: None,
+            last_agy_prompt_checked_gen: None,
+            last_agy_prompt_snapshot: None,
+            agy_prompt_absent_since: None,
             last_seen_line_hashes: Vec::new(),
             last_seen_total_rows: 0,
             last_active_line_hashes: Vec::new(),
@@ -290,6 +317,14 @@ impl TerminalPane {
             ai_hook_active: false,
             ai_hook_state: None,
             ai_working_since: None,
+            last_pty_output_instant: None,
+            ai_permission_prompt_detected: false,
+            detected_agy_permission_prompt: None,
+            agy_prompt_candidate: None,
+            dismissed_agy_permission_prompt: None,
+            last_agy_prompt_checked_gen: None,
+            last_agy_prompt_snapshot: None,
+            agy_prompt_absent_since: None,
             last_seen_line_hashes: Vec::new(),
             last_seen_total_rows: 0,
             last_active_line_hashes: Vec::new(),
@@ -310,9 +345,65 @@ impl TerminalPane {
 
     pub fn write_input(&mut self, bytes: &[u8]) {
         if !bytes.is_empty() {
-            // ユーザーが承認・拒否・次プロンプト等を入力したら AI の Waiting 状態を解除し、
-            // 以降の正当な Waiting（PermissionRequest / Stop）を取りこぼさないようにする
-            if self.ai_hook_state == Some(AiHookState::Waiting) {
+            // 画面検知によるパーミッション待ち中は、選択肢移動キー（矢印・Tab・マウス）では状態を維持する。
+            // Enter / Esc / Ctrl+C の確定・キャンセル入力は Working へ復帰しつつ応答済み署名を記録し、
+            // その他の入力（未対応キー等）は応答済み署名を記録せず Working へ戻す（ダイアログが 1.2 秒残れば再検知する）。
+            // スロット確認（clear_attention）で ai_hook_state が None になったあとの応答でも復帰させる。
+            if self.ai_permission_prompt_detected {
+                if !status::is_prompt_navigation_input(bytes) {
+                    let now = Instant::now();
+                    self.ai_hook_state = Some(AiHookState::Working);
+                    self.ai_permission_prompt_detected = false;
+                    self.agy_prompt_absent_since = None;
+                    self.is_waiting_input = false;
+                    self.last_pty_output_instant = Some(now);
+                    let detected_sig = self.detected_agy_permission_prompt.take();
+                    if status::is_prompt_confirm_input(bytes) {
+                        self.dismissed_agy_permission_prompt =
+                            self.last_agy_prompt_snapshot.clone().or(detected_sig);
+                        self.agy_prompt_candidate = None;
+                    } else {
+                        self.agy_prompt_candidate = self
+                            .last_agy_prompt_snapshot
+                            .clone()
+                            .or(detected_sig)
+                            .map(|sig| (sig, now));
+                    }
+                }
+            } else if self.is_ai_hook_managed()
+                && self.active_ai_tool == Some(AiTool::Agy)
+                && self.ai_hook_state == Some(AiHookState::Working)
+                && status::is_prompt_confirm_input(bytes)
+            {
+                // 1.2 秒の検知前にユーザーが即座に確定・キャンセル応答した場合も、
+                // 現在の画面から取り直した署名を優先して応答済みへ記録し、1.2 秒後の誤検知を防ぐ
+                if self.last_agy_prompt_checked_gen != Some(self.content_generation) {
+                    self.last_agy_prompt_checked_gen = Some(self.content_generation);
+                    self.last_agy_prompt_snapshot = self.detect_agy_permission_prompt();
+                }
+                let candidate = self.agy_prompt_candidate.take().map(|(s, _)| s);
+                if let Some(sig) = self.last_agy_prompt_snapshot.clone().or(candidate) {
+                    self.dismissed_agy_permission_prompt = Some(sig);
+                    self.agy_prompt_absent_since = None;
+                }
+            } else if self.ai_hook_state == Some(AiHookState::Waiting) {
+                // ユーザーが承認・拒否・次プロンプト等を入力したら AI の Waiting 状態を解除し、
+                // 以降の正当な Waiting（PermissionRequest / Stop）を取りこぼさないようにする。
+                // agy でフック由来の Waiting 中に確定・キャンセル応答された場合も、現在画面にダイアログが
+                // 出ていれば応答済み署名を記録し、直後の Working で再検知されないようにする。
+                if self.is_ai_hook_managed()
+                    && self.active_ai_tool == Some(AiTool::Agy)
+                    && status::is_prompt_confirm_input(bytes)
+                {
+                    if self.last_agy_prompt_checked_gen != Some(self.content_generation) {
+                        self.last_agy_prompt_checked_gen = Some(self.content_generation);
+                        self.last_agy_prompt_snapshot = self.detect_agy_permission_prompt();
+                    }
+                    if let Some(sig) = self.last_agy_prompt_snapshot.clone() {
+                        self.dismissed_agy_permission_prompt = Some(sig);
+                        self.agy_prompt_absent_since = None;
+                    }
+                }
                 self.ai_hook_state = None;
                 self.is_waiting_input = false;
             }
@@ -461,6 +552,7 @@ impl TerminalPane {
             return;
         }
         let now = Instant::now();
+        self.last_pty_output_instant = Some(now);
         let is_ai_managed = self.is_ai_hook_managed();
 
         // AI フック管理モード中はフックイベントを唯一の正とし、
@@ -623,6 +715,12 @@ impl TerminalPane {
             self.write_input(b"\x0c");
         }
         self.mark_screen_seen();
+        self.detected_agy_permission_prompt = None;
+        self.dismissed_agy_permission_prompt = None;
+        self.agy_prompt_candidate = None;
+        self.last_agy_prompt_checked_gen = None;
+        self.last_agy_prompt_snapshot = None;
+        self.agy_prompt_absent_since = None;
         self.content_generation = self.content_generation.wrapping_add(1);
         self.mark_dirty();
     }

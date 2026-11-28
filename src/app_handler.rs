@@ -295,7 +295,7 @@ impl ApplicationHandler<AppEvent> for TentApp {
         }
 
         if let Some(ws) = self.workspace.as_mut() {
-            if ws.update_waiting_states(now) {
+            if ws.update_waiting_states(now, self.window_focused) {
                 need_redraw = true;
             }
             let now_outputting = ws.has_any_active_output(now);

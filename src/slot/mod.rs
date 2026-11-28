@@ -273,7 +273,7 @@ impl Workspace {
         false
     }
 
-    pub fn update_waiting_states(&mut self, now: Instant) -> bool {
+    pub fn update_waiting_states(&mut self, now: Instant, window_focused: bool) -> bool {
         let active = self.active_slot;
         let mut changed = false;
         for (idx, slot) in self.slots.iter_mut().enumerate() {
@@ -281,7 +281,7 @@ impl Workspace {
             let slot_label = Slot::number_label(idx);
             if let Some(root) = &mut slot.root {
                 root.for_each_terminal_mut(&mut |p| {
-                    if p.update_waiting_state(now, is_active, Some(slot_label)) {
+                    if p.update_waiting_state(now, is_active, window_focused, Some(slot_label)) {
                         changed = true;
                     }
                 });
