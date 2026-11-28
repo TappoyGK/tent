@@ -8,7 +8,10 @@ use ghostty_vt::screen::CellWide;
 use ghostty_vt::terminal::{Point, PointCoordinate};
 
 use super::selection::extract_selection_from_terminal;
-use super::{BACKGROUND_NOTIFY_MIN_DURATION, TerminalPane, WAITING_IDLE_THRESHOLD};
+use super::{
+    AGY_PERMISSION_PROMPT_IDLE, BACKGROUND_NOTIFY_MIN_DURATION, TerminalPane,
+    WAITING_IDLE_THRESHOLD,
+};
 use crate::daemon::{AiHookState, AiTool};
 
 impl TerminalPane {
@@ -30,6 +33,9 @@ impl TerminalPane {
             self.ai_hook_active = false;
             self.ai_hook_state = None;
             self.ai_working_since = None;
+            self.ai_permission_prompt_detected = false;
+            self.last_agy_prompt_checked_gen = None;
+            self.last_agy_prompt_visible = false;
             self.had_background_output = false;
             self.work_indicator_started_at = None;
             self.last_output_instant = None;
@@ -51,6 +57,20 @@ impl TerminalPane {
             self.active_ai_tool = Some(t);
         }
         self.ai_hook_active = true;
+        let was_prompt_detected = self.ai_permission_prompt_detected;
+        // 画面検知による Waiting 中にフックの Working が届いても、ダイアログがまだ画面に残っている場合は
+        // 検知中の状態を維持し、1.2 秒後の再検知・重複通知を防ぐ
+        if state == AiHookState::Working
+            && was_prompt_detected
+            && self.active_ai_tool == Some(AiTool::Agy)
+            && self.has_agy_permission_prompt()
+        {
+            self.last_agy_prompt_checked_gen = Some(self.content_generation);
+            self.last_agy_prompt_visible = true;
+            return false;
+        }
+        self.ai_permission_prompt_detected = false;
+        self.last_agy_prompt_checked_gen = None;
         let now = Instant::now();
         self.had_background_output = false;
         self.work_indicator_started_at = None;
@@ -67,8 +87,9 @@ impl TerminalPane {
             }
             AiHookState::Waiting => {
                 // あいだに Working / Idle / ユーザー入力（write_input） / スロット確認（clear_attention）を
-                // 挟まずに届いた重複 Waiting（例: PermissionRequest の 6 秒後に来る Notification）を抑止する
-                if self.ai_hook_state == Some(AiHookState::Waiting) {
+                // 挟まずに届いた重複 Waiting（例: PermissionRequest の 6 秒後に来る Notification）を抑止する。
+                // ただし画面検知由来の Waiting はフックの Waiting（Stop 等）を抑止しない。
+                if self.ai_hook_state == Some(AiHookState::Waiting) && !was_prompt_detected {
                     return false;
                 }
                 let worked_duration = self
@@ -163,16 +184,128 @@ impl TerminalPane {
         })
     }
 
+    /// アクティブ画面の最後の非空行から最大 16 行以内に `agy` のパーミッション確認ダイアログ
+    /// （許可／拒否の選択肢ペア）が表示されているか判定する。
+    fn has_agy_permission_prompt(&self) -> bool {
+        if self.rows == 0 || self.cols == 0 {
+            return false;
+        }
+        let mut last_non_empty_row = None;
+        for row in (0..self.rows).rev() {
+            if hash_active_line(&self.terminal, self.cols, row).is_some() {
+                last_non_empty_row = Some(row);
+                break;
+            }
+        }
+        let Some(end_row) = last_non_empty_row else {
+            return false;
+        };
+        let start_row = end_row.saturating_sub(15);
+
+        let mut lines: Vec<String> = Vec::with_capacity(usize::from(end_row - start_row + 1));
+        let mut grapheme_buf = ['\0'; 16];
+        for row in start_row..=end_row {
+            let mut row_text = String::with_capacity(usize::from(self.cols));
+            for col in 0..self.cols {
+                let Ok(gr) = self.terminal.grid_ref(Point::Active(PointCoordinate {
+                    x: col,
+                    y: u32::from(row),
+                })) else {
+                    row_text.push(' ');
+                    continue;
+                };
+                let wide = gr
+                    .cell()
+                    .ok()
+                    .and_then(|c| c.wide().ok())
+                    .unwrap_or(CellWide::Narrow);
+                if matches!(wide, CellWide::SpacerTail | CellWide::SpacerHead) {
+                    continue;
+                }
+                let len = gr.graphemes(&mut grapheme_buf).unwrap_or(0);
+                if len == 0 {
+                    row_text.push(' ');
+                } else {
+                    for &ch in &grapheme_buf[..len] {
+                        row_text.push(ch);
+                    }
+                }
+            }
+            let trimmed_len = row_text.trim_end().len();
+            row_text.truncate(trimmed_len);
+            lines.push(row_text);
+        }
+
+        let line_refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        has_agy_permission_prompt_lines(&line_refs)
+    }
+
     /// 裏タブで出力が止まったときに「入力待ち」へ遷移させ、
     /// 実行中インジケータを伴う長時間処理が完了した場合は OS 通知する。
-    /// AI 稼働中はフック駆動のため、ここでの汎用アイドル判定は行わない。
+    /// AI 稼働中はフック駆動のため汎用アイドル判定は行わないが、
+    /// `PermissionRequest` フックを持たない `agy` では `Working` 中のパーミッション確認 UI のみ補完検知する。
     pub fn update_waiting_state(
         &mut self,
         now: Instant,
         is_active: bool,
+        window_focused: bool,
         slot_label: Option<&str>,
     ) -> bool {
         if self.is_ai_hook_managed() {
+            if self.active_ai_tool != Some(AiTool::Agy) {
+                return false;
+            }
+            if self.ai_permission_prompt_detected {
+                if self.last_agy_prompt_checked_gen != Some(self.content_generation) {
+                    self.last_agy_prompt_checked_gen = Some(self.content_generation);
+                    self.last_agy_prompt_visible = self.has_agy_permission_prompt();
+                }
+                if !self.last_agy_prompt_visible {
+                    // 応答後の次フレームでダイアログが画面から消えたら Working へ復帰する
+                    // （裏スロットを開いて clear_attention で Waiting を消したあとの応答も含む）
+                    self.ai_permission_prompt_detected = false;
+                    self.ai_hook_state = Some(AiHookState::Working);
+                    self.is_waiting_input = false;
+                    return true;
+                }
+                if self.ai_hook_state == Some(AiHookState::Waiting)
+                    && !is_active
+                    && !self.is_waiting_input
+                {
+                    self.is_waiting_input = true;
+                    return true;
+                }
+                return false;
+            }
+            if self.ai_hook_state == Some(AiHookState::Working)
+                && self
+                    .last_pty_output_instant
+                    .is_some_and(|t| now.duration_since(t) >= AGY_PERMISSION_PROMPT_IDLE)
+            {
+                if self.last_agy_prompt_checked_gen != Some(self.content_generation) {
+                    self.last_agy_prompt_checked_gen = Some(self.content_generation);
+                    self.last_agy_prompt_visible = self.has_agy_permission_prompt();
+                }
+                if self.last_agy_prompt_visible {
+                    self.ai_hook_state = Some(AiHookState::Waiting);
+                    self.ai_permission_prompt_detected = true;
+                    self.last_output_at = Local::now();
+                    self.last_output_instant = None;
+                    if !is_active {
+                        self.is_waiting_input = true;
+                    }
+                    if (!is_active || !window_focused)
+                        && let Some(label) = slot_label
+                    {
+                        let title = format!("TenT [{}] {}", label, self.folder_name);
+                        self.try_send_os_notification(
+                            title,
+                            "AI がパーミッション確認を待っています".to_string(),
+                        );
+                    }
+                    return true;
+                }
+            }
             return false;
         }
         if is_active {
@@ -318,4 +451,143 @@ fn hash_active_line(terminal: &Terminal, cols: u16, row: u16) -> Option<u64> {
     }
 
     has_non_space.then(|| hasher.finish())
+}
+
+/// ダイアログ選択肢の行頭装飾（空白・枠線・選択カーソル・連番）と行末の枠線・空白を取り除く。
+/// diff 行（`+` / `-`）の誤検知を防ぐため `+` / `-` は取り除かない。
+fn strip_option_affixes(line: &str) -> &str {
+    let mut s = line.trim();
+    if let Some(rest) = s
+        .strip_prefix('│')
+        .or_else(|| s.strip_prefix('┃'))
+        .or_else(|| s.strip_prefix('║'))
+    {
+        s = rest.trim_start();
+    }
+    if let Some(rest) = s
+        .strip_suffix('│')
+        .or_else(|| s.strip_suffix('┃'))
+        .or_else(|| s.strip_suffix('║'))
+    {
+        s = rest.trim_end();
+    }
+    if let Some(first) = s.chars().next()
+        && matches!(
+            first,
+            '>' | '❯' | '›' | '▸' | '▶' | '→' | '●' | '○' | '◉' | '•' | '*'
+        )
+    {
+        s = s[first.len_utf8()..].trim_start();
+    }
+    let digits_len = s.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits_len > 0 && digits_len <= 2 {
+        let after_digits = &s[digits_len..];
+        if let Some(rest) = after_digits
+            .strip_prefix(". ")
+            .or_else(|| after_digits.strip_prefix(") "))
+        {
+            s = rest.trim_start();
+        }
+    }
+    s.trim_end()
+}
+
+fn is_agy_allow_option(opt_lower: &str) -> bool {
+    matches!(
+        opt_lower,
+        "yes, run command"
+            | "yes, allow access"
+            | "yes, allow creation"
+            | "yes, allow tool call"
+            | "yes, accept this change"
+            | "yes, elevate"
+            | "yes, grant permission"
+    ) || opt_lower.starts_with("yes, and always allow ")
+        || opt_lower.starts_with("yes, grant permission for ")
+        || opt_lower.starts_with("yes, and always grant permission for ")
+        || opt_lower.starts_with("yes, use auto mode until you exit")
+        || opt_lower.starts_with("yes, and use auto mode until you exit")
+}
+
+fn is_agy_deny_option(opt_lower: &str) -> bool {
+    matches!(
+        opt_lower,
+        "no, cancel"
+            | "no, deny"
+            | "no, deny access"
+            | "no, deny creation"
+            | "no, deny tool call"
+            | "no, deny permission"
+            | "no, reject this change"
+    ) || opt_lower.starts_with("no, and always deny ")
+}
+
+/// `Yes, and tell ... what to do next` / `No, and tell ... what to do differently` を判定する。
+/// `agy` が自前 CRLF 改行で複数行に分けた場合にも対応するため、最大 2 行の続き行を空白連結して末尾一致を確認する。
+fn matches_tell_option(lines: &[&str], idx: usize, prefix: &str, suffix: &str) -> bool {
+    let opt = strip_option_affixes(lines[idx]).to_ascii_lowercase();
+    if !opt.starts_with(prefix) {
+        return false;
+    }
+    if opt.ends_with(suffix) {
+        return true;
+    }
+    let mut joined = opt;
+    for next_line in lines.iter().skip(idx + 1).take(2) {
+        let trimmed = strip_option_affixes(next_line).to_ascii_lowercase();
+        if trimmed.is_empty() || is_agy_allow_option(&trimmed) || is_agy_deny_option(&trimmed) {
+            break;
+        }
+        joined.push(' ');
+        joined.push_str(&trimmed);
+        if joined.ends_with(suffix) {
+            return true;
+        }
+    }
+    false
+}
+
+/// アクティブ画面の行スライスに `agy` のパーミッション確認ダイアログ（許可／拒否選択肢の組）が
+/// 含まれているか判定する。
+/// 最後の拒否行より上に許可行が 1 つ以上あり、直近の許可行から最後の拒否行までが 10 行以内
+/// （かつ間の選択肢行数が 10 件以内）であれば `true` を返す。
+fn has_agy_permission_prompt_lines(lines: &[&str]) -> bool {
+    let mut is_allow = Vec::with_capacity(lines.len());
+    let mut is_deny = Vec::with_capacity(lines.len());
+    let mut last_deny: Option<usize> = None;
+
+    for (idx, line) in lines.iter().enumerate() {
+        let opt_lower = strip_option_affixes(line).to_ascii_lowercase();
+        let allow = is_agy_allow_option(&opt_lower)
+            || matches_tell_option(lines, idx, "yes, and tell ", " what to do next");
+        let deny = !allow
+            && (is_agy_deny_option(&opt_lower)
+                || matches_tell_option(lines, idx, "no, and tell ", " what to do differently"));
+        is_allow.push(allow);
+        is_deny.push(deny);
+        if deny {
+            last_deny = Some(idx);
+        }
+    }
+
+    let Some(deny_idx) = last_deny else {
+        return false;
+    };
+    let Some(nearest_allow) = (0..deny_idx).rev().find(|&i| is_allow[i]) else {
+        return false;
+    };
+    if deny_idx - nearest_allow > 10 {
+        return false;
+    }
+    let options_between = (nearest_allow..=deny_idx)
+        .filter(|&i| is_allow[i] || is_deny[i])
+        .count();
+    options_between <= 10
+}
+
+/// 画面テキストに `agy` のパーミッション確認プロンプトが含まれているか判定する。
+#[cfg(test)]
+pub(super) fn has_agy_permission_prompt_text(text: &str) -> bool {
+    let lines: Vec<&str> = text.lines().collect();
+    has_agy_permission_prompt_lines(&lines)
 }

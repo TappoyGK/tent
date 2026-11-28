@@ -108,7 +108,20 @@ TenT は **Claude Code / agy / Codex** の 3 ツールをフォアグラウン�
 - `--tool agy` を指定すると、`agy` のフック契約に合わせて stdout へ必ず JSON を返します（`--event pre-tool-use` 指定またはトップレベル `hookEventName: "PreToolUse"` 時は `{"decision":"allow"}`、それ以外は `{}`）。
 - `Stop` 時のトップレベル `terminationReason` が `"USER_CANCELED"` の場合は、`fullyIdle` の値にかかわらず自動で `idle`（クリア）扱いになります。
 - `Stop` 時のトップレベル `fullyIdle` が `false`（バックグラウンドタスク残存中）の場合は、入力待ち（黄）へ遷移させず無視します。
-- **制限事項**: `agy` のフック仕様では、`fullyIdle: false` の `Stop` のあとにすべてのバックグラウンドタスクが完了しても改めて `fullyIdle: true` の `Stop` が発火するかは定められていません。改めて発火しない場合は、次のプロンプト送信または手動キャンセルまで緑表示が残ります。
+- **ユーザー質問（`ask_question`）の検知**: `ask_question` ツールは `PreToolUse` / `PostToolUse` フックで即時に入力待ち（黄）／作業中（緑）を切り替えます。
+- **パーミッション確認待ちの画面補完検知**: `agy` のフック仕様には `PermissionRequest` イベントが存在しないため、`agy` が `Working` 中に 1.2 秒以上 PTY 出力がなく、かつアクティブ画面の最後の非空行から最大 16 行以内に下記の英語選択肢ペア（大文字・小文字区別なし）が表示されている場合、自動で入力待ち（黄）へ遷移させます。
+  - 実機 `agy`（46 列・`Run this command?` の記録で確認）は代替スクリーン・同期出力（DEC Mode 2026）・自前 CRLF 改行（`\x1b[?7l`）で描画し、確認ダイアログ表示中は無出力、応答後の次フレームでダイアログを消去します。フッターには実行中・確認待ちとも `esc to cancel` が出るため、フッター文字列での除外は行いません。
+  - 照合時は前後の空白・枠線（`│┃║`）・選択記号（`>❯›▸▶→●○◉•*`）・2 桁までの連番（`1.` / `1)`）を取り除いた行全体で判定します（行末に他の文字や飾りが付く場合は一致しません）。最後の拒否行より上に許可行が 1 つ以上あり、直近の許可行から最後の拒否行までが 10 行以内（かつ間の選択肢行数が 10 件以内）の場合に一致とみなします（拒否選択肢が複数並ぶダイアログや、自前 CRLF 改行で非選択肢行を挟む場合にも対応）。
+  - **許可側**: `Yes, run command` / `Yes, allow access` / `Yes, allow creation` / `Yes, allow tool call` / `Yes, accept this change` / `Yes, elevate` / `Yes, grant permission` / `Yes, and always allow ...`（前方一致） / `Yes, grant permission for ...`（前方一致） / `Yes, and always grant permission for ...`（前方一致） / `Yes, use Auto mode until you exit...`（前方一致） / `Yes, and use Auto mode until you exit...`（前方一致） / `Yes, and tell ... what to do next`（自前改行時は最大 2 行の続き行を連結して末尾一致）
+  - **拒否側**: `No, cancel` / `No, deny` / `No, deny access` / `No, deny creation` / `No, deny tool call` / `No, deny permission` / `No, reject this change` / `No, and always deny ...`（前方一致） / `No, and tell ... what to do differently`（自前改行時は最大 2 行の続き行を連結して末尾一致）
+  - **通知・復帰・スロット切替**: 画面補完検知の OS 通知は裏スロットまたはウィンドウ非フォーカス時に作業時間にかかわらず送信されます（フック由来の `Waiting` は 5 秒以上の作業時のみ）。アクティブスロットで検知したまま別スロットへ移動すると、裏スロット側が黄色（入力待ち）になります。ユーザーが応答して次フレームでダイアログが画面から消えると自動で `Working` へ復帰します（`clear_attention` で黄色を消したあとの応答も含む）。画面検知由来の `Waiting` はフック由来の `Waiting`（`Stop` 等）を抑止せず、ダイアログ表示中にフックの `Working` が届いた場合は画面にダイアログが残っている限り検知状態を維持して重複通知を防ぎます。
+- **制限事項**:
+  - `agy` のフック仕様では、`fullyIdle: false` の `Stop` のあとにすべてのバックグラウンドタスクが完了しても改めて `fullyIdle: true` の `Stop` が発火するかは定められていません。改めて発火しない場合は、次のプロンプト送信または手動キャンセルまで緑表示が残ります。
+  - パーミッション確認待ちの画面補完検知は `agy` の `Working` 状態のみが対象であり、上記の英語選択肢文言・並び条件および最後の非空行から最大 16 行の検査範囲に依存します。
+  - 実機記録で確認できているのは 46 列の `Run this command?` ダイアログのみであり、`Allow creation` / `Allow access` 等の他ダイアログ・`No, and tell ...` の実描画・46 列以外の幅・実時間間隔・`Stop` / `PreInvocation` フックの実際の発火順序・`Tab`（Amend）画面の描画は未確認です（`Tab` で Amend 画面に移って確認ダイアログが消えると、編集中でも `Working` へ戻ります）。
+  - 応答後もダイアログが画面に残る描き方（`Run this command?` 以外では未確認）では、キー入力で解除しないため画面から消えるまで黄色が残ります。逆に、検知中にリサイズ再描画等でダイアログが一瞬でも画面から消えたタイミングで検査が走ると `Working` に戻り、再表示から 1.2 秒後に再検知・再通知されます。また、1 つ目のダイアログが消えてから 2 つ目が出るまでに検査が走らないと、2 つ目は同じ `Waiting` の継続扱いとなり 2 回目の通知は出ません（黄色表示は継続）。
+  - ブラウザ側で開く `Allow remote debugging?` は端末画面に出ないため検知できません。また、`Allow sandbox bypass for command execution?`（許可／拒否とも未確認）や `Allow administrator elevation?`（拒否側未確認）が上記一覧外の文言を使う場合や、行末に別表記が付く描き方では検知できません。
+  - 会話本文に上記一覧（完全一致および前方一致の文言）に一致する許可／拒否行が 10 行以内に並んだ状態で 1.2 秒以上無出力になった場合は誤検知が起こりえます。
 
 ```json
 {

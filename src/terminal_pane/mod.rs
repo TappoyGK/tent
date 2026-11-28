@@ -43,6 +43,8 @@ const BACKGROUND_NOTIFY_MIN_DURATION: Duration = Duration::from_secs(5);
 const ACTIVE_OUTPUT_FAST_PATH: Duration = Duration::from_millis(50);
 /// DEC Mode 2026 (Synchronized Output) で描画ホールドを許可する最大時間（固まり防止）
 const SYNC_OUTPUT_MAX_HOLD: Duration = Duration::from_secs(1);
+/// agy の Working 中に PTY 出力が止まってからパーミッション確認プロンプトを検知するまでの無出力時間
+const AGY_PERMISSION_PROMPT_IDLE: Duration = Duration::from_millis(1200);
 
 /// イベントループへのカスタム通知
 #[derive(Debug, Clone)]
@@ -130,6 +132,15 @@ pub struct TerminalPane {
     pub ai_hook_state: Option<AiHookState>,
     /// AI が Working 状態に入った時刻（長時間処理の OS 通知判定用）
     ai_working_since: Option<Instant>,
+    /// 直近の PTY バイト受信時刻（AI フック管理モード中の無出力時間計測専用）
+    last_pty_output_instant: Option<Instant>,
+    /// agy の画面パーミッション確認プロンプト検知によって Waiting へ昇格したか
+    /// （スロット確認 `clear_attention` で Waiting を消したあとも、ダイアログ消去まで保持する）
+    ai_permission_prompt_detected: bool,
+    /// agy パーミッション確認プロンプトを最後に検査した `content_generation`
+    last_agy_prompt_checked_gen: Option<u64>,
+    /// 最後の `has_agy_permission_prompt()` 結果キャッシュ
+    last_agy_prompt_visible: bool,
     last_seen_line_hashes: Vec<Option<u64>>,
     last_seen_total_rows: usize,
     last_active_line_hashes: Vec<Option<u64>>,
@@ -215,6 +226,10 @@ impl TerminalPane {
             ai_hook_active: false,
             ai_hook_state: None,
             ai_working_since: None,
+            last_pty_output_instant: None,
+            ai_permission_prompt_detected: false,
+            last_agy_prompt_checked_gen: None,
+            last_agy_prompt_visible: false,
             last_seen_line_hashes: Vec::new(),
             last_seen_total_rows: 0,
             last_active_line_hashes: Vec::new(),
@@ -290,6 +305,10 @@ impl TerminalPane {
             ai_hook_active: false,
             ai_hook_state: None,
             ai_working_since: None,
+            last_pty_output_instant: None,
+            ai_permission_prompt_detected: false,
+            last_agy_prompt_checked_gen: None,
+            last_agy_prompt_visible: false,
             last_seen_line_hashes: Vec::new(),
             last_seen_total_rows: 0,
             last_active_line_hashes: Vec::new(),
@@ -310,9 +329,12 @@ impl TerminalPane {
 
     pub fn write_input(&mut self, bytes: &[u8]) {
         if !bytes.is_empty() {
-            // ユーザーが承認・拒否・次プロンプト等を入力したら AI の Waiting 状態を解除し、
-            // 以降の正当な Waiting（PermissionRequest / Stop）を取りこぼさないようにする
-            if self.ai_hook_state == Some(AiHookState::Waiting) {
+            // 画面検知による agy のパーミッション待ちは、実機では応答後の次フレームでダイアログが
+            // 消えるため、キー種別による推測を行わず画面からダイアログが消えた時点で Working へ戻す。
+            // フック由来の Waiting（PermissionRequest / Stop 等）は従来どおり入力時に解除する。
+            if !self.ai_permission_prompt_detected
+                && self.ai_hook_state == Some(AiHookState::Waiting)
+            {
                 self.ai_hook_state = None;
                 self.is_waiting_input = false;
             }
@@ -461,6 +483,7 @@ impl TerminalPane {
             return;
         }
         let now = Instant::now();
+        self.last_pty_output_instant = Some(now);
         let is_ai_managed = self.is_ai_hook_managed();
 
         // AI フック管理モード中はフックイベントを唯一の正とし、
@@ -623,6 +646,8 @@ impl TerminalPane {
             self.write_input(b"\x0c");
         }
         self.mark_screen_seen();
+        self.last_agy_prompt_checked_gen = None;
+        self.last_agy_prompt_visible = false;
         self.content_generation = self.content_generation.wrapping_add(1);
         self.mark_dirty();
     }
