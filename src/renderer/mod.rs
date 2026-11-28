@@ -1,10 +1,12 @@
 mod footer;
 mod help_modal;
 mod main_pane;
+mod overlays;
 mod primitives;
 mod search_bar;
 mod sidebar;
 mod status_bar;
+mod textures;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,6 +18,11 @@ use glyphon::{
 };
 use wgpu::util::DeviceExt;
 use winit::window::Window;
+
+pub use overlays::{
+    MemoryOverlay, RenderOutcome, RenderOverlays, SearchBarOverlay, SearchHighlightOverlay,
+    SelectionOverlay, TimerOverlay, UrlHoverOverlay,
+};
 
 use crate::layout::{AppLayout, Rect};
 use crate::slot::{NUM_SLOTS, Workspace};
@@ -50,114 +57,6 @@ struct CachedPaneVisual {
     snapshot: MainScreenSnapshot,
     /// 行単位のテキストキャッシュ（dirty な行のみ再シェイプ）
     row_spans: Vec<Vec<CachedMainSpan>>,
-}
-
-/// マウス選択範囲
-#[derive(Clone, Copy, Debug)]
-pub struct SelectionOverlay {
-    pub pane_id: PaneId,
-    pub start: (u16, u16),
-    pub end: (u16, u16),
-}
-
-/// ホバー中 URL の下線ハイライト範囲
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct UrlHoverOverlay {
-    pub pane_id: PaneId,
-    pub row: u16,
-    pub start_col: u16,
-    pub end_col: u16,
-}
-
-/// ステータスバー横長タイマーの表示状態
-#[derive(Clone, Debug, Default)]
-pub struct TimerOverlay {
-    /// 残りまたは設定中の割合（0.0 = 0分, 1.0 = 60分）
-    pub fraction: f32,
-    /// タイマー設定時間に対する残り割合（1.0 = 開始直後, 0.0 = 終了。砂時計用）
-    pub progress: f32,
-    /// 表示する分数ラベル（例: "25m"、停止中は空）
-    pub label: String,
-    pub is_dragging: bool,
-    pub is_running: bool,
-    pub is_finished: bool,
-    /// 砂粒落下アニメーション用フレームカウンタ
-    pub anim_tick: u32,
-}
-
-/// ペイン内検索のビューポート内ハイライト一覧
-#[derive(Clone, Debug)]
-pub struct SearchHighlightOverlay {
-    pub pane_id: PaneId,
-    /// `(vp_row, start_col, end_col, is_current)`
-    pub matches: Vec<(u16, u16, u16, bool)>,
-}
-
-/// ペイン内検索バーの表示状態
-#[derive(Clone, Debug)]
-pub struct SearchBarOverlay<'a> {
-    pub pane_id: PaneId,
-    pub is_browser: bool,
-    pub query: &'a str,
-    pub select_all: bool,
-    pub count_label: String,
-}
-
-/// ステータスバーのメモリ使用量バー表示状態
-/// 80% ライン = 1.0 GiB（GPU 込みの実測目安）、100% フルスケール = 1.25 GiB
-#[derive(Clone, Debug, Default)]
-pub struct MemoryOverlay {
-    /// フルスケール（1.25 GiB）に対する使用率（0.0..=1.0）
-    pub fraction: f32,
-    /// 80% 警告ライン（1.0 GiB）を超過しているか
-    pub is_over_budget: bool,
-    /// バー中央に表示する現在値ラベル（例: "480M", "1.2G"）
-    pub label: String,
-}
-
-impl MemoryOverlay {
-    /// ターミナル＋デーモン合計（GPU/Metal フットプリント込み）の基準ライン（1.0 GiB = バーの 80%）
-    pub const BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
-    /// バーの 100% フルスケール（1.25 GiB = 1.0 GiB / 0.8）
-    pub const FULL_SCALE_BYTES: u64 = 1280 * 1024 * 1024;
-
-    pub fn from_bytes(bytes: u64) -> Self {
-        if bytes == 0 {
-            return Self::default();
-        }
-        let fraction = (bytes as f64 / Self::FULL_SCALE_BYTES as f64).clamp(0.0, 1.0) as f32;
-        Self {
-            fraction,
-            is_over_budget: bytes > Self::BUDGET_BYTES,
-            label: crate::macos::format_memory_bytes(bytes),
-        }
-    }
-}
-
-/// 描画時のオーバーレイ状態（IME・D&D・テキスト選択・URLホバー・URLバー編集・検索・システム状態・ヘルプ）
-pub struct RenderOverlays<'a> {
-    pub ime_preedit: &'a str,
-    pub drag_source_slot: Option<usize>,
-    pub drag_hover_slot: Option<usize>,
-    pub selection: Option<SelectionOverlay>,
-    pub hovered_url: Option<UrlHoverOverlay>,
-    pub url_bar_editing: Option<(&'a str, bool)>,
-    pub search_highlights: Option<SearchHighlightOverlay>,
-    pub search_bar: Option<SearchBarOverlay<'a>>,
-    pub battery: Option<crate::macos::BatteryStatus>,
-    pub wifi: Option<crate::macos::WifiStatus>,
-    pub show_help: bool,
-    pub daemon_version_mismatch: bool,
-    pub daemon_upgrade_confirm: bool,
-    pub version_copied: bool,
-    pub timer: TimerOverlay,
-    pub memory: &'a MemoryOverlay,
-}
-
-/// 1フレーム描画の戻り値
-pub struct RenderOutcome {
-    pub cursor_area: Option<(f32, f32, f32, f32)>,
-    pub needs_redraw: bool,
 }
 
 type FooterCacheKey = (Vec<(String, bool)>, u32, u32);
@@ -581,91 +480,6 @@ impl Renderer {
             help_right_buffer,
             help_cache_key: (0, 0),
         })
-    }
-
-    /// ブラウザサムネイルの RGBA 画像を GPU テクスチャへアップロードする
-    pub fn update_browser_snapshot(
-        &mut self,
-        pane_id: PaneId,
-        width: u32,
-        height: u32,
-        rgba: &[u8],
-    ) {
-        if width == 0 || height == 0 || rgba.len() < (width as usize * height as usize * 4) {
-            return;
-        }
-        let write_pixels = |texture: &wgpu::Texture| {
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                rgba,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(width * 4),
-                    rows_per_image: Some(height),
-                },
-                wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
-        };
-
-        // 同じ解像度の既存テクスチャがあれば再利用し、不要な GPU テクスチャ再確保を避ける
-        if let Some((texture, _, cur_w, cur_h)) = self.browser_textures.get(&pane_id)
-            && *cur_w == width
-            && *cur_h == height
-        {
-            write_pixels(texture);
-            return;
-        }
-
-        let tex_format = if self.is_srgb {
-            wgpu::TextureFormat::Rgba8UnormSrgb
-        } else {
-            wgpu::TextureFormat::Rgba8Unorm
-        };
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("browser_thumb"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: tex_format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        write_pixels(&texture);
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("browser_thumb_bg"),
-            layout: &self.image_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.image_sampler),
-                },
-            ],
-        });
-        self.browser_textures
-            .insert(pane_id, (texture, bind_group, width, height));
-    }
-
-    pub fn retain_browser_textures(&mut self, live_ids: &[PaneId]) {
-        self.browser_textures.retain(|id, _| live_ids.contains(id));
     }
 
     pub fn resize(&mut self, width: u32, height: u32, scale_factor: f32) {
