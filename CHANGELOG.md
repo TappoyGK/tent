@@ -21,6 +21,7 @@
 - 内蔵ブラウザ（`WKWebView`）フォーカス中に基本的な編集ショートカット（`Cmd+C` / `Cmd+V` / `Cmd+Shift+V` / `Cmd+X` / `Cmd+A` / `Cmd+Z` / `Cmd+Shift+Z`）が効くように修正
 - リサイズによる折り返し変化・ビューポート上部の処理中表示・再出力後の古い通知フラグ保持によるターミナル状態（黄色／オレンジ）の偽陽性を修正
 - 不可視 PTY 再描画や AI TUI の下部 UI 更新によるターミナル状態（緑／黄／時刻）の偽陽性を修正（AI フック受信セッションでは PTY 出力由来の汎用判定を抑止）
+- `tent hook` が stdin JSON のトップレベルフィールドを厳密に解析し、`SubagentStop` / `SubagentStart`・トップレベル `agent_id` 付きの非許可待ち `waiting`/`idle`・`agy` のバックグラウンド残存（`fullyIdle: false`、`USER_CANCELED` を除く）を無視するよう修正（`PermissionRequest` / `Notification` の許可待ちと `working` は維持）
 
 ## [0.1.22] - 2026-11-27
 
