@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::terminal_pane::PaneId;
 
 use super::protocol::{ClientMsg, read_daemon_event, write_client_msg};
-use super::{DAEMON_PROTOCOL_VERSION, DaemonEvent, ReplayedPane};
+use super::{AiHookState, AiTool, DAEMON_PROTOCOL_VERSION, DaemonEvent, ReplayedPane};
 
 /// GUI 側からデーモンへ非同期コマンドを送るハンドル
 #[derive(Clone)]
@@ -183,6 +183,26 @@ pub(super) fn normalize_post_handshake_event(ev: DaemonEvent, server_version: u3
         return DaemonEvent::Resync(rp);
     }
     ev
+}
+
+/// 単発 CLI（`tent hook`）から常駐デーモンへ AI フック状態イベントを送信する。
+/// デーモン未起動やソケット切断時は呼び出し元の AI フックを妨げないよう短時間でエラー返却する。
+pub fn send_hook_event(
+    sock_path: &Path,
+    pane_id: PaneId,
+    state: AiHookState,
+    tool: Option<AiTool>,
+) -> io::Result<()> {
+    let mut stream = UnixStream::connect(sock_path)?;
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+    write_client_msg(
+        &mut stream,
+        &ClientMsg::HookEvent {
+            pane_id,
+            state,
+            tool,
+        },
+    )
 }
 
 /// 指定ソケットで待ち受けている常駐デーモンをピンポイントで停止する（明示的なアップグレード用）。

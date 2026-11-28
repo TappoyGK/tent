@@ -186,6 +186,9 @@ impl Slot {
                 p.is_waiting_input = false;
                 p.had_background_output = false;
                 p.work_indicator_started_at = None;
+                if p.ai_hook_state == Some(crate::daemon::AiHookState::Waiting) {
+                    p.ai_hook_state = None;
+                }
                 p.mark_screen_seen();
             });
         }
@@ -195,7 +198,7 @@ impl Slot {
         if let Some(root) = &mut self.root {
             root.for_each_terminal_mut(&mut |p| {
                 p.mark_screen_seen();
-                if p.is_actively_outputting(now) {
+                if !p.is_ai_hook_managed() && p.is_actively_outputting(now) {
                     p.had_background_output = true;
                     if p.has_active_work_indicator() {
                         p.work_indicator_started_at.get_or_insert(now);

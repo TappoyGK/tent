@@ -11,12 +11,13 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Local};
 use ghostty_vt::paste;
 use ghostty_vt::render::{CellIterator, RowIterator};
+use ghostty_vt::screen::CellWide;
 pub use ghostty_vt::screen::TrackedGridRef;
 use ghostty_vt::style::RgbColor;
 use ghostty_vt::terminal::{Mode, Point, PointCoordinate, PointSpace};
 use ghostty_vt::{Event as VtEvent, RenderState, Terminal, TerminalOptions};
 
-use crate::daemon::{DaemonClient, ReplayedPane};
+use crate::daemon::{AiHookState, AiTool, DaemonClient, ReplayedPane};
 use crate::macos;
 
 pub use selection::UrlMatch;
@@ -34,6 +35,8 @@ const RESIZE_GRACE_PERIOD: Duration = Duration::from_secs(1);
 const WAITING_IDLE_THRESHOLD: Duration = Duration::from_secs(4);
 /// 裏スロットでの完了・入力待ち OS 通知を出すための最小実行時間（短時間ノイズ抑制）
 const BACKGROUND_NOTIFY_MIN_DURATION: Duration = Duration::from_secs(5);
+/// 連続出力中に全行ハッシュ比較を省略する短時間ウィンドウ（高スループット維持用）
+const ACTIVE_OUTPUT_FAST_PATH: Duration = Duration::from_millis(50);
 /// DEC Mode 2026 (Synchronized Output) で描画ホールドを許可する最大時間（固まり防止）
 const SYNC_OUTPUT_MAX_HOLD: Duration = Duration::from_secs(1);
 
@@ -115,7 +118,18 @@ pub struct TerminalPane {
     osc133_tail: [u8; 6],
     osc133_tail_len: u8,
     pub is_waiting_input: bool,
-    last_seen_screen_hash: u64,
+    /// このペインで特別監視対象の AI ツール（Claude Code / agy / Codex）が稼働中か
+    pub active_ai_tool: Option<AiTool>,
+    /// 現在の AI セッションでフックイベントを 1 回以上受信済みか（未設定ユーザーは一般ルールを維持）
+    pub ai_hook_active: bool,
+    /// AI フックから通知された明示状態（AI フック管理モード中は画面差分ルールを止めてこれを正とする）
+    pub ai_hook_state: Option<AiHookState>,
+    /// AI が Working 状態に入った時刻（長時間処理の OS 通知判定用）
+    ai_working_since: Option<Instant>,
+    last_seen_line_hashes: Vec<Option<u64>>,
+    last_seen_total_rows: usize,
+    last_active_line_hashes: Vec<Option<u64>>,
+    active_lines_dirty: bool,
     last_notification_sent: Option<Instant>,
     pub minimap: MinimapSnapshot,
     minimap_dirty: bool,
@@ -191,7 +205,14 @@ impl TerminalPane {
             osc133_tail: [0; 6],
             osc133_tail_len: 0,
             is_waiting_input: false,
-            last_seen_screen_hash: 0,
+            active_ai_tool: None,
+            ai_hook_active: false,
+            ai_hook_state: None,
+            ai_working_since: None,
+            last_seen_line_hashes: Vec::new(),
+            last_seen_total_rows: 0,
+            last_active_line_hashes: Vec::new(),
+            active_lines_dirty: true,
             last_notification_sent: None,
             minimap: MinimapSnapshot {
                 cols,
@@ -258,7 +279,14 @@ impl TerminalPane {
             osc133_tail: [0; 6],
             osc133_tail_len: 0,
             is_waiting_input: false,
-            last_seen_screen_hash: 0,
+            active_ai_tool: None,
+            ai_hook_active: false,
+            ai_hook_state: None,
+            ai_working_since: None,
+            last_seen_line_hashes: Vec::new(),
+            last_seen_total_rows: 0,
+            last_active_line_hashes: Vec::new(),
+            active_lines_dirty: true,
             last_notification_sent: None,
             minimap: MinimapSnapshot {
                 cols,
@@ -274,6 +302,12 @@ impl TerminalPane {
 
     pub fn write_input(&mut self, bytes: &[u8]) {
         if !bytes.is_empty() {
+            // ユーザーが承認・拒否・次プロンプト等を入力したら AI の Waiting 状態を解除し、
+            // 以降の正当な Waiting（PermissionRequest / Stop）を取りこぼさないようにする
+            if self.ai_hook_state == Some(AiHookState::Waiting) {
+                self.ai_hook_state = None;
+                self.is_waiting_input = false;
+            }
             self.daemon.send_input(self.id, bytes.to_vec());
         }
     }
@@ -360,6 +394,96 @@ impl TerminalPane {
         false
     }
 
+    /// このペインが AI フック駆動モードで管理されているか返す。
+    /// フックを 1 回も設定していない環境では一般ルールを維持し、フックを受信した AI セッションのみ切り替える。
+    pub fn is_ai_hook_managed(&self) -> bool {
+        self.active_ai_tool.is_some() && self.ai_hook_active
+    }
+
+    /// デーモンから届いたフォアグラウンド AI ツール種別を反映する。
+    /// シェル復帰時（`None`）にフック管理モードを解除して一般ルールへ戻す。
+    pub fn update_ai_tool_from_daemon(&mut self, tool: Option<AiTool>) -> bool {
+        if self.active_ai_tool == tool {
+            return false;
+        }
+        self.active_ai_tool = tool;
+        if tool.is_none() {
+            // AI 終了してシェルへ戻ったためフック状態を解除し、現在画面を基準にする
+            self.ai_hook_active = false;
+            self.ai_hook_state = None;
+            self.ai_working_since = None;
+            self.had_background_output = false;
+            self.work_indicator_started_at = None;
+            self.last_output_instant = None;
+            self.mark_screen_seen();
+        }
+        true
+    }
+
+    /// AI フック（`tent hook`）から届いた明示的な状態遷移を適用する。
+    pub fn apply_ai_hook_event(
+        &mut self,
+        state: AiHookState,
+        tool: Option<AiTool>,
+        is_active: bool,
+        window_focused: bool,
+        slot_label: &str,
+    ) -> bool {
+        if let Some(t) = tool {
+            self.active_ai_tool = Some(t);
+        }
+        self.ai_hook_active = true;
+        let now = Instant::now();
+        self.had_background_output = false;
+        self.work_indicator_started_at = None;
+        self.osc133_job_started_at = None;
+
+        match state {
+            AiHookState::Working => {
+                self.ai_hook_state = Some(AiHookState::Working);
+                self.ai_working_since.get_or_insert(now);
+                self.is_waiting_input = false;
+                self.has_notification = false;
+                self.last_output_at = Local::now();
+                self.last_output_instant = Some(now);
+            }
+            AiHookState::Waiting => {
+                // あいだに Working / Idle / ユーザー入力（write_input） / スロット確認（clear_attention）を
+                // 挟まずに届いた重複 Waiting（例: PermissionRequest の 6 秒後に来る Notification）を抑止する
+                if self.ai_hook_state == Some(AiHookState::Waiting) {
+                    return false;
+                }
+                let worked_duration = self
+                    .ai_working_since
+                    .take()
+                    .map(|start| now.saturating_duration_since(start));
+                self.ai_hook_state = Some(AiHookState::Waiting);
+                self.last_output_at = Local::now();
+                self.last_output_instant = None;
+                if !is_active {
+                    self.is_waiting_input = true;
+                }
+                let long_enough =
+                    worked_duration.is_none_or(|d| d >= BACKGROUND_NOTIFY_MIN_DURATION);
+                if (!is_active || !window_focused) && long_enough {
+                    let title = format!("TenT [{}] {}", slot_label, self.folder_name);
+                    self.try_send_os_notification(
+                        title,
+                        "AI の応答が完了／確認待ちになりました".to_string(),
+                    );
+                }
+            }
+            AiHookState::Idle => {
+                self.ai_hook_state = None;
+                self.ai_working_since = None;
+                self.is_waiting_input = false;
+                self.has_notification = false;
+                self.last_output_instant = None;
+            }
+        }
+        true
+    }
+
     /// 過負荷時の自動再同期で受け取った完全スナップショットを現在の端末へ反映する
     /// GUI 側で最新のリサイズが行われていた場合は、旧サイズへ巻き戻さず最新サイズを維持する
     pub fn apply_resync_snapshot(&mut self, replayed: ReplayedPane) {
@@ -377,10 +501,20 @@ impl TerminalPane {
                     self.last_cell_px.1,
                 );
             }
+            let before_total_rows = self.terminal.total_rows().unwrap_or(0);
+            let before_lines = self.current_active_line_hashes();
             self.terminal = decoded;
             self.update_cwd_from_daemon(replayed.cwd);
-            self.last_output_at = Local::now();
-            self.last_output_instant = Some(Instant::now());
+            let after_total_rows = self.terminal.total_rows().unwrap_or(0);
+            let after_lines = self.current_active_line_hashes();
+            self.last_active_line_hashes = after_lines.clone();
+            self.active_lines_dirty = false;
+            if !self.is_ai_hook_managed()
+                && (after_total_rows != before_total_rows || after_lines != before_lines)
+            {
+                self.last_output_at = Local::now();
+                self.last_output_instant = Some(Instant::now());
+            }
             self.mark_dirty();
         }
     }
@@ -408,38 +542,84 @@ impl TerminalPane {
             return;
         }
         let now = Instant::now();
-        let osc133_completed_long = self.process_osc_133_markers(bytes, now);
-        self.terminal.vt_write(bytes);
+        let is_ai_managed = self.is_ai_hook_managed();
+
+        // AI フック管理モード中はフックイベントを唯一の正とし、
+        // PTY 出力による画面差分・タイムスタンプ・作業中/入力待ち判定を一切行わない。
+        let (osc133_completed_long, visual_changed) = if is_ai_managed {
+            self.terminal.vt_write(bytes);
+            self.active_lines_dirty = true;
+            (false, false)
+        } else {
+            let osc133_completed_long = self.process_osc_133_markers(bytes, now);
+            let prev_total_rows = self.terminal.total_rows().unwrap_or(0);
+            // 直近の確定済み可視変化から 50ms 以内で、かつ状態遷移（裏出力初回・通知解除・待機解除）が
+            // 不要な連続ストリーミング中のみハッシュ比較を省略し、時刻や状態は延長しない。
+            // 50ms 経過後のチャンクで必ずハッシュ比較へ戻り、不可視再描画による無限延長を防ぐ。
+            let can_use_fast_path = (is_active || self.had_background_output)
+                && !self.has_notification
+                && !self.is_waiting_input;
+            let fast_streaming = can_use_fast_path
+                && self
+                    .last_output_instant
+                    .is_some_and(|t| now.duration_since(t) < ACTIVE_OUTPUT_FAST_PATH);
+            if !fast_streaming && self.active_lines_dirty {
+                self.last_active_line_hashes = self.current_active_line_hashes();
+                self.active_lines_dirty = false;
+            }
+            self.terminal.vt_write(bytes);
+            let new_total_rows = self.terminal.total_rows().unwrap_or(0);
+            let visual_changed = if new_total_rows != prev_total_rows {
+                self.active_lines_dirty = true;
+                true
+            } else if fast_streaming {
+                self.active_lines_dirty = true;
+                false
+            } else {
+                let after_lines = self.current_active_line_hashes();
+                let changed = after_lines != self.last_active_line_hashes;
+                if changed {
+                    self.last_active_line_hashes = after_lines;
+                }
+                changed
+            };
+            (osc133_completed_long, visual_changed)
+        };
         let in_startup_grace = now.duration_since(self.created_at) < STARTUP_GRACE_PERIOD;
         let is_resize_redraw = self
             .last_resize_instant
             .is_some_and(|t| now.duration_since(t) < RESIZE_GRACE_PERIOD);
-        if !is_resize_redraw {
-            self.last_output_at = Local::now();
-            self.last_output_instant = Some(now);
-            self.is_waiting_input = false;
-            // 処理が再開して新規出力が流れた場合は古い通知フラグを解除する
-            // （同一チャンク内に新規通知・BEL が含まれていれば後段で再点灯する）
-            self.has_notification = false;
-            if !is_active && !in_startup_grace {
-                self.had_background_output = true;
-                if self.has_active_work_indicator() {
-                    self.work_indicator_started_at.get_or_insert(now);
+        if !is_ai_managed {
+            if !is_resize_redraw {
+                // 画面上の可視テキストが実際に変わったときだけ最終更新時刻・出力中状態を更新する
+                if visual_changed {
+                    self.last_output_at = Local::now();
+                    self.last_output_instant = Some(now);
+                    self.is_waiting_input = false;
+                    // 処理が再開して新規出力が流れた場合は古い通知フラグを解除する
+                    // （同一チャンク内に新規通知・BEL が含まれていれば後段で再点灯する）
+                    self.has_notification = false;
+                    if !is_active && !in_startup_grace {
+                        self.had_background_output = true;
+                        if self.has_active_work_indicator() {
+                            self.work_indicator_started_at.get_or_insert(now);
+                        }
+                    }
                 }
+            } else if !self.had_background_output {
+                // リサイズ猶予中の再描画は未確認出力とみなさず基準ハッシュを更新する
+                self.mark_screen_seen();
             }
-        } else if !self.had_background_output {
-            // リサイズ猶予中の再描画は未確認出力とみなさず基準ハッシュを更新する
-            self.mark_screen_seen();
-        }
-        if osc133_completed_long && !is_active && !in_startup_grace {
-            self.is_waiting_input = true;
-            self.had_background_output = false;
-            self.work_indicator_started_at = None;
-            let title = format!("TenT [{}] {}", slot_label, self.folder_name);
-            self.try_send_os_notification(
-                title,
-                "コマンドが完了し入力待ちになりました".to_string(),
-            );
+            if osc133_completed_long && !is_active && !in_startup_grace {
+                self.is_waiting_input = true;
+                self.had_background_output = false;
+                self.work_indicator_started_at = None;
+                let title = format!("TenT [{}] {}", slot_label, self.folder_name);
+                self.try_send_os_notification(
+                    title,
+                    "コマンドが完了し入力待ちになりました".to_string(),
+                );
+            }
         }
         self.minimap_dirty = true;
         self.generation = self.generation.wrapping_add(1);
@@ -451,7 +631,9 @@ impl TerminalPane {
         for event in events {
             match event {
                 VtEvent::PtyWrite(resp) => {
-                    self.write_input(&resp);
+                    if !resp.is_empty() {
+                        self.daemon.send_input(self.id, resp);
+                    }
                 }
                 VtEvent::PwdChanged(uri) => {
                     if let Some(path) = parse_pwd_uri(&uri) {
@@ -545,12 +727,15 @@ impl TerminalPane {
         }
         // リサイズ時点で未確認の変化がなかった場合は、リサイズによる折り返し変化を
         // 「未確認の出力」と誤認しないよう基準ハッシュを新サイズへ追従させる
-        let screen_was_unseen_clean = self.current_screen_hash() == self.last_seen_screen_hash;
+        let screen_was_unseen_clean = self.last_seen_total_rows
+            == self.terminal.total_rows().unwrap_or(0)
+            && self.current_active_line_hashes() == self.last_seen_line_hashes;
         self.cols = cols;
         self.rows = rows;
         self.last_cell_px = (cell_w_px, cell_h_px);
         self.last_resize_instant = Some(Instant::now());
         let _ = self.terminal.resize(cols, rows, cell_w_px, cell_h_px);
+        self.active_lines_dirty = true;
         if screen_was_unseen_clean {
             self.mark_screen_seen();
         }
@@ -558,33 +743,36 @@ impl TerminalPane {
         self.mark_dirty();
     }
 
-    /// 直近2秒以内に出力があったか（LED・出力中ハイライト用）
+    /// 処理中・出力中か（LED・出力中ハイライト用）。
+    /// AI フック管理モード中はフック由来の `Working` 状態を正とし、それ以外は直近 2 秒以内の出力で判定する。
     pub fn is_actively_outputting(&self, now: Instant) -> bool {
+        if self.is_ai_hook_managed() {
+            return self.ai_hook_state == Some(AiHookState::Working);
+        }
         self.last_output_instant
             .is_some_and(|t| now.duration_since(t) < Duration::from_secs(2))
     }
 
-    /// 現在のビューポート上の可視テキスト全体のハッシュを計算する
-    /// （カーソル点滅や同一内容の再描画で「入力待ち」が誤復活するのを防ぐため）
-    pub fn current_screen_hash(&mut self) -> u64 {
+    /// 現在のアクティブ画面（`Point::Active`）各行の可視テキストハッシュ配列をヒープ確保なしで計算する。
+    /// 空行は `None`、非空行は `Some(hash)`。スクロールバック閲覧中でも最新出力を正確に検知できる。
+    pub fn current_active_line_hashes(&self) -> Vec<Option<u64>> {
         if self.rows == 0 || self.cols == 0 {
-            return 0;
+            return Vec::new();
         }
-        let text = extract_selection_from_terminal(
-            &self.terminal,
-            self.cols,
-            self.rows,
-            (0, 0),
-            (self.cols.saturating_sub(1), self.rows.saturating_sub(1)),
-        );
-        let mut hasher = DefaultHasher::new();
-        text.hash(&mut hasher);
-        hasher.finish()
+        let mut hashes = Vec::with_capacity(usize::from(self.rows));
+        for row in 0..self.rows {
+            hashes.push(hash_active_line(&self.terminal, self.cols, row));
+        }
+        hashes
     }
 
-    /// ユーザーがこのペインを確認した時点の画面内容を記憶する
+    /// ユーザーがこのペインを確認した時点の各行ハッシュと総行数を記憶する
     pub fn mark_screen_seen(&mut self) {
-        self.last_seen_screen_hash = self.current_screen_hash();
+        let lines = self.current_active_line_hashes();
+        self.last_seen_line_hashes = lines.clone();
+        self.last_seen_total_rows = self.terminal.total_rows().unwrap_or(0);
+        self.last_active_line_hashes = lines;
+        self.active_lines_dirty = false;
     }
 
     /// ビューポート内に AI エージェントの実行中インジケータ（`esc to interrupt` 等）が表示中か判定する
@@ -616,14 +804,18 @@ impl TerminalPane {
         })
     }
 
-    /// 裏タブで出力が止まったときに「AI入力待ち」へ遷移させ、
-    /// 実行中インジケータを伴う長時間処理が完了した場合は OS 通知する
+    /// 裏タブで出力が止まったときに「入力待ち」へ遷移させ、
+    /// 実行中インジケータを伴う長時間処理が完了した場合は OS 通知する。
+    /// AI 稼働中はフック駆動のため、ここでの汎用アイドル判定は行わない。
     pub fn update_waiting_state(
         &mut self,
         now: Instant,
         is_active: bool,
         slot_label: Option<&str>,
     ) -> bool {
+        if self.is_ai_hook_managed() {
+            return false;
+        }
         if is_active {
             self.had_background_output = false;
             self.work_indicator_started_at = None;
@@ -633,8 +825,6 @@ impl TerminalPane {
             .last_output_instant
             .is_some_and(|t| now.duration_since(t) >= WAITING_IDLE_THRESHOLD);
         if self.had_background_output && idle_long_enough {
-            // Codex / Claude Code 等が処理中（esc to interrupt 表示中）なら入力待ちにしない。
-            // ただし 4 秒以上出力が止まっている場合は過去ログ残留と区別するため開始時刻は引き継がない。
             if self.has_active_work_indicator() {
                 self.work_indicator_started_at = None;
                 return false;
@@ -642,9 +832,11 @@ impl TerminalPane {
             let should_notify = self.should_notify_background_completion(now);
             self.had_background_output = false;
             self.work_indicator_started_at = None;
-            // 最後に確認した時点から可視テキストが一切変わっていなければ（カーソル点滅・同一再描画等）黄色にしない
-            let cur_hash = self.current_screen_hash();
-            if cur_hash == self.last_seen_screen_hash {
+            let cur_lines = self.current_active_line_hashes();
+            let cur_total_rows = self.terminal.total_rows().unwrap_or(0);
+            let has_visible_change = cur_total_rows != self.last_seen_total_rows
+                || cur_lines != self.last_seen_line_hashes;
+            if !has_visible_change {
                 return false;
             }
             if !self.is_waiting_input {
@@ -833,6 +1025,49 @@ impl TerminalPane {
             false
         }
     }
+}
+
+/// アクティブ画面の 1 行をヒープ確保なしでハッシュ化する（空行なら `None`）
+fn hash_active_line(terminal: &Terminal, cols: u16, row: u16) -> Option<u64> {
+    let mut hasher = DefaultHasher::new();
+    let mut grapheme_buf = ['\0'; 16];
+    let mut pending_spaces: u16 = 0;
+    let mut has_non_space = false;
+
+    for col in 0..cols {
+        let Ok(gr) = terminal.grid_ref(Point::Active(PointCoordinate {
+            x: col,
+            y: u32::from(row),
+        })) else {
+            pending_spaces = pending_spaces.saturating_add(1);
+            continue;
+        };
+        let wide = gr
+            .cell()
+            .ok()
+            .and_then(|c| c.wide().ok())
+            .unwrap_or(CellWide::Narrow);
+        if matches!(wide, CellWide::SpacerTail | CellWide::SpacerHead) {
+            continue;
+        }
+        let len = gr.graphemes(&mut grapheme_buf).unwrap_or(0);
+        let is_space = len == 0 || (len == 1 && grapheme_buf[0] == ' ');
+        if is_space {
+            pending_spaces = pending_spaces.saturating_add(1);
+        } else {
+            if pending_spaces > 0 {
+                0u32.hash(&mut hasher);
+                pending_spaces.hash(&mut hasher);
+                pending_spaces = 0;
+            }
+            for &ch in &grapheme_buf[..len] {
+                ch.hash(&mut hasher);
+            }
+            has_non_space = true;
+        }
+    }
+
+    has_non_space.then(|| hasher.finish())
 }
 
 pub fn extract_folder_name(path: &Path) -> String {

@@ -585,6 +585,45 @@ impl Workspace {
         changed
     }
 
+    pub fn apply_ai_tool_updates(
+        &mut self,
+        updates: Vec<(PaneId, Option<crate::daemon::AiTool>)>,
+    ) -> bool {
+        let mut changed = false;
+        for (pane_id, tool) in updates {
+            for slot in &mut self.slots {
+                if let Some(root) = &mut slot.root
+                    && let Some(pane) = root.terminal_pane_mut(pane_id)
+                {
+                    if pane.update_ai_tool_from_daemon(tool) {
+                        changed = true;
+                    }
+                    break;
+                }
+            }
+        }
+        changed
+    }
+
+    pub fn apply_hook_event(
+        &mut self,
+        pane_id: PaneId,
+        state: crate::daemon::AiHookState,
+        tool: Option<crate::daemon::AiTool>,
+        window_focused: bool,
+    ) -> bool {
+        for (idx, slot) in self.slots.iter_mut().enumerate() {
+            if let Some(root) = &mut slot.root
+                && let Some(pane) = root.terminal_pane_mut(pane_id)
+            {
+                let is_active = idx == self.active_slot;
+                let label = Slot::number_label(idx);
+                return pane.apply_ai_hook_event(state, tool, is_active, window_focused, label);
+            }
+        }
+        false
+    }
+
     pub fn has_any_active_output(&self, now: Instant) -> bool {
         self.slots.iter().any(|s| s.is_actively_outputting(now))
     }
