@@ -305,9 +305,7 @@ impl TentApp {
                 }
 
                 // URL バー外をクリックしたら編集終了
-                if self.url_bar_edit.take().is_some() {
-                    self.request_redraw_now();
-                }
+                self.close_url_bar_edit(false);
 
                 // 2. 右サイドバー判定
                 let hit = self
@@ -587,20 +585,6 @@ impl TentApp {
                 if !self.ime_preedit.is_empty() {
                     return;
                 }
-                if self.url_bar_edit.is_some() {
-                    // URL バー編集中でもスロット切替等のアプリショートカットは通す
-                    if let Some(shortcut) = match_app_shortcut(&event, self.modifiers)
-                        && !matches!(
-                            shortcut,
-                            AppShortcut::Copy | AppShortcut::Paste | AppShortcut::FocusUrlBar
-                        )
-                    {
-                        self.handle_shortcut(shortcut);
-                        return;
-                    }
-                    self.handle_url_bar_key(&event);
-                    return;
-                }
                 if self.search.is_some() {
                     // 検索バー編集中でもスロット切替・Cmd+F 全選択等のアプリショートカットは通す
                     if let Some(shortcut) = match_app_shortcut(&event, self.modifiers)
@@ -652,9 +636,7 @@ impl TentApp {
                 Ime::Commit(text) => {
                     self.ime_preedit.clear();
                     if !text.is_empty() {
-                        if let Some(edit) = self.url_bar_edit.as_mut() {
-                            edit.insert_str(&text);
-                        } else if let Some(search) = self.search.as_mut() {
+                        if let Some(search) = self.search.as_mut() {
                             if search.select_all {
                                 search.query.clear();
                                 search.select_all = false;
@@ -721,10 +703,7 @@ impl TentApp {
                         start_col: m.start_col,
                         end_col: m.end_col,
                     }),
-                    url_bar_editing: self
-                        .url_bar_edit
-                        .as_ref()
-                        .map(|e| (e.text.as_str(), e.cursor, e.select_all)),
+                    url_bar_editing: self.url_bar_edit.is_some(),
                     search_highlights: self.search.as_ref().and_then(|s| {
                         let crate::SearchTarget::Terminal(pid) = s.target else {
                             return None;

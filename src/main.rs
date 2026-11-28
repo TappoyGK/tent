@@ -345,6 +345,12 @@ impl TentApp {
             }
         }
         self.layout = Some(layout);
+        if self.url_bar_edit.is_some()
+            && let Some(rect) = self.current_url_bar_rect()
+            && let Some(window) = &self.window
+        {
+            window.reposition_url_bar(rect);
+        }
         self.sync_browsers();
         self.request_redraw_now();
     }

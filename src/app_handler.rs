@@ -121,7 +121,8 @@ impl ApplicationHandler for TentApp {
                 self.update_control_flow(event_loop);
             }
             AppEvent::WebViewClicked { px, py } => {
-                let mut changed = self.url_bar_edit.take().is_some();
+                let mut changed = self.url_bar_edit.is_some();
+                self.close_url_bar_edit(false);
                 if self.search.is_some() {
                     self.close_search();
                     changed = true;
@@ -265,6 +266,12 @@ impl ApplicationHandler for TentApp {
                         self.request_redraw_now();
                     }
                 }
+            }
+            AppEvent::UrlBarSubmit(text) => {
+                self.submit_url_bar_edit(&text);
+            }
+            AppEvent::UrlBarCancel => {
+                self.close_url_bar_edit(true);
             }
         }
     }

@@ -1,6 +1,7 @@
 mod menu;
 mod proxy;
 pub mod types;
+mod url_field;
 mod window;
 
 use std::cell::{Cell, RefCell};
@@ -38,6 +39,7 @@ pub trait ApplicationHandler {
 pub struct ActiveEventLoop {
     mtm: MainThreadMarker,
     window_delegate: Retained<TentWindowDelegate>,
+    proxy: AppProxy,
     control_flow: Cell<ControlFlow>,
     exit_requested: Cell<bool>,
     window: RefCell<Option<Arc<NativeWindow>>>,
@@ -45,7 +47,12 @@ pub struct ActiveEventLoop {
 
 impl ActiveEventLoop {
     pub fn create_window(&self, attrs: WindowAttributes) -> Arc<NativeWindow> {
-        let win = Arc::new(NativeWindow::new(self.mtm, attrs, &self.window_delegate));
+        let win = Arc::new(NativeWindow::new(
+            self.mtm,
+            attrs,
+            &self.window_delegate,
+            self.proxy.clone(),
+        ));
         *self.window.borrow_mut() = Some(Arc::clone(&win));
         win
     }
@@ -326,6 +333,7 @@ pub fn run_app<H: ApplicationHandler + 'static>(proxy: AppProxy, handler: H) {
     let event_loop = ActiveEventLoop {
         mtm,
         window_delegate,
+        proxy: proxy.clone(),
         control_flow: Cell::new(ControlFlow::Wait),
         exit_requested: Cell::new(false),
         window: RefCell::new(None),

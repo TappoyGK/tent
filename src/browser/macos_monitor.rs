@@ -13,7 +13,19 @@ use crate::terminal_pane::AppEvent;
 #[cfg(target_os = "macos")]
 fn is_native_terminal_view(obj: &objc2::runtime::NSObject) -> bool {
     let name = obj.class().name().to_string_lossy();
-    name.contains("TentMetalView") || name == "NSView"
+    name.contains("TentMetalView")
+        || name.contains("NSText")
+        || name.contains("NSClipView")
+        || name == "NSView"
+}
+
+#[cfg(target_os = "macos")]
+fn is_native_text_field_focused(win: &objc2_app_kit::NSWindow) -> bool {
+    win.firstResponder().is_some_and(|fr| {
+        let obj: &objc2::runtime::NSObject = &fr;
+        let name = obj.class().name().to_string_lossy();
+        name.contains("NSText")
+    })
 }
 
 /// WKWebView にフォーカスがある間も TenT のグローバルショートカット
@@ -268,6 +280,16 @@ pub fn install_macos_shortcut_monitor(proxy: AppProxy) {
                 let key_code = event.keyCode();
 
                 if let Some(shortcut) = match_macos_keycode_shortcut(key_code, shift, opt) {
+                    // ネイティブ URL バー（NSTextField）編集中は Cmd+←/→ を行頭/行末移動へ譲る
+                    if matches!(
+                        shortcut,
+                        AppShortcut::BrowserBack | AppShortcut::BrowserForward
+                    ) && let Some(mtm) = MainThreadMarker::new()
+                        && let Some(win) = event.window(mtm)
+                        && is_native_text_field_focused(&win)
+                    {
+                        return event_ptr.as_ptr();
+                    }
                     let _ = proxy.send_event(AppEvent::Shortcut(shortcut));
                     return std::ptr::null_mut();
                 }

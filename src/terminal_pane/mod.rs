@@ -94,6 +94,8 @@ pub enum AppEvent {
         paths: Vec<PathBuf>,
         pos: Option<(f32, f32)>,
     },
+    UrlBarSubmit(String),
+    UrlBarCancel,
 }
 
 /// 1つのターミナルペイン（libghostty-vt + デーモンクライアント接続）

@@ -8,169 +8,74 @@ use crate::slot::{SplitAxis, Workspace};
 use crate::{SearchState, SearchTarget, TentApp, UrlBarEdit};
 
 impl TentApp {
+    pub(crate) fn current_url_bar_rect(&self) -> Option<crate::layout::Rect> {
+        let layout = self.layout.as_ref()?;
+        let scale = self
+            .window
+            .as_ref()
+            .map(|w| w.scale_factor() as f32)
+            .unwrap_or(1.0);
+        let ctrl = layout.status_bar_controls(scale, true, self.daemon_version_mismatch);
+        Some(ctrl.url_bar_rect)
+    }
+
     pub(crate) fn start_url_bar_edit(&mut self) {
         self.sync_live_browser_urls();
-        let Some(ws) = &self.workspace else {
+        let Some((pane_id, url)) = self
+            .workspace
+            .as_ref()
+            .and_then(Workspace::focused_browser)
+            .map(|b| (b.id, b.url.clone()))
+        else {
             return;
         };
-        let Some(b) = ws.focused_browser() else {
+        let Some(url_rect) = self.current_url_bar_rect() else {
             return;
         };
-        let text = b.url.clone();
-        let cursor = text.len();
-        self.url_bar_edit = Some(UrlBarEdit {
-            pane_id: b.id,
-            text,
-            cursor,
-            select_all: true,
-        });
-        self.focus_terminal_view();
+        self.url_bar_edit = Some(UrlBarEdit { pane_id });
+        if let Some(window) = &self.window {
+            window.show_url_bar(url_rect, &url);
+        }
         self.request_redraw_now();
     }
 
-    pub(crate) fn handle_url_bar_key(&mut self, event: &KeyEvent) -> bool {
-        if event.state != ElementState::Pressed {
-            return true;
-        }
-        let Some(edit) = self.url_bar_edit.as_mut() else {
-            return false;
-        };
-
-        if self.modifiers.super_key() && !self.modifiers.control_key() {
-            match &event.logical_key {
-                Key::Character(c) if c.eq_ignore_ascii_case("a") => {
-                    edit.select_all = true;
-                    edit.cursor = edit.text.len();
-                    self.request_redraw_now();
-                    return true;
-                }
-                Key::Character(c) if c.eq_ignore_ascii_case("c") => {
-                    macos::write_clipboard_text(&edit.text);
-                    return true;
-                }
-                Key::Character(c) if c.eq_ignore_ascii_case("x") => {
-                    macos::write_clipboard_text(&edit.text);
-                    edit.text.clear();
-                    edit.cursor = 0;
-                    edit.select_all = false;
-                    self.request_redraw_now();
-                    return true;
-                }
-                Key::Character(c) if c.eq_ignore_ascii_case("v") => {
-                    if let Some(clip) = macos::read_clipboard_text() {
-                        let single_line = clip.replace(['\r', '\n'], "");
-                        edit.insert_str(&single_line);
-                        self.request_redraw_now();
-                    }
-                    return true;
-                }
-                _ => {}
+    pub(crate) fn close_url_bar_edit(&mut self, restore_webview_focus: bool) {
+        if let Some(edit) = self.url_bar_edit.take() {
+            if let Some(window) = &self.window {
+                window.hide_url_bar();
             }
-        }
-
-        if self.modifiers.control_key() && !self.modifiers.super_key() && !self.modifiers.alt_key()
-        {
-            match &event.logical_key {
-                Key::Character(c) if c.eq_ignore_ascii_case("a") => {
-                    edit.move_home();
-                    self.request_redraw_now();
-                    return true;
-                }
-                Key::Character(c) if c.eq_ignore_ascii_case("e") => {
-                    edit.move_end();
-                    self.request_redraw_now();
-                    return true;
-                }
-                Key::Character(c) if c.eq_ignore_ascii_case("b") => {
-                    edit.move_left();
-                    self.request_redraw_now();
-                    return true;
-                }
-                Key::Character(c) if c.eq_ignore_ascii_case("f") => {
-                    edit.move_right();
-                    self.request_redraw_now();
-                    return true;
-                }
-                Key::Character(c) if c.eq_ignore_ascii_case("d") => {
-                    edit.delete_forward();
-                    self.request_redraw_now();
-                    return true;
-                }
-                Key::Character(c) if c.eq_ignore_ascii_case("h") => {
-                    edit.backspace();
-                    self.request_redraw_now();
-                    return true;
-                }
-                _ => {}
-            }
-        }
-
-        match &event.logical_key {
-            Key::Named(NamedKey::Escape) => {
-                let pid = edit.pane_id;
-                self.url_bar_edit = None;
-                self.browsers.focus_webview(pid);
-                self.request_redraw_now();
-            }
-            Key::Named(NamedKey::Enter) => {
-                let edit = self.url_bar_edit.take().unwrap();
-                let url = normalize_url_input(&edit.text);
-                if let Some(ws) = self.workspace.as_mut() {
-                    ws.update_browser_url(edit.pane_id, url.clone());
-                }
-                self.browsers.navigate(edit.pane_id, &url);
+            if restore_webview_focus
+                && self
+                    .workspace
+                    .as_ref()
+                    .and_then(Workspace::focused_browser)
+                    .is_some_and(|b| b.id == edit.pane_id)
+            {
                 self.browsers.focus_webview(edit.pane_id);
-                self.save_state();
-                self.request_redraw_now();
             }
-            Key::Named(NamedKey::Backspace) => {
-                edit.backspace();
-                self.request_redraw_now();
-            }
-            Key::Named(NamedKey::Delete) => {
-                edit.delete_forward();
-                self.request_redraw_now();
-            }
-            Key::Named(NamedKey::ArrowLeft) => {
-                edit.move_left();
-                self.request_redraw_now();
-            }
-            Key::Named(NamedKey::ArrowRight) => {
-                edit.move_right();
-                self.request_redraw_now();
-            }
-            Key::Named(NamedKey::Home) => {
-                edit.move_home();
-                self.request_redraw_now();
-            }
-            Key::Named(NamedKey::End) => {
-                edit.move_end();
-                self.request_redraw_now();
-            }
-            _ => {
-                if !self.modifiers.super_key()
-                    && !self.modifiers.control_key()
-                    && let Some(text) = &event.text
-                {
-                    let filtered: String = text
-                        .chars()
-                        .filter(|&c| {
-                            let cp = c as u32;
-                            !c.is_control() && !(0xF700..=0xF8FF).contains(&cp)
-                        })
-                        .collect();
-                    if !filtered.is_empty() {
-                        edit.insert_str(&filtered);
-                        self.request_redraw_now();
-                    }
-                }
-            }
+            self.request_redraw_now();
         }
-        true
+    }
+
+    pub(crate) fn submit_url_bar_edit(&mut self, raw_text: &str) {
+        let Some(edit) = self.url_bar_edit.take() else {
+            return;
+        };
+        if let Some(window) = &self.window {
+            window.hide_url_bar();
+        }
+        let url = normalize_url_input(raw_text);
+        if let Some(ws) = self.workspace.as_mut() {
+            ws.update_browser_url(edit.pane_id, url.clone());
+        }
+        self.browsers.navigate(edit.pane_id, &url);
+        self.browsers.focus_webview(edit.pane_id);
+        self.save_state();
+        self.request_redraw_now();
     }
 
     pub(crate) fn start_search(&mut self) {
-        self.url_bar_edit = None;
+        self.close_url_bar_edit(false);
         let Some(ws) = self.workspace.as_mut() else {
             return;
         };
@@ -505,7 +410,7 @@ impl TentApp {
             shortcut,
             AppShortcut::Copy | AppShortcut::Paste | AppShortcut::FocusUrlBar
         ) {
-            self.url_bar_edit = None;
+            self.close_url_bar_edit(false);
         }
         // 検索バー編集中でも検索操作以外のナビゲーションを受けたら検索を閉じる
         if !matches!(

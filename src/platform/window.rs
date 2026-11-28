@@ -18,13 +18,15 @@ use raw_window_handle::{
     HasWindowHandle, RawDisplayHandle, RawWindowHandle, WindowHandle,
 };
 
+use crate::layout::Rect;
 use crate::macos::{AppCursorKind, subtract_cursor_rects};
-use crate::platform::dispatch_window_event;
 use crate::platform::types::{
     ElementState, Ime, Key, KeyEvent, LogicalPosition, LogicalSize, ModifiersState, MouseButton,
     MouseScrollDelta, PhysicalKey, PhysicalPosition, PhysicalSize, WindowEvent,
     fallback_unshifted_char, macos_keycode_to_physical, physical_to_named_key,
 };
+use crate::platform::url_field::NativeUrlField;
+use crate::platform::{AppProxy, dispatch_window_event};
 
 /// ウィンドウ生成時の初期属性
 pub struct WindowAttributes {
@@ -557,11 +559,12 @@ impl HasWindowHandle for BrowserContainerHandle {
     }
 }
 
-/// TenT の macOS ネイティブウィンドウ（`NSWindow` + `root_view` + `TentMetalView`）
+/// TenT の macOS ネイティブウィンドウ（`NSWindow` + `root_view` + `TentMetalView` + `NativeUrlField`）
 pub struct NativeWindow {
     ns_window: Retained<NSWindow>,
     root_view: Retained<NSView>,
     metal_view: Retained<TentMetalView>,
+    url_field: NativeUrlField,
     redraw_queued: AtomicBool,
 }
 
@@ -592,7 +595,12 @@ impl HasDisplayHandle for NativeWindow {
 }
 
 impl NativeWindow {
-    pub fn new(mtm: MainThreadMarker, attrs: WindowAttributes, delegate: &NSObject) -> Self {
+    pub fn new(
+        mtm: MainThreadMarker,
+        attrs: WindowAttributes,
+        delegate: &NSObject,
+        proxy: AppProxy,
+    ) -> Self {
         let content_rect = CGRect::new(
             CGPoint::new(0.0, 0.0),
             CGSize::new(attrs.inner_size.width, attrs.inner_size.height),
@@ -622,6 +630,7 @@ impl NativeWindow {
         let root_view = NSView::initWithFrame(mtm.alloc(), content_rect);
         let metal_view = TentMetalView::new(mtm, content_rect);
         root_view.addSubview(&metal_view);
+        let url_field = NativeUrlField::new(mtm, &root_view, proxy);
         ns_window.setContentView(Some(&root_view));
         let _ = ns_window.makeFirstResponder(Some(&metal_view));
 
@@ -640,6 +649,7 @@ impl NativeWindow {
             ns_window,
             root_view,
             metal_view,
+            url_field,
             redraw_queued: AtomicBool::new(false),
         }
     }
@@ -679,6 +689,25 @@ impl NativeWindow {
     /// ターミナル側の `TentMetalView` へ First Responder を戻す
     pub fn focus_terminal(&self) {
         let _ = self.ns_window.makeFirstResponder(Some(&self.metal_view));
+    }
+
+    pub fn show_url_bar(&self, phys_rect: Rect, text: &str) {
+        self.url_field.show(
+            &self.ns_window,
+            &self.root_view,
+            phys_rect,
+            self.scale_factor(),
+            text,
+        );
+    }
+
+    pub fn reposition_url_bar(&self, phys_rect: Rect) {
+        self.url_field
+            .reposition(&self.root_view, phys_rect, self.scale_factor());
+    }
+
+    pub fn hide_url_bar(&self) {
+        self.url_field.hide();
     }
 
     pub fn set_ime_cursor_area(&self, pos: PhysicalPosition<i32>, size: PhysicalSize<u32>) {

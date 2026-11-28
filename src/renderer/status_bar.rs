@@ -411,9 +411,8 @@ impl Renderer {
                 self.main_status_cache_key = status_key;
             }
 
-            // URL バー背景・枠線・全選択ハイライト・テキスト
-            let is_editing = overlays.url_bar_editing.is_some();
-            let is_select_all = overlays.url_bar_editing.is_some_and(|(_, _, sa)| sa);
+            // URL バー背景・枠線・テキスト（編集時はネイティブ NSTextField が前面に載る）
+            let is_editing = overlays.url_bar_editing;
             let url_bg = if is_editing {
                 [0.07, 0.09, 0.13, 1.0]
             } else {
@@ -436,34 +435,11 @@ impl Renderer {
                 url_border,
             );
 
-            let display_url =
-                if let Some((edit_text, cursor, select_all)) = overlays.url_bar_editing {
-                    if select_all {
-                        edit_text.to_string()
-                    } else {
-                        let pos = cursor.min(edit_text.len());
-                        let pos = if edit_text.is_char_boundary(pos) {
-                            pos
-                        } else {
-                            edit_text.len()
-                        };
-                        format!("{}|{}", &edit_text[..pos], &edit_text[pos..])
-                    }
-                } else {
-                    active_browser.map(|b| b.url.clone()).unwrap_or_default()
-                };
-            if is_select_all && !display_url.is_empty() {
-                let char_w = (11.5 * scale_factor).round().max(10.0) * 0.61;
-                let text_w = (display_url.chars().count() as f32 * char_w)
-                    .min((sb_ctrl.url_bar_rect.w - 10.0 * scale_factor).max(0.0));
-                let sel_rect = Rect::new(
-                    sb_ctrl.url_bar_rect.x + 5.0 * scale_factor,
-                    sb_ctrl.url_bar_rect.y + 2.5 * scale_factor,
-                    text_w,
-                    (sb_ctrl.url_bar_rect.h - 5.0 * scale_factor).max(2.0),
-                );
-                self.push_rect(rects, sel_rect, [0.22, 0.48, 0.82, 0.75]);
-            }
+            let display_url = if is_editing {
+                String::new()
+            } else {
+                active_browser.map(|b| b.url.clone()).unwrap_or_default()
+            };
             let url_key = (
                 display_url.clone(),
                 is_editing,
