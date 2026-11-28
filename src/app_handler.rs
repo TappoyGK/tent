@@ -43,16 +43,14 @@ impl ApplicationHandler for TentApp {
         macos::install_app_icon();
         // WKWebView フォーカス中でも Cmd+1..0 / Cmd+B / Cmd+L 等を拾えるようにする
         install_macos_shortcut_monitor(self.proxy.clone());
-        // Finder ファイル・スクショ右下サムネイル等の D&D を確実に受け取る
-        macos::install_file_drop_handler(&window, self.proxy.clone());
 
         let scale = window.scale_factor() as f32;
         let gap = (6.0 * scale).round();
         let size = window.inner_size();
         let layout = AppLayout::compute(size.width, size.height, scale, self.sidebar_state);
 
-        let renderer =
-            Renderer::new(Arc::clone(&window), scale).expect("failed to initialize wgpu renderer");
+        let renderer = Renderer::new(window.surface_target(), size.width, size.height, scale)
+            .expect("failed to initialize wgpu renderer");
 
         // デーモンへ接続（未起動なら自動デタッチ起動）し、生きたペインをすべて再接続
         // スリープや描画停止中に GUI 側キューが際限なく膨張するのを防ぐため有界チャネルを使用し、

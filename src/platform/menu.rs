@@ -7,7 +7,7 @@ use objc2_foundation::{MainThreadMarker, NSString};
 
 /// macOS 標準のメニューバー（App メニュー・Edit メニュー）を構築して `NSApp.mainMenu` へ設定する。
 /// Edit メニューの target は `nil`（First Responder ルーティング）にするため、
-/// `WKWebView` フォーカス中の `Cmd+C/V/X/A/Z/Shift+Z` が AppKit 正規経路でそのまま動作する。
+/// `WKWebView` / `NSTextField` フォーカス中の `Cmd+C/V/X/A/Z/Shift+Z` が AppKit 正規経路でそのまま動作する。
 #[cfg(target_os = "macos")]
 pub fn install_main_menu(mtm: MainThreadMarker) {
     let app = NSApplication::sharedApplication(mtm);
@@ -17,6 +17,29 @@ pub fn install_main_menu(mtm: MainThreadMarker) {
     let app_menu_item = NSMenuItem::new(mtm);
     let app_menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("TenT"));
     unsafe {
+        let about_item = NSMenuItem::initWithTitle_action_keyEquivalent(
+            mtm.alloc(),
+            &NSString::from_str("About TenT"),
+            Some(sel!(orderFrontStandardAboutPanel:)),
+            &NSString::from_str(""),
+        );
+        app_menu.addItem(&about_item);
+
+        app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+        let services_item = NSMenuItem::initWithTitle_action_keyEquivalent(
+            mtm.alloc(),
+            &NSString::from_str("Services"),
+            None,
+            &NSString::from_str(""),
+        );
+        let services_menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("Services"));
+        services_item.setSubmenu(Some(&services_menu));
+        app.setServicesMenu(Some(&services_menu));
+        app_menu.addItem(&services_item);
+
+        app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+
         let hide_item = NSMenuItem::initWithTitle_action_keyEquivalent(
             mtm.alloc(),
             &NSString::from_str("Hide TenT"),

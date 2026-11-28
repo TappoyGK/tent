@@ -9,7 +9,6 @@ mod status_bar;
 mod textures;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Instant;
 
 use glyphon::{
@@ -18,7 +17,7 @@ use glyphon::{
 };
 use wgpu::util::DeviceExt;
 
-use crate::platform::NativeWindow as Window;
+use crate::platform::SurfaceTarget;
 
 pub use overlays::{
     MemoryOverlay, RenderOutcome, RenderOverlays, SearchBarOverlay, SearchHighlightOverlay,
@@ -143,13 +142,17 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(window: Arc<Window>, scale_factor: f32) -> Result<Self, Box<dyn std::error::Error>> {
-        let size = window.inner_size();
-        let width = size.width.max(1);
-        let height = size.height.max(1);
+    pub fn new(
+        surface_target: SurfaceTarget,
+        width: u32,
+        height: u32,
+        scale_factor: f32,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let width = width.max(1);
+        let height = height.max(1);
 
         let instance = wgpu::Instance::default();
-        let surface = instance.create_surface(window)?;
+        let surface = instance.create_surface(surface_target)?;
 
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::LowPower,

@@ -14,9 +14,9 @@ use crate::terminal_pane::AppEvent;
 fn is_native_terminal_view(obj: &objc2::runtime::NSObject) -> bool {
     let name = obj.class().name().to_string_lossy();
     name.contains("TentMetalView")
+        || name.contains("TentRootView")
         || name.contains("NSText")
         || name.contains("NSClipView")
-        || name == "NSView"
 }
 
 #[cfg(target_os = "macos")]

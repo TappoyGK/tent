@@ -4,17 +4,21 @@ pub mod types;
 mod url_field;
 mod window;
 
+use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, NSObjectProtocol};
 use objc2::{MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
-use objc2_foundation::{MainThreadMarker, NSNotification, NSObject, NSTimer};
+use objc2_foundation::{
+    MainThreadMarker, NSNotification, NSObject, NSRunLoop, NSRunLoopCommonModes, NSTimer,
+};
 
 pub use proxy::AppProxy;
 pub use types::{
@@ -22,7 +26,7 @@ pub use types::{
     ModifiersState, MouseButton, MouseScrollDelta, NamedKey, PhysicalKey, PhysicalPosition,
     PhysicalSize, WindowEvent,
 };
-pub use window::{NativeWindow, WindowAttributes};
+pub use window::{NativeWindow, SurfaceTarget, WindowAttributes};
 
 use crate::terminal_pane::AppEvent;
 
@@ -42,18 +46,18 @@ pub struct ActiveEventLoop {
     proxy: AppProxy,
     control_flow: Cell<ControlFlow>,
     exit_requested: Cell<bool>,
-    window: RefCell<Option<Arc<NativeWindow>>>,
+    window: RefCell<Option<Rc<NativeWindow>>>,
 }
 
 impl ActiveEventLoop {
-    pub fn create_window(&self, attrs: WindowAttributes) -> Arc<NativeWindow> {
-        let win = Arc::new(NativeWindow::new(
+    pub fn create_window(&self, attrs: WindowAttributes) -> Rc<NativeWindow> {
+        let win = Rc::new(NativeWindow::new(
             self.mtm,
             attrs,
             &self.window_delegate,
             self.proxy.clone(),
         ));
-        *self.window.borrow_mut() = Some(Arc::clone(&win));
+        *self.window.borrow_mut() = Some(Rc::clone(&win));
         win
     }
 
@@ -61,10 +65,9 @@ impl ActiveEventLoop {
         self.control_flow.set(flow);
     }
 
+    /// 終了フラグのみを立てる（実際の `exiting()` と `NSApp.terminate` は借用解放後に実行する）
     pub fn exit(&self) {
         self.exit_requested.set(true);
-        let app = NSApplication::sharedApplication(self.mtm);
-        app.terminate(None);
     }
 }
 
@@ -81,12 +84,16 @@ struct MainRuntime {
     proxy: AppProxy,
     wake_timer: Option<Retained<NSTimer>>,
     timer_target: Retained<TentTimerTarget>,
-    in_dispatch: bool,
-    pending: VecDeque<PendingDispatch>,
 }
 
+// 再入ガード・保留キュー・終了状態は RUNTIME の外へ分離し、
+// AppKit 同期コールバック再入時に RUNTIME.borrow_mut() が二重借用でパニックしないようにする。
 thread_local! {
     static RUNTIME: RefCell<Option<MainRuntime>> = const { RefCell::new(None) };
+    static IN_DISPATCH: Cell<bool> = const { Cell::new(false) };
+    static PENDING: RefCell<VecDeque<PendingDispatch>> = const { RefCell::new(VecDeque::new()) };
+    static EXITED: Cell<bool> = const { Cell::new(false) };
+    static PANIC_PAYLOAD: RefCell<Option<Box<dyn Any + Send>>> = const { RefCell::new(None) };
 }
 
 pub(crate) fn dispatch_window_event(event: WindowEvent) {
@@ -119,59 +126,118 @@ extern "C" fn on_proxy_wake(_ctx: *mut c_void) {
     dispatch_or_enqueue(PendingDispatch::DrainProxy);
 }
 
-fn dispatch_or_enqueue(item: PendingDispatch) {
+fn run_exiting_once() {
+    if EXITED.replace(true) {
+        return;
+    }
     RUNTIME.with(|cell| {
-        let mut borrow = cell.borrow_mut();
-        let Some(rt) = borrow.as_mut() else {
-            return;
-        };
-        rt.pending.push_back(item);
-        if rt.in_dispatch {
-            return;
-        }
-        rt.in_dispatch = true;
-
-        while let Some(next) = rt.pending.pop_front() {
-            if rt.event_loop.exit_requested.get() {
-                break;
+        if let Ok(mut borrow) = cell.try_borrow_mut()
+            && let Some(rt) = borrow.as_mut()
+        {
+            if let Some(timer) = rt.wake_timer.take() {
+                timer.invalidate();
             }
-            match next {
-                PendingDispatch::Window(ev) => {
-                    rt.handler.window_event(&rt.event_loop, ev);
-                }
-                PendingDispatch::DrainProxy => {
-                    let events = rt.proxy.drain_events();
-                    for ev in events {
-                        if rt.event_loop.exit_requested.get() {
-                            break;
-                        }
-                        rt.handler.user_event(&rt.event_loop, ev);
-                    }
-                }
-                PendingDispatch::Redraw => {
-                    let should_draw = rt
-                        .event_loop
-                        .window
-                        .borrow()
-                        .as_ref()
-                        .is_some_and(|w| w.take_redraw_flag());
-                    if should_draw {
-                        rt.handler
-                            .window_event(&rt.event_loop, WindowEvent::RedrawRequested);
-                    }
-                }
-                PendingDispatch::TimerTick => {
-                    rt.handler.about_to_wait(&rt.event_loop);
-                }
-            }
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                rt.handler.exiting(&rt.event_loop);
+            }));
         }
-
-        if !rt.event_loop.exit_requested.get() {
-            rt.handler.about_to_wait(&rt.event_loop);
-            reschedule_timer(rt);
-        }
-        rt.in_dispatch = false;
     });
+}
+
+fn finish_if_exiting_or_panicked() {
+    let has_panic = PANIC_PAYLOAD.with(|p| p.borrow().is_some());
+    let should_exit = RUNTIME.with(|cell| {
+        cell.try_borrow()
+            .ok()
+            .and_then(|b| b.as_ref().map(|rt| rt.event_loop.exit_requested.get()))
+            .unwrap_or(false)
+    });
+
+    if has_panic {
+        run_exiting_once();
+        if let Some(mtm) = MainThreadMarker::new() {
+            let app = NSApplication::sharedApplication(mtm);
+            app.stop(None);
+        }
+    } else if should_exit {
+        run_exiting_once();
+        if let Some(mtm) = MainThreadMarker::new() {
+            let app = NSApplication::sharedApplication(mtm);
+            app.terminate(None);
+        }
+    }
+}
+
+fn dispatch_or_enqueue(item: PendingDispatch) {
+    PENDING.with(|q| q.borrow_mut().push_back(item));
+    if IN_DISPATCH.get() {
+        return;
+    }
+
+    IN_DISPATCH.set(true);
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        RUNTIME.with(|cell| {
+            let mut borrow = cell.borrow_mut();
+            let Some(rt) = borrow.as_mut() else {
+                return;
+            };
+
+            loop {
+                if rt.event_loop.exit_requested.get() {
+                    break;
+                }
+                let next = PENDING.with(|q| q.borrow_mut().pop_front());
+                let Some(next) = next else {
+                    break;
+                };
+                match next {
+                    PendingDispatch::Window(ev) => {
+                        rt.handler.window_event(&rt.event_loop, ev);
+                    }
+                    PendingDispatch::DrainProxy => {
+                        let events = rt.proxy.drain_events();
+                        for ev in events {
+                            if rt.event_loop.exit_requested.get() {
+                                break;
+                            }
+                            rt.handler.user_event(&rt.event_loop, ev);
+                        }
+                    }
+                    PendingDispatch::Redraw => {
+                        let should_draw = rt
+                            .event_loop
+                            .window
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|w| w.take_redraw_flag());
+                        if should_draw {
+                            rt.handler
+                                .window_event(&rt.event_loop, WindowEvent::RedrawRequested);
+                        }
+                    }
+                    PendingDispatch::TimerTick => {
+                        rt.handler.about_to_wait(&rt.event_loop);
+                    }
+                }
+            }
+
+            if !rt.event_loop.exit_requested.get() {
+                rt.handler.about_to_wait(&rt.event_loop);
+                reschedule_timer(rt);
+            }
+        });
+    }));
+    IN_DISPATCH.set(false);
+
+    if let Err(payload) = result {
+        PANIC_PAYLOAD.with(|p| {
+            let mut slot = p.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(payload);
+            }
+        });
+    }
+    finish_if_exiting_or_panicked();
 }
 
 fn reschedule_timer(rt: &mut MainRuntime) {
@@ -185,7 +251,7 @@ fn reschedule_timer(rt: &mut MainRuntime) {
             .unwrap_or(Duration::from_millis(1))
             .max(Duration::from_millis(1));
         let timer = unsafe {
-            NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+            NSTimer::timerWithTimeInterval_target_selector_userInfo_repeats(
                 delay.as_secs_f64(),
                 &rt.timer_target,
                 sel!(onTimer:),
@@ -193,6 +259,11 @@ fn reschedule_timer(rt: &mut MainRuntime) {
                 false,
             )
         };
+        // メニュー展開中やライブリサイズ中もタイマーが止まらないよう CommonModes へ登録する
+        let run_loop = NSRunLoop::mainRunLoop();
+        unsafe {
+            run_loop.addTimer_forMode(&timer, NSRunLoopCommonModes);
+        }
         rt.wake_timer = Some(timer);
     }
 }
@@ -239,11 +310,15 @@ define_class!(
 
         #[unsafe(method(windowDidBecomeKey:))]
         fn window_did_become_key(&self, _notification: &NSNotification) {
+            dispatch_window_event(WindowEvent::ModifiersChanged(
+                crate::browser::current_macos_modifiers(),
+            ));
             dispatch_window_event(WindowEvent::Focused(true));
         }
 
         #[unsafe(method(windowDidResignKey:))]
         fn window_did_resign_key(&self, _notification: &NSNotification) {
+            dispatch_window_event(WindowEvent::ModifiersChanged(ModifiersState::empty()));
             dispatch_window_event(WindowEvent::Focused(false));
         }
 
@@ -279,28 +354,33 @@ define_class!(
             #[allow(deprecated)]
             app.activateIgnoringOtherApps(true);
 
-            RUNTIME.with(|cell| {
-                let mut borrow = cell.borrow_mut();
-                if let Some(rt) = borrow.as_mut() {
-                    rt.in_dispatch = true;
-                    rt.handler.resumed(&rt.event_loop);
-                    rt.in_dispatch = false;
-                }
-            });
+            IN_DISPATCH.set(true);
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                RUNTIME.with(|cell| {
+                    let mut borrow = cell.borrow_mut();
+                    if let Some(rt) = borrow.as_mut() {
+                        rt.handler.resumed(&rt.event_loop);
+                    }
+                });
+            }));
+            IN_DISPATCH.set(false);
+
+            if let Err(payload) = result {
+                PANIC_PAYLOAD.with(|p| {
+                    let mut slot = p.borrow_mut();
+                    if slot.is_none() {
+                        *slot = Some(payload);
+                    }
+                });
+                finish_if_exiting_or_panicked();
+                return;
+            }
             dispatch_or_enqueue(PendingDispatch::TimerTick);
         }
 
         #[unsafe(method(applicationWillTerminate:))]
         fn application_will_terminate(&self, _notification: &NSNotification) {
-            RUNTIME.with(|cell| {
-                let mut borrow = cell.borrow_mut();
-                if let Some(rt) = borrow.as_mut() {
-                    if let Some(timer) = rt.wake_timer.take() {
-                        timer.invalidate();
-                    }
-                    rt.handler.exiting(&rt.event_loop);
-                }
-            });
+            run_exiting_once();
         }
 
         #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
@@ -339,6 +419,7 @@ pub fn run_app<H: ApplicationHandler + 'static>(proxy: AppProxy, handler: H) {
         window: RefCell::new(None),
     };
 
+    EXITED.set(false);
     RUNTIME.with(|cell| {
         *cell.borrow_mut() = Some(MainRuntime {
             handler: Box::new(handler),
@@ -346,8 +427,6 @@ pub fn run_app<H: ApplicationHandler + 'static>(proxy: AppProxy, handler: H) {
             proxy,
             wake_timer: None,
             timer_target,
-            in_dispatch: false,
-            pending: VecDeque::new(),
         });
     });
 
@@ -355,4 +434,8 @@ pub fn run_app<H: ApplicationHandler + 'static>(proxy: AppProxy, handler: H) {
         let _: () = msg_send![&app, setDelegate: &*app_delegate];
     }
     app.run();
+
+    if let Some(payload) = PANIC_PAYLOAD.with(|p| p.borrow_mut().take()) {
+        resume_unwind(payload);
+    }
 }

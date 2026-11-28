@@ -13,7 +13,8 @@ pub use clipboard::{
     shell_escape_path, write_clipboard_text,
 };
 pub use cursor_rects::{AppCursorKind, subtract_cursor_rects};
-pub use file_drop::install_file_drop_handler;
+#[cfg(target_os = "macos")]
+pub use file_drop::{handle_perform_drag, notify_drag_hover, register_dragged_types};
 #[cfg(test)]
 pub use process::detect_ai_tool_from_process;
 pub use process::{detect_ai_tool_for_pid, format_memory_bytes, get_pid_cwd, get_pid_memory_bytes};

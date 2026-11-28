@@ -16,6 +16,7 @@ mod terminal_pane;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -59,7 +60,7 @@ pub(crate) struct TentApp {
     pub(crate) daemon_pid: Option<i32>,
     pub(crate) daemon_rx: Option<Receiver<DaemonEvent>>,
 
-    pub(crate) window: Option<Arc<NativeWindow>>,
+    pub(crate) window: Option<Rc<NativeWindow>>,
     pub(crate) renderer: Option<Renderer>,
     pub(crate) workspace: Option<Workspace>,
     pub(crate) browsers: BrowserManager,

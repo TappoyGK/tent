@@ -3,10 +3,11 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, AnyObject, Bool, NSObjectProtocol, Sel};
+use objc2::runtime::{AnyClass, AnyObject, Bool, NSObjectProtocol, ProtocolObject, Sel};
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSAutoresizingMaskOptions, NSBackingStoreType, NSCursor, NSEvent, NSResponder, NSScreen,
+    NSAutoresizingMaskOptions, NSBackingStoreType, NSCursor, NSDragOperation,
+    NSDraggingDestination, NSDraggingInfo, NSEvent, NSEventModifierFlags, NSResponder, NSScreen,
     NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -18,15 +19,20 @@ use raw_window_handle::{
     HasWindowHandle, RawDisplayHandle, RawWindowHandle, WindowHandle,
 };
 
+use crate::key_map::{AppShortcut, match_app_shortcut};
 use crate::layout::Rect;
-use crate::macos::{AppCursorKind, subtract_cursor_rects};
+use crate::macos::{
+    AppCursorKind, handle_perform_drag, notify_drag_hover, register_dragged_types,
+    subtract_cursor_rects,
+};
 use crate::platform::types::{
-    ElementState, Ime, Key, KeyEvent, LogicalPosition, LogicalSize, ModifiersState, MouseButton,
-    MouseScrollDelta, PhysicalKey, PhysicalPosition, PhysicalSize, WindowEvent,
-    fallback_unshifted_char, macos_keycode_to_physical, physical_to_named_key,
+    ElementState, Ime, Key, KeyCode, KeyEvent, LogicalPosition, LogicalSize, ModifiersState,
+    MouseButton, MouseScrollDelta, NamedKey, PhysicalKey, PhysicalPosition, PhysicalSize,
+    WindowEvent, fallback_unshifted_char, macos_keycode_to_physical, physical_to_named_key,
 };
 use crate::platform::url_field::NativeUrlField;
 use crate::platform::{AppProxy, dispatch_window_event};
+use crate::terminal_pane::AppEvent;
 
 /// ウィンドウ生成時の初期属性
 pub struct WindowAttributes {
@@ -45,11 +51,29 @@ impl Default for WindowAttributes {
     }
 }
 
+// `TentMetalView` と `WKWebView` / `NativeUrlField` を兄弟配置するための名前付きコンテナビュー
+define_class!(
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    pub struct TentRootView;
+
+    unsafe impl NSObjectProtocol for TentRootView {}
+);
+
+impl TentRootView {
+    pub fn new(mtm: MainThreadMarker, frame: CGRect) -> Retained<Self> {
+        let this = mtm.alloc::<Self>().set_ivars(());
+        unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+}
+
 pub struct TentMetalViewIvars {
+    proxy: AppProxy,
     marked_text: RefCell<String>,
     ime_rect_phys: Cell<(i32, i32, u32, u32)>,
     in_key_down: Cell<bool>,
     ime_consumed_keydown: Cell<bool>,
+    last_mods: Cell<ModifiersState>,
     cursor_kind: AtomicU8,
     tracking_area: RefCell<Option<Retained<NSTrackingArea>>>,
 }
@@ -68,9 +92,30 @@ define_class!(
             Bool::YES
         }
 
+        #[unsafe(method(acceptsFirstMouse:))]
+        fn accepts_first_mouse(&self, _event: Option<&NSEvent>) -> Bool {
+            Bool::YES
+        }
+
         #[unsafe(method(wantsUpdateLayer))]
         fn wants_update_layer(&self) -> Bool {
             Bool::NO
+        }
+
+        #[unsafe(method(copy:))]
+        fn menu_copy(&self, _sender: Option<&AnyObject>) {
+            let _ = self
+                .ivars()
+                .proxy
+                .send_event(AppEvent::Shortcut(AppShortcut::Copy));
+        }
+
+        #[unsafe(method(paste:))]
+        fn menu_paste(&self, _sender: Option<&AnyObject>) {
+            let _ = self
+                .ivars()
+                .proxy
+                .send_event(AppEvent::Shortcut(AppShortcut::Paste));
         }
 
         #[unsafe(method(updateTrackingAreas))]
@@ -101,7 +146,7 @@ define_class!(
         fn reset_cursor_rects(&self) {
             let bounds = self.bounds();
             let mut excluded = Vec::new();
-            // 親コンテナ（TentRootView）上の兄弟ビュー（表示中の WKWebView）領域を除外する
+            // 親コンテナ（TentRootView）上の兄弟ビュー（表示中の WKWebView 等）領域を除外する
             if let Some(superview) = unsafe { self.superview() } {
                 let self_ptr: *const NSView = (self as *const Self).cast();
                 for sub in superview.subviews().iter() {
@@ -146,8 +191,8 @@ define_class!(
 
         #[unsafe(method(performKeyEquivalent:))]
         fn perform_key_equivalent(&self, event: &NSEvent) -> Bool {
-            // 自分が First Responder（ターミナル / URLバー / 検索バー）のときだけ横取りする。
-            // WKWebView が First Responder のときは NO を返し、AppKit 標準の Edit メニュー等へ流す。
+            // 自分が First Responder（ターミナル / 検索バー）のときだけ横取りする。
+            // WKWebView / NSTextField が First Responder のときは NO を返し、AppKit 標準の Edit メニュー等へ流す。
             let is_first = self
                 .window()
                 .and_then(|w| w.firstResponder())
@@ -165,15 +210,20 @@ define_class!(
                 return Bool::NO;
             }
 
-            // Cmd+Q / Cmd+H / Cmd+Opt+H は macOS 標準の App メニューへ任せる
-            let keycode = event.keyCode();
-            if (keycode == 0x0c && !mods.control_key() && !mods.alt_key() && !mods.shift_key())
-                || (keycode == 0x04 && !mods.control_key() && !mods.shift_key())
-            {
+            let key_event = nsevent_to_key_event(event, ElementState::Pressed);
+
+            // TenT のアプリショートカット、および検索バーで使う Cmd+A / Cmd+G のみを捕捉し、
+            // Cmd+Q / Cmd+H / Ctrl+Cmd+Space（絵文字ピッカー）等は macOS メニューへそのまま流す。
+            let is_search_cmd = !mods.control_key()
+                && !mods.alt_key()
+                && matches!(
+                    &key_event.logical_key,
+                    Key::Character(c) if c.eq_ignore_ascii_case("a") || c.eq_ignore_ascii_case("g")
+                );
+            if match_app_shortcut(&key_event, mods).is_none() && !is_search_cmd {
                 return Bool::NO;
             }
 
-            let key_event = nsevent_to_key_event(event, ElementState::Pressed);
             dispatch_window_event(WindowEvent::KeyboardInput { event: key_event });
             Bool::YES
         }
@@ -214,7 +264,41 @@ define_class!(
         #[unsafe(method(flagsChanged:))]
         fn flags_changed(&self, event: &NSEvent) {
             let mods = ModifiersState::from_macos_flags(event.modifierFlags().0);
+            let prev = self.ivars().last_mods.replace(mods);
             dispatch_window_event(WindowEvent::ModifiersChanged(mods));
+
+            // Kitty Keyboard Protocol 用に修飾キー単体の押下/解放イベントも送出する
+            let physical_key = macos_keycode_to_physical(event.keyCode());
+            if let PhysicalKey::Code(code) = physical_key {
+                let pressed = match code {
+                    KeyCode::ShiftLeft | KeyCode::ShiftRight => {
+                        mods.shift_key() && !prev.shift_key()
+                    }
+                    KeyCode::ControlLeft | KeyCode::ControlRight => {
+                        mods.control_key() && !prev.control_key()
+                    }
+                    KeyCode::AltLeft | KeyCode::AltRight => mods.alt_key() && !prev.alt_key(),
+                    KeyCode::SuperLeft | KeyCode::SuperRight => {
+                        mods.super_key() && !prev.super_key()
+                    }
+                    _ => return,
+                };
+                let state = if pressed {
+                    ElementState::Pressed
+                } else {
+                    ElementState::Released
+                };
+                dispatch_window_event(WindowEvent::KeyboardInput {
+                    event: KeyEvent {
+                        physical_key,
+                        logical_key: Key::Unidentified,
+                        unshifted_char: None,
+                        state,
+                        repeat: false,
+                        text: None,
+                    },
+                });
+            }
         }
 
         #[unsafe(method(mouseMoved:))]
@@ -286,6 +370,36 @@ define_class!(
         }
     }
 
+    unsafe impl NSDraggingDestination for TentMetalView {
+        #[unsafe(method(draggingEntered:))]
+        fn dragging_entered(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
+            let obj: &AnyObject = unsafe { &*(sender as *const _ as *const AnyObject) };
+            notify_drag_hover(obj, &self.ivars().proxy);
+            NSDragOperation::Copy
+        }
+
+        #[unsafe(method(draggingUpdated:))]
+        fn dragging_updated(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
+            let obj: &AnyObject = unsafe { &*(sender as *const _ as *const AnyObject) };
+            notify_drag_hover(obj, &self.ivars().proxy);
+            NSDragOperation::Copy
+        }
+
+        #[unsafe(method(prepareForDragOperation:))]
+        fn prepare_for_drag_operation(
+            &self,
+            _sender: &ProtocolObject<dyn NSDraggingInfo>,
+        ) -> Bool {
+            Bool::YES
+        }
+
+        #[unsafe(method(performDragOperation:))]
+        fn perform_drag_operation(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> Bool {
+            let obj: &AnyObject = unsafe { &*(sender as *const _ as *const AnyObject) };
+            handle_perform_drag(obj, &self.ivars().proxy)
+        }
+    }
+
     unsafe impl NSTextInputClient for TentMetalView {
         #[unsafe(method(insertText:replacementRange:))]
         fn insert_text_replacement_range(
@@ -300,12 +414,9 @@ define_class!(
             }
 
             let in_kd = self.ivars().in_key_down.get();
-            let is_plain_single_ascii = text.len() == 1
-                && text.as_bytes()[0].is_ascii()
-                && !text.as_bytes()[0].is_ascii_control();
-
-            // IME 変換確定、keyDown 外からの挿入（絵文字ピッカー等）、非 ASCII / デッドキー合成は Ime::Commit で処理
-            if was_marked || !in_kd || !is_plain_single_ascii {
+            // 変換確定（marked あり）または keyDown 外からの挿入（絵文字ピッカー等）のみ Ime::Commit を使う。
+            // 変換中でない通常キー入力は KeyboardInput 経路へ通し、Kitty プロトコル・JIS ¥・選択解除と一貫させる。
+            if was_marked || !in_kd {
                 self.ivars().ime_consumed_keydown.set(true);
                 if !text.is_empty() {
                     dispatch_window_event(WindowEvent::Ime(Ime::Commit(text)));
@@ -404,12 +515,14 @@ define_class!(
 );
 
 impl TentMetalView {
-    pub fn new(mtm: MainThreadMarker, frame: CGRect) -> Retained<Self> {
+    pub fn new(mtm: MainThreadMarker, frame: CGRect, proxy: AppProxy) -> Retained<Self> {
         let this = mtm.alloc::<Self>().set_ivars(TentMetalViewIvars {
+            proxy,
             marked_text: RefCell::new(String::new()),
             ime_rect_phys: Cell::new((0, 0, 1, 1)),
             in_key_down: Cell::new(false),
             ime_consumed_keydown: Cell::new(false),
+            last_mods: Cell::new(ModifiersState::empty()),
             cursor_kind: AtomicU8::new(AppCursorKind::Default as u8),
             tracking_area: RefCell::new(None),
         });
@@ -419,6 +532,8 @@ impl TentMetalView {
             NSAutoresizingMaskOptions::ViewWidthSizable
                 | NSAutoresizingMaskOptions::ViewHeightSizable,
         );
+        let view_obj: &AnyObject = unsafe { &*(&*view as *const Self).cast() };
+        register_dragged_types(view_obj);
         view
     }
 
@@ -440,6 +555,12 @@ impl TentMetalView {
         self.ivars()
             .ime_rect_phys
             .set((pos.x, pos.y, size.width, size.height));
+        unsafe {
+            let ctx: *mut AnyObject = msg_send![self, inputContext];
+            if !ctx.is_null() {
+                let _: () = msg_send![ctx, invalidateCharacterCoordinates];
+            }
+        }
     }
 
     pub fn set_cursor_kind(&self, kind: AppCursorKind) {
@@ -496,29 +617,24 @@ fn nsevent_to_key_event(event: &NSEvent, state: ElementState) -> KeyEvent {
         Key::Unidentified
     };
 
-    // unshifted_char: まず Shift 無効化後の文字（JIS/US 配列対応）を試み、取れなければ物理キーフォールバック
-    let mods = ModifiersState::from_macos_flags(event.modifierFlags().0);
-    let unshifted_char = if !mods.shift_key() {
-        chars_ignoring
-            .as_deref()
-            .and_then(|s| s.chars().next())
-            .filter(|&c| {
-                let cp = c as u32;
-                cp >= 0x20 && cp != 0x7f && !(0xF700..=0xF8FF).contains(&cp)
-            })
-            .or_else(|| match physical_key {
-                PhysicalKey::Code(code) => fallback_unshifted_char(code),
-                PhysicalKey::Unidentified => None,
-            })
-    } else {
-        match physical_key {
+    // macOS 10.15+ の charactersByApplyingModifiers(empty) で現在のキーボード配列（JIS/US等）における
+    // Shift/Option/Ctrl/CapsLock 無効化後の基底文字を取得する
+    let unshifted_char = event
+        .charactersByApplyingModifiers(NSEventModifierFlags::empty())
+        .map(|s| s.to_string())
+        .as_deref()
+        .and_then(|s| s.chars().next())
+        .filter(|&c| {
+            let cp = c as u32;
+            cp >= 0x20 && cp != 0x7f && !(0xF700..=0xF8FF).contains(&cp)
+        })
+        .or_else(|| match physical_key {
             PhysicalKey::Code(code) => fallback_unshifted_char(code),
-            PhysicalKey::Unidentified => chars_ignoring.as_deref().and_then(|s| s.chars().next()),
-        }
-    };
+            PhysicalKey::Unidentified => None,
+        });
 
     let text = match &logical_key {
-        Key::Named(n) if *n != crate::platform::NamedKey::Space => None,
+        Key::Named(n) if *n != NamedKey::Space => None,
         _ => chars.and_then(|s| {
             let cleaned: String = s
                 .chars()
@@ -545,8 +661,32 @@ fn nsevent_to_key_event(event: &NSEvent, state: ElementState) -> KeyEvent {
     }
 }
 
+/// `wgpu::Instance::create_surface` へ渡す `Send + Sync` なサーフェスハンドル。
+/// `NativeWindow` 本体ではなく raw view handle のみを `Send + Sync` に閉じ込める。
+pub struct SurfaceTarget {
+    metal_view: NonNull<std::ffi::c_void>,
+}
+
+unsafe impl Send for SurfaceTarget {}
+unsafe impl Sync for SurfaceTarget {}
+
+impl HasWindowHandle for SurfaceTarget {
+    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+        let handle = AppKitWindowHandle::new(self.metal_view);
+        Ok(unsafe { WindowHandle::borrow_raw(RawWindowHandle::AppKit(handle)) })
+    }
+}
+
+impl HasDisplayHandle for SurfaceTarget {
+    fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
+        Ok(unsafe {
+            DisplayHandle::borrow_raw(RawDisplayHandle::AppKit(AppKitDisplayHandle::new()))
+        })
+    }
+}
+
 /// `wry::WebViewBuilder::build_as_child` へ渡すコンテナビューハンドル。
-/// `TentMetalView` ではなくプレーンな `root_view` を返すことで、
+/// `TentMetalView` ではなくプレーンな `TentRootView` を返すことで、
 /// `WKWebView` を `TentMetalView` の「子」ではなく「兄弟」として配置する。
 pub struct BrowserContainerHandle {
     root_view: NonNull<std::ffi::c_void>,
@@ -559,39 +699,14 @@ impl HasWindowHandle for BrowserContainerHandle {
     }
 }
 
-/// TenT の macOS ネイティブウィンドウ（`NSWindow` + `root_view` + `TentMetalView` + `NativeUrlField`）
+/// TenT の macOS ネイティブウィンドウ（メインスレッド専用: `!Send`, `!Sync`）
 pub struct NativeWindow {
+    mtm: MainThreadMarker,
     ns_window: Retained<NSWindow>,
-    root_view: Retained<NSView>,
+    root_view: Retained<TentRootView>,
     metal_view: Retained<TentMetalView>,
     url_field: NativeUrlField,
     redraw_queued: AtomicBool,
-}
-
-// `NativeWindow` はメインスレッドでのみ UI メソッドを呼び出し、`wgpu::Surface` の
-// ライフタイム維持のために `Arc<NativeWindow>` として共有される。
-unsafe impl Send for NativeWindow {}
-unsafe impl Sync for NativeWindow {}
-
-impl HasWindowHandle for NativeWindow {
-    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
-        let ptr = NonNull::new(
-            (&*self.metal_view as *const TentMetalView)
-                .cast_mut()
-                .cast(),
-        )
-        .ok_or(HandleError::Unavailable)?;
-        let handle = AppKitWindowHandle::new(ptr);
-        Ok(unsafe { WindowHandle::borrow_raw(RawWindowHandle::AppKit(handle)) })
-    }
-}
-
-impl HasDisplayHandle for NativeWindow {
-    fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
-        Ok(unsafe {
-            DisplayHandle::borrow_raw(RawDisplayHandle::AppKit(AppKitDisplayHandle::new()))
-        })
-    }
 }
 
 impl NativeWindow {
@@ -626,9 +741,9 @@ impl NativeWindow {
             let _: () = msg_send![&ns_window, setDelegate: delegate];
         }
 
-        // プレーンなコンテナ NSView（WKWebView と TentMetalView の親）
-        let root_view = NSView::initWithFrame(mtm.alloc(), content_rect);
-        let metal_view = TentMetalView::new(mtm, content_rect);
+        // 名前付きコンテナ TentRootView の下に TentMetalView・NativeUrlField・WKWebView を兄弟配置する
+        let root_view = TentRootView::new(mtm, content_rect);
+        let metal_view = TentMetalView::new(mtm, content_rect, proxy.clone());
         root_view.addSubview(&metal_view);
         let url_field = NativeUrlField::new(mtm, &root_view, proxy);
         ns_window.setContentView(Some(&root_view));
@@ -646,12 +761,23 @@ impl NativeWindow {
         ns_window.makeKeyAndOrderFront(None);
 
         Self {
+            mtm,
             ns_window,
             root_view,
             metal_view,
             url_field,
             redraw_queued: AtomicBool::new(false),
         }
+    }
+
+    pub fn surface_target(&self) -> SurfaceTarget {
+        let ptr = NonNull::new(
+            (&*self.metal_view as *const TentMetalView)
+                .cast_mut()
+                .cast(),
+        )
+        .expect("metal_view pointer is non-null");
+        SurfaceTarget { metal_view: ptr }
     }
 
     pub fn scale_factor(&self) -> f64 {
@@ -668,8 +794,7 @@ impl NativeWindow {
     }
 
     pub fn outer_position(&self) -> Option<PhysicalPosition<i32>> {
-        let mtm = MainThreadMarker::new()?;
-        let primary_h = primary_screen_height(mtm);
+        let primary_h = primary_screen_height(self.mtm);
         let frame = self.ns_window.frame();
         let scale = self.scale_factor();
         let top_left_y = primary_h - (frame.origin.y + frame.size.height);
@@ -679,9 +804,9 @@ impl NativeWindow {
         ))
     }
 
-    /// `wry::WebViewBuilder::build_as_child` 用のコンテナハンドル（プレーンな `root_view`）
+    /// `wry::WebViewBuilder::build_as_child` 用のコンテナハンドル（`TentRootView`）
     pub fn browser_container_handle(&self) -> BrowserContainerHandle {
-        let ptr = NonNull::new((&*self.root_view as *const NSView).cast_mut().cast())
+        let ptr = NonNull::new((&*self.root_view as *const TentRootView).cast_mut().cast())
             .expect("root_view pointer is non-null");
         BrowserContainerHandle { root_view: ptr }
     }
@@ -721,12 +846,6 @@ impl NativeWindow {
     pub fn invalidate_cursor_rects(&self) {
         self.ns_window
             .invalidateCursorRectsForView(&self.metal_view);
-    }
-
-    pub fn metal_view_ptr(&self) -> *mut AnyObject {
-        (&*self.metal_view as *const TentMetalView)
-            .cast_mut()
-            .cast()
     }
 
     pub fn request_redraw(&self) {
