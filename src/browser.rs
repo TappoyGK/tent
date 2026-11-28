@@ -801,6 +801,43 @@ impl BrowserManager {
         }
     }
 
+    /// ブラウザペイン内でテキストを検索して該当箇所へスクロール・選択する
+    pub fn find_in_page(
+        &self,
+        pane_id: PaneId,
+        query: &str,
+        backwards: bool,
+        reset_selection: bool,
+    ) {
+        let Some(managed) = self.views.get(&pane_id) else {
+            return;
+        };
+        if query.is_empty() {
+            self.clear_find_highlight(pane_id);
+            return;
+        }
+        let escaped = escape_js_string(query);
+        let reset_js = if reset_selection {
+            "try { const s = window.getSelection(); if (s) s.removeAllRanges(); } catch (_) {}"
+        } else {
+            ""
+        };
+        let back = if backwards { "true" } else { "false" };
+        let script = format!(
+            "(() => {{ {reset_js} window.find(\"{escaped}\", false, {back}, true, false, false, false); }})();"
+        );
+        let _ = managed.webview.evaluate_script(&script);
+    }
+
+    /// ブラウザペイン内の検索選択ハイライトを解除する
+    pub fn clear_find_highlight(&self, pane_id: PaneId) {
+        if let Some(managed) = self.views.get(&pane_id) {
+            let _ = managed.webview.evaluate_script(
+                "try { const s = window.getSelection(); if (s) s.removeAllRanges(); } catch (_) {}",
+            );
+        }
+    }
+
     pub fn reload(&self, pane_id: PaneId) {
         if let Some(managed) = self.views.get(&pane_id) {
             let _ = managed.webview.reload();
@@ -1421,8 +1458,26 @@ fn match_macos_keycode_shortcut(key_code: u16, shift: bool, opt: bool) -> Option
         0x2C => Some(AppShortcut::ToggleHelp),                // /
         0x21 => Some(AppShortcut::FocusPane(FocusDir::Prev)), // [
         0x1E => Some(AppShortcut::FocusPane(FocusDir::Next)), // ]
+        0x03 => Some(AppShortcut::Find),                      // F
         _ => None,
     }
+}
+
+/// JS 文字列リテラル（二重引用符内）へ安全に埋め込むためのエスケープ
+pub fn escape_js_string(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 8);
+    for ch in input.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1436,6 +1491,21 @@ mod tests {
             normalize_url_input("https://example.com"),
             "https://example.com"
         );
+    }
+
+    #[test]
+    fn test_escape_js_string_and_find_shortcut() {
+        assert_eq!(escape_js_string(r#"a"b\c"#), r#"a\"b\\c"#);
+        assert_eq!(escape_js_string("line1\nline2"), r"line1\nline2");
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            match_macos_keycode_shortcut(0x03, false, false),
+            Some(AppShortcut::Find)
+        );
+    }
+
+    #[test]
+    fn test_normalize_url_input_extra() {
         assert_eq!(
             normalize_url_input("localhost:3000/app"),
             "http://localhost:3000/app"

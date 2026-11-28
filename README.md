@@ -54,6 +54,7 @@ cargo test
 | `Cmd+Left` / `Cmd+Right` | ブラウザ戻る / 進む（2 本指スワイプ対応） |
 | `Cmd+Click` / `Cmd+Shift+Click` | URL を内蔵ブラウザ / 外部ブラウザで開く |
 | `Cmd+C` / `Cmd+V` | コピー / ペースト |
+| `Cmd+F` | ペイン内検索（ターミナル・内蔵ブラウザ両対応、`Enter` / `Shift+Enter` / `Cmd+G` / `Cmd+Shift+G` / `Esc`） |
 | `Cmd+K` | 画面・スクロールバックをクリア |
 | `Cmd+Opt+R` | TenT 本体再起動（デーモン上のセッションは維持） |
 | `Cmd+/` / `Cmd+?` | ショートカットヘルプ表示 |

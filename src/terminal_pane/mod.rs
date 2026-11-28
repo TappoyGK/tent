@@ -1,3 +1,4 @@
+mod search;
 mod selection;
 mod snapshot;
 #[cfg(test)]
@@ -20,6 +21,7 @@ use ghostty_vt::{Event as VtEvent, RenderState, Terminal, TerminalOptions};
 use crate::daemon::{AiHookState, AiTool, DaemonClient, ReplayedPane};
 use crate::macos;
 
+pub use search::{SearchMatch, resolve_tracked_search_match_index};
 pub use selection::UrlMatch;
 use selection::{
     extract_selection_from_screen, extract_selection_from_terminal, find_url_at_cell,
@@ -135,6 +137,8 @@ pub struct TerminalPane {
     minimap_dirty: bool,
     /// 描画キャッシュ無効化用の世代カウンタ
     pub generation: u64,
+    /// 画面内容・リサイズ変化の検知用世代カウンタ（スクロールだけでは増えない）
+    pub content_generation: u64,
 }
 
 impl TerminalPane {
@@ -221,6 +225,7 @@ impl TerminalPane {
             },
             minimap_dirty: true,
             generation: 1,
+            content_generation: 1,
         })
     }
 
@@ -295,6 +300,7 @@ impl TerminalPane {
             },
             minimap_dirty: true,
             generation: 1,
+            content_generation: 1,
         };
         pane.mark_screen_seen();
         Ok(pane)
@@ -515,6 +521,7 @@ impl TerminalPane {
                 self.last_output_at = Local::now();
                 self.last_output_instant = Some(Instant::now());
             }
+            self.content_generation = self.content_generation.wrapping_add(1);
             self.mark_dirty();
         }
     }
@@ -623,6 +630,7 @@ impl TerminalPane {
         }
         self.minimap_dirty = true;
         self.generation = self.generation.wrapping_add(1);
+        self.content_generation = self.content_generation.wrapping_add(1);
 
         let events: Vec<VtEvent> = self.terminal.events().collect();
         let mut saw_bell = false;
@@ -703,6 +711,7 @@ impl TerminalPane {
             self.write_input(b"\x0c");
         }
         self.mark_screen_seen();
+        self.content_generation = self.content_generation.wrapping_add(1);
         self.mark_dirty();
     }
 
@@ -740,6 +749,7 @@ impl TerminalPane {
             self.mark_screen_seen();
         }
         self.daemon.resize_pane(self.id, cols, rows);
+        self.content_generation = self.content_generation.wrapping_add(1);
         self.mark_dirty();
     }
 
@@ -949,6 +959,30 @@ impl TerminalPane {
     ) -> Option<((u16, u16), (u16, u16))> {
         let vp_top = viewport_top_screen_row(&self.terminal);
         screen_selection_to_viewport(a, b, vp_top, self.cols, self.rows)
+    }
+
+    /// スクロールバック＋アクティブ画面全体からテキストを大文字小文字区別なしで検索する
+    pub fn search_screen(&self, query: &str) -> Vec<SearchMatch> {
+        search::search_terminal_screen(&self.terminal, self.cols, query)
+    }
+
+    /// 指定の `Point::Screen` 行がビューポート内に収まるようにスクロールする
+    pub fn scroll_to_screen_row(&mut self, target_screen_row: u32) {
+        if self.rows == 0 || self.is_alt_screen() {
+            return;
+        }
+        let vp_top = self.viewport_top_screen_row();
+        let vp_bottom = vp_top.saturating_add(u32::from(self.rows.saturating_sub(1)));
+        if target_screen_row >= vp_top && target_screen_row <= vp_bottom {
+            return;
+        }
+        let desired_top = target_screen_row.saturating_sub(u32::from(self.rows) / 3);
+        let delta = (desired_top as isize) - (vp_top as isize);
+        if delta != 0 {
+            self.terminal
+                .scroll_viewport(ghostty_vt::terminal::ScrollViewport::Delta(delta));
+            self.mark_dirty();
+        }
     }
 
     /// 代替画面（vim / less / tmux 等）が表示中か返す

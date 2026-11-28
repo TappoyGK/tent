@@ -30,7 +30,7 @@ use crate::layout::{AppLayout, Rect, SidebarState};
 use crate::renderer::Renderer;
 use crate::slot::Workspace;
 use crate::state::{SavedState, WindowGeometry};
-use crate::terminal_pane::{AppEvent, PaneId, TrackedGridRef, UrlMatch};
+use crate::terminal_pane::{AppEvent, PaneId, SearchMatch, TrackedGridRef, UrlMatch};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const CWD_POLL_INTERVAL: Duration = Duration::from_millis(1000);
@@ -101,6 +101,41 @@ struct UrlBarEdit {
     pane_id: PaneId,
     text: String,
     select_all: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SearchTarget {
+    Terminal(PaneId),
+    Browser(PaneId),
+}
+
+impl SearchTarget {
+    pub(crate) fn pane_id(self) -> PaneId {
+        match self {
+            Self::Terminal(id) | Self::Browser(id) => id,
+        }
+    }
+
+    pub(crate) fn is_browser(self) -> bool {
+        matches!(self, Self::Browser(_))
+    }
+}
+
+/// 出力継続中の自動再検索スロットル間隔（毎フレーム全走査による描画詰まりを防止）
+pub(crate) const SEARCH_RESYNC_INTERVAL: Duration = Duration::from_millis(300);
+
+pub(crate) struct SearchState {
+    pub(crate) target: SearchTarget,
+    pub(crate) query: String,
+    pub(crate) select_all: bool,
+    pub(crate) matches: Vec<SearchMatch>,
+    pub(crate) current_match: Option<usize>,
+    /// 現在マッチ開始位置を追跡するピン（スクロールバック削除・リフロー追従用）
+    pub(crate) current_pin: Option<TrackedGridRef>,
+    /// 最後に検索を実行した時点の `TerminalPane::content_generation`
+    pub(crate) content_generation: u64,
+    /// 最後に再検索を実行した時刻（出力継続中のスロットル用）
+    pub(crate) last_sync_at: Instant,
 }
 
 #[derive(Default)]
@@ -243,6 +278,7 @@ struct TentApp {
     last_autoscroll: Instant,
     hovered_url: Option<(PaneId, UrlMatch)>,
     url_bar_edit: Option<UrlBarEdit>,
+    search: Option<SearchState>,
     show_help: bool,
     restart_requested: bool,
     daemon_version_mismatch: bool,
@@ -295,6 +331,7 @@ impl TentApp {
             last_autoscroll: now - AUTOSCROLL_INTERVAL,
             hovered_url: None,
             url_bar_edit: None,
+            search: None,
             show_help: false,
             restart_requested: false,
             daemon_version_mismatch: false,
@@ -384,7 +421,7 @@ impl TentApp {
             .collect();
         self.browsers.sync(window, &refs, scale);
 
-        if self.url_bar_edit.is_none() {
+        if self.url_bar_edit.is_none() && self.search.is_none() {
             if let Some(b) = ws.focused_browser() {
                 self.browsers.focus_webview(b.id);
             } else {
@@ -414,6 +451,13 @@ impl TentApp {
                         .is_some_and(|s| s.pane_id == pane_id)
                     {
                         self.selection = None;
+                    }
+                    if self
+                        .search
+                        .as_ref()
+                        .is_some_and(|s| s.target.pane_id() == pane_id)
+                    {
+                        self.search = None;
                     }
                     pane_exited = true;
                     changed = true;
@@ -525,7 +569,33 @@ impl TentApp {
         if self.can_autoscroll_selection() {
             wake_at = wake_at.min((self.last_autoscroll + AUTOSCROLL_INTERVAL).max(now));
         }
+        if let Some(due) = self.search_resync_due_at() {
+            wake_at = wake_at.min(due.max(now));
+        }
         event_loop.set_control_flow(ControlFlow::WaitUntil(wake_at));
+    }
+
+    /// 出力・リサイズ等により再検索が保留中であれば、次に自動再検索すべき時刻を返す
+    fn search_resync_due_at(&self) -> Option<Instant> {
+        let search = self.search.as_ref()?;
+        let SearchTarget::Terminal(pid) = search.target else {
+            return None;
+        };
+        if search.query.is_empty() {
+            return None;
+        }
+        let pane = self
+            .workspace
+            .as_ref()?
+            .active_slot_ref()
+            .root
+            .as_ref()?
+            .terminal_pane(pid)?;
+        if pane.content_generation == search.content_generation {
+            None
+        } else {
+            Some(search.last_sync_at + SEARCH_RESYNC_INTERVAL)
+        }
     }
 
     fn can_autoscroll_selection(&self) -> bool {
@@ -791,6 +861,10 @@ impl ApplicationHandler<AppEvent> for TentApp {
             }
             AppEvent::WebViewClicked { px, py } => {
                 let mut changed = self.url_bar_edit.take().is_some();
+                if self.search.is_some() {
+                    self.close_search();
+                    changed = true;
+                }
                 if let Some(ws) = self.workspace.as_mut()
                     && ws.focus_pane_at(px, py).is_some()
                 {
@@ -805,6 +879,7 @@ impl ApplicationHandler<AppEvent> for TentApp {
                     || self.show_help
                     || self.slot_drag.is_some()
                     || self.url_bar_edit.is_some()
+                    || self.search.is_some()
                 {
                     return;
                 }
@@ -952,6 +1027,10 @@ impl ApplicationHandler<AppEvent> for TentApp {
                 need_redraw = true;
             }
             self.was_any_outputting = now_outputting;
+        }
+
+        if self.search_resync_due_at().is_some_and(|due| now >= due) {
+            need_redraw = true;
         }
 
         // 起動後の段階的セッション復旧（アクティブスロットの後、残りスロットを1つずつ順次復旧）

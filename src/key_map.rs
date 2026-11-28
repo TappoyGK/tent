@@ -37,6 +37,7 @@ pub enum AppShortcut {
     Copy,                 // Cmd+C
     Paste,                // Cmd+V
     ClearScreen,          // Cmd+K (画面・スクロールバッククリア)
+    Find,                 // Cmd+F (ペイン内検索)
 }
 
 /// Cmd+1..9/0、Cmd+Opt+1/2、Cmd+\、iTerm2互換ペイン操作、ブラウザ操作、Cmd+C/V を判定する
@@ -115,6 +116,7 @@ pub fn match_app_shortcut(event: &KeyEvent, mods: ModifiersState) -> Option<AppS
         KeyCode::KeyC => Some(AppShortcut::Copy),
         KeyCode::KeyV => Some(AppShortcut::Paste),
         KeyCode::KeyK => Some(AppShortcut::ClearScreen),
+        KeyCode::KeyF => Some(AppShortcut::Find),
         _ => None,
     }
 }

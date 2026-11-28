@@ -2,6 +2,7 @@ mod footer;
 mod help_modal;
 mod main_pane;
 mod primitives;
+mod search_bar;
 mod sidebar;
 mod status_bar;
 
@@ -84,7 +85,25 @@ pub struct TimerOverlay {
     pub anim_tick: u32,
 }
 
-/// 描画時のオーバーレイ状態（IME・D&D・テキスト選択・URLホバー・URLバー編集・システム状態・ヘルプ）
+/// ペイン内検索のビューポート内ハイライト一覧
+#[derive(Clone, Debug)]
+pub struct SearchHighlightOverlay {
+    pub pane_id: PaneId,
+    /// `(vp_row, start_col, end_col, is_current)`
+    pub matches: Vec<(u16, u16, u16, bool)>,
+}
+
+/// ペイン内検索バーの表示状態
+#[derive(Clone, Debug)]
+pub struct SearchBarOverlay<'a> {
+    pub pane_id: PaneId,
+    pub is_browser: bool,
+    pub query: &'a str,
+    pub select_all: bool,
+    pub count_label: String,
+}
+
+/// 描画時のオーバーレイ状態（IME・D&D・テキスト選択・URLホバー・URLバー編集・検索・システム状態・ヘルプ）
 pub struct RenderOverlays<'a> {
     pub ime_preedit: &'a str,
     pub drag_source_slot: Option<usize>,
@@ -92,6 +111,8 @@ pub struct RenderOverlays<'a> {
     pub selection: Option<SelectionOverlay>,
     pub hovered_url: Option<UrlHoverOverlay>,
     pub url_bar_editing: Option<(&'a str, bool)>,
+    pub search_highlights: Option<SearchHighlightOverlay>,
+    pub search_bar: Option<SearchBarOverlay<'a>>,
     pub battery: Option<crate::macos::BatteryStatus>,
     pub wifi: Option<crate::macos::WifiStatus>,
     pub show_help: bool,
@@ -108,6 +129,7 @@ pub struct RenderOutcome {
 }
 
 type FooterCacheKey = (Vec<(String, bool)>, u32, u32);
+type SearchCacheKey = (String, String, bool, u32, u32);
 
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -173,6 +195,11 @@ pub struct Renderer {
     // メインパネル下端フッター（ペイン別最終更新時刻）用バッファ
     footer_buffers: Vec<Buffer>,
     footer_cache_keys: Vec<FooterCacheKey>,
+
+    // ペイン内検索バー用バッファ
+    search_query_buffer: Buffer,
+    search_count_buffer: Buffer,
+    search_cache_key: SearchCacheKey,
 
     // ショートカットヘルプダイアログ用バッファ
     help_header_buffer: Buffer,
@@ -455,6 +482,10 @@ impl Renderer {
         let help_header_buffer = Buffer::new(&mut font_system, card_metrics);
         let help_left_buffer = Buffer::new(&mut font_system, card_metrics);
         let help_right_buffer = Buffer::new(&mut font_system, card_metrics);
+        let mut search_query_buffer = Buffer::new(&mut font_system, card_metrics);
+        search_query_buffer.set_wrap(Wrap::None);
+        let mut search_count_buffer = Buffer::new(&mut font_system, card_metrics);
+        search_count_buffer.set_wrap(Wrap::None);
 
         Ok(Self {
             surface,
@@ -504,6 +535,9 @@ impl Renderer {
             status_btn_labels: std::array::from_fn(|_| String::new()),
             footer_buffers: Vec::new(),
             footer_cache_keys: Vec::new(),
+            search_query_buffer,
+            search_count_buffer,
+            search_cache_key: (String::new(), String::new(), true, 0, 0),
             help_header_buffer,
             help_left_buffer,
             help_right_buffer,
@@ -619,6 +653,7 @@ impl Renderer {
         for key in &mut self.footer_cache_keys {
             key.2 = 0;
         }
+        self.search_cache_key.4 = 0;
         self.help_cache_key = (0, 0);
     }
 
@@ -703,7 +738,23 @@ impl Renderer {
             pane_gap,
             &mut rects,
         );
-        let cursor_area = main_res.cursor_area;
+        let search_bar_layout = self.build_search_bar(
+            &active_pane_rects,
+            layout,
+            scale_factor,
+            overlays,
+            &mut rects,
+        );
+        let cursor_area = if let Some(ref sb) = search_bar_layout {
+            Some((
+                sb.query_rect.x,
+                sb.bar_rect.y,
+                sb.query_rect.w,
+                sb.bar_rect.h,
+            ))
+        } else {
+            main_res.cursor_area
+        };
         let time_w = self.build_sidebar(
             workspace,
             active_idx,
@@ -785,6 +836,13 @@ impl Renderer {
             &self.footer_buffers,
             &footer_columns,
             layout,
+            scale_factor,
+            &mut text_areas,
+        );
+        search_bar::push_search_bar_text_areas(
+            &self.search_query_buffer,
+            &self.search_count_buffer,
+            search_bar_layout.as_ref(),
             scale_factor,
             &mut text_areas,
         );
