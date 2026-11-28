@@ -104,22 +104,22 @@ pub struct SearchBarOverlay<'a> {
 }
 
 /// ステータスバーのメモリ使用量バー表示状態
-/// 80% ライン = 512 MiB（「これだけあれば足りる」目安）、100% フルスケール = 640 MiB
+/// 80% ライン = 1.0 GiB（GPU 込みの実測目安）、100% フルスケール = 1.25 GiB
 #[derive(Clone, Debug, Default)]
 pub struct MemoryOverlay {
-    /// フルスケール（640 MiB）に対する使用率（0.0..=1.0）
+    /// フルスケール（1.25 GiB）に対する使用率（0.0..=1.0）
     pub fraction: f32,
-    /// 80% 警告ライン（512 MiB）を超過しているか
+    /// 80% 警告ライン（1.0 GiB）を超過しているか
     pub is_over_budget: bool,
-    /// バー中央に表示する現在値ラベル（例: "185M", "1.2G"）
+    /// バー中央に表示する現在値ラベル（例: "480M", "1.2G"）
     pub label: String,
 }
 
 impl MemoryOverlay {
-    /// ターミナル＋デーモン合計の「これだけあれば足りる」基準ライン（512 MiB = バーの 80%）
-    pub const BUDGET_BYTES: u64 = 512 * 1024 * 1024;
-    /// バーの 100% フルスケール（640 MiB = 512 MiB / 0.8）
-    pub const FULL_SCALE_BYTES: u64 = 640 * 1024 * 1024;
+    /// ターミナル＋デーモン合計（GPU/Metal フットプリント込み）の基準ライン（1.0 GiB = バーの 80%）
+    pub const BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+    /// バーの 100% フルスケール（1.25 GiB = 1.0 GiB / 0.8）
+    pub const FULL_SCALE_BYTES: u64 = 1280 * 1024 * 1024;
 
     pub fn from_bytes(bytes: u64) -> Self {
         if bytes == 0 {

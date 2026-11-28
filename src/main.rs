@@ -1547,19 +1547,19 @@ mod tests {
         assert_eq!(empty.label, "");
         assert!(!empty.is_over_budget);
 
-        // 256 MiB = フルスケール(640 MiB)の 40%・非超過
-        let normal = MemoryOverlay::from_bytes(256 * 1024 * 1024);
-        assert_eq!(normal.label, "256M");
+        // 512 MiB = フルスケール(1280 MiB)の 40%・非超過
+        let normal = MemoryOverlay::from_bytes(512 * 1024 * 1024);
+        assert_eq!(normal.label, "512M");
         assert!(!normal.is_over_budget);
         assert!((normal.fraction - 0.40).abs() < 0.01);
 
-        // 512 MiB（ちょうど 80% ライン）はまだ赤にならない
+        // 1.0 GiB（ちょうど 80% ライン）はまだ赤にならない
         let at_budget = MemoryOverlay::from_bytes(MemoryOverlay::BUDGET_BYTES);
-        assert_eq!(at_budget.label, "512M");
+        assert_eq!(at_budget.label, "1.0G");
         assert!(!at_budget.is_over_budget);
         assert!((at_budget.fraction - 0.80).abs() < 0.01);
 
-        // 512 MiB 超過で赤警告（is_over_budget == true）
+        // 1.0 GiB 超過で赤警告（is_over_budget == true）
         let over = MemoryOverlay::from_bytes(MemoryOverlay::BUDGET_BYTES + 1);
         assert!(over.is_over_budget);
 

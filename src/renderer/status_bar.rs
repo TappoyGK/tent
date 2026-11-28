@@ -230,7 +230,7 @@ impl Renderer {
             }
         }
 
-        // メモリ使用量モニターバー描画（80% = 512MiB の目安ライン、超過時は赤で警告）
+        // メモリ使用量モニターバー描画（80% = 1.0GiB の目安ライン、超過時は赤で警告）
         if sb_ctrl.mem_bar_rect.w > 1.0 && !overlays.memory.label.is_empty() {
             let mr = sb_ctrl.mem_bar_rect;
             let over = overlays.memory.is_over_budget;
@@ -259,7 +259,7 @@ impl Renderer {
                 self.push_rect(rects, Rect::new(mr.x, mr.y, fill_w, mr.h), fill_color);
             }
 
-            // 80%（512 MiB）しきい値ラインの縦目盛り
+            // 80%（1.0 GiB）しきい値ラインの縦目盛り
             let tick_w = (1.5 * scale_factor).max(1.0);
             let tick_x = mr.x + mr.w * 0.80;
             let tick_color = if over {

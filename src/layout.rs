@@ -307,7 +307,7 @@ impl AppLayout {
         } else {
             after_upgrade_x
         };
-        // メモリ使用量モニターバー（80% = 512MiB、100% = 640MiB）をタイマーの左隣に配置
+        // メモリ使用量モニターバー（80% = 1.0GiB、100% = 1.25GiB）をタイマーの左隣に配置
         let mem_w = 76.0 * scale;
         let mem_x = (after_timer_x - gap * 2.0 - mem_w).max(bar.x);
         let mem_bar_rect = if after_timer_x - bar.x >= mem_w + 150.0 * scale {
