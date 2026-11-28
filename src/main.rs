@@ -1228,20 +1228,97 @@ fn agy_hook_stdout_json(event_override: Option<&str>, stdin_payload: &str) -> &'
     }
 }
 
+/// JSON ペイロード内から指定キーの直後にある値部分の先頭スライスを取り出す軽量ヘルパー
+fn json_field_value_slice<'a>(payload: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("\"{key}\"");
+    let mut rest = payload;
+    while let Some(pos) = rest.find(&needle) {
+        let after_key = &rest[pos + needle.len()..];
+        let trimmed = after_key.trim_start();
+        if let Some(after_colon) = trimmed.strip_prefix(':') {
+            return Some(after_colon.trim_start());
+        }
+        rest = after_key;
+    }
+    None
+}
+
+fn json_has_non_empty_string_field(payload: &str, key: &str) -> bool {
+    let Some(val) = json_field_value_slice(payload, key) else {
+        return false;
+    };
+    let Some(inner) = val.strip_prefix('"') else {
+        return false;
+    };
+    !inner.starts_with('"')
+}
+
+fn json_has_bool_field(payload: &str, key: &str, expected: bool) -> bool {
+    let Some(val) = json_field_value_slice(payload, key) else {
+        return false;
+    };
+    let token = if expected { "true" } else { "false" };
+    let Some(after) = val.strip_prefix(token) else {
+        return false;
+    };
+    after
+        .chars()
+        .next()
+        .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+}
+
+fn is_subagent_hook_payload(payload: &str) -> bool {
+    if payload.contains("\"SubagentStop\"") || payload.contains("\"SubagentStart\"") {
+        return true;
+    }
+    for key in [
+        "agent_id",
+        "agentId",
+        "parentConversationId",
+        "parent_conversation_id",
+        "parentSessionId",
+        "parent_session_id",
+    ] {
+        if json_has_non_empty_string_field(payload, key) {
+            return true;
+        }
+    }
+    false
+}
+
 fn resolve_hook_state_from_stdin(
     base_state: daemon::AiHookState,
     tool: Option<daemon::AiTool>,
     stdin_payload: &str,
-) -> daemon::AiHookState {
+) -> Option<daemon::AiHookState> {
+    // サブエージェント由来のフック完了／開始は親ペインの状態を汚さないよう無視する
+    if is_subagent_hook_payload(stdin_payload) {
+        return None;
+    }
+    // agy の Stop フックでバックグラウンドタスク／サブエージェントがまだ残っている（fullyIdle: false）
+    // 場合は入力待ち（黄）にせず作業中（緑）のまま維持する
+    if base_state == daemon::AiHookState::Waiting
+        && tool == Some(daemon::AiTool::Agy)
+        && json_has_bool_field(stdin_payload, "fullyIdle", false)
+    {
+        return None;
+    }
+    // Claude Code の Stop フックで継続ブロック再試行中（stop_hook_active: true）は誤って黄にしない
+    if base_state == daemon::AiHookState::Waiting
+        && tool == Some(daemon::AiTool::Claude)
+        && json_has_bool_field(stdin_payload, "stop_hook_active", true)
+    {
+        return None;
+    }
     // agy の Stop フックはユーザー自身が Ctrl+C 等でキャンセルした場合にも発火するため、
     // terminationReason が USER_CANCELED なら入力待ち（黄）にせず Idle としてクリアする
     if base_state == daemon::AiHookState::Waiting
         && tool == Some(daemon::AiTool::Agy)
         && stdin_payload.contains("USER_CANCELED")
     {
-        return daemon::AiHookState::Idle;
+        return Some(daemon::AiHookState::Idle);
     }
-    base_state
+    Some(base_state)
 }
 
 /// AI フックから呼び出される軽量 CLI (`tent hook <working|waiting|idle> [--tool claude|agy|codex] [--event pre-tool-use]`)。
@@ -1290,9 +1367,9 @@ fn run_hook_cli(mut args: impl Iterator<Item = String>) {
             .read_to_string(&mut stdin_payload);
     }
 
-    if let Some(base_state) = base_state {
-        let state = resolve_hook_state_from_stdin(base_state, tool, &stdin_payload);
-
+    if let Some(base_state) = base_state
+        && let Some(state) = resolve_hook_state_from_stdin(base_state, tool, &stdin_payload)
+    {
         let pane_id = pane_id_override.or_else(|| {
             std::env::var("TENT_PANE_ID")
                 .ok()
@@ -1437,22 +1514,74 @@ mod tests {
 
         use crate::daemon::{AiHookState, AiTool};
 
-        // agy の Stop フックは USER_CANCELED なら Idle、それ以外は Waiting
+        // agy の Stop フックは USER_CANCELED なら Idle、fullyIdle: false なら無視（None）、それ以外は Waiting
         assert_eq!(
             resolve_hook_state_from_stdin(
                 AiHookState::Waiting,
                 Some(AiTool::Agy),
                 r#"{"terminationReason":"USER_CANCELED"}"#,
             ),
-            AiHookState::Idle
+            Some(AiHookState::Idle)
         );
         assert_eq!(
             resolve_hook_state_from_stdin(
                 AiHookState::Waiting,
                 Some(AiTool::Agy),
-                r#"{"terminationReason":"NO_TOOL_CALL"}"#,
+                r#"{"terminationReason":"NO_TOOL_CALL","fullyIdle":true}"#,
             ),
-            AiHookState::Waiting
+            Some(AiHookState::Waiting)
+        );
+        assert_eq!(
+            resolve_hook_state_from_stdin(
+                AiHookState::Waiting,
+                Some(AiTool::Agy),
+                r#"{"terminationReason":"NO_TOOL_CALL","fullyIdle": false}"#,
+            ),
+            None
+        );
+
+        // サブエージェント由来のフックは全ツールで無視（None）されること
+        assert_eq!(
+            resolve_hook_state_from_stdin(
+                AiHookState::Waiting,
+                Some(AiTool::Claude),
+                r#"{"hook_event_name":"SubagentStop","agent_id":"sub-123"}"#,
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_hook_state_from_stdin(
+                AiHookState::Waiting,
+                Some(AiTool::Agy),
+                r#"{"parentConversationId":"conv-parent-1","fullyIdle":true}"#,
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_hook_state_from_stdin(
+                AiHookState::Waiting,
+                Some(AiTool::Codex),
+                r#"{"agent_id":"agent-9"}"#,
+            ),
+            None
+        );
+        // agent_id が空文字や null の場合はメインエージェント扱いとして通ること
+        assert_eq!(
+            resolve_hook_state_from_stdin(
+                AiHookState::Waiting,
+                Some(AiTool::Claude),
+                r#"{"agent_id": null, "stop_hook_active": false}"#,
+            ),
+            Some(AiHookState::Waiting)
+        );
+        // Claude Code の stop_hook_active: true は無視されること
+        assert_eq!(
+            resolve_hook_state_from_stdin(
+                AiHookState::Waiting,
+                Some(AiTool::Claude),
+                r#"{"stop_hook_active": true}"#,
+            ),
+            None
         );
 
         // agy の PreToolUse だけは {"decision":"allow"} を返す（明示 --event または stdin）
