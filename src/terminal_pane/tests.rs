@@ -1174,15 +1174,14 @@ fn test_search_tracking_follows_reflow_and_scrollback_pruning() {
     let hits_after = pane.search_screen("target_token");
     assert_eq!(hits_after.len(), 1);
     assert!(hits_after[0].start_row > hits_before[0].start_row);
-    let resolved_idx =
-        resolve_tracked_search_match_index(&hits_after, moved_pos, Some(hits_before[0].start_row));
+    let resolved_idx = resolve_tracked_search_match_index(&hits_after, moved_pos, true);
     assert_eq!(resolved_idx, Some(0));
     assert_eq!(
         moved_pos,
         Some((hits_after[0].start_col, hits_after[0].start_row))
     );
 
-    // 2. ピン失効時でも直前の行番号に最も近いマッチへ安全にフォールバックすること
+    // 2. スクロールバック先頭パージでピンが失効した場合は、残存する最も古いマッチ（idx 0）へ寄せること
     let multi = vec![
         super::SearchMatch {
             start_row: 2,
@@ -1204,19 +1203,11 @@ fn test_search_tracking_follows_reflow_and_scrollback_pruning() {
         },
     ];
     assert_eq!(
-        resolve_tracked_search_match_index(&multi, None, Some(12)),
-        Some(1)
+        resolve_tracked_search_match_index(&multi, None, true),
+        Some(0)
     );
     assert_eq!(
-        resolve_tracked_search_match_index(&multi, None, Some(20)),
-        Some(2)
-    );
-    assert_eq!(
-        resolve_tracked_search_match_index(&multi, None, Some(10)),
-        Some(1)
-    );
-    assert_eq!(
-        resolve_tracked_search_match_index(&multi, None, None),
+        resolve_tracked_search_match_index(&multi, None, false),
         Some(2)
     );
 }

@@ -241,13 +241,12 @@ impl TentApp {
                     .current_pin
                     .as_ref()
                     .and_then(|pin| pane.resolve_tracked_point(pin));
-                let prev_row = search
-                    .current_match
-                    .and_then(|idx| search.matches.get(idx))
-                    .map(|m| m.start_row);
+                let had_current = search.current_match.is_some();
                 let found = pane.search_screen(&search.query);
                 let next_idx = crate::terminal_pane::resolve_tracked_search_match_index(
-                    &found, prev_pos, prev_row,
+                    &found,
+                    prev_pos,
+                    had_current,
                 );
                 let next_pin = next_idx
                     .and_then(|i| found.get(i))
