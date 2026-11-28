@@ -2,16 +2,14 @@ use std::collections::VecDeque;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalPosition, LogicalSize};
-use winit::event::WindowEvent;
-use winit::event_loop::ActiveEventLoop;
-use winit::window::{Window, WindowId};
-
 use crate::browser::{current_macos_modifiers, install_macos_shortcut_monitor};
 use crate::daemon::{DaemonClient, DaemonEvent, default_socket_path};
 use crate::layout::AppLayout;
 use crate::macos;
+use crate::platform::{
+    ActiveEventLoop, ApplicationHandler, LogicalPosition, LogicalSize, WindowAttributes,
+    WindowEvent,
+};
 use crate::renderer::Renderer;
 use crate::slot::Workspace;
 use crate::state::SavedState;
@@ -22,7 +20,7 @@ use crate::{
     selection_autoscroll_delta, spawn_replacement_instance,
 };
 
-impl ApplicationHandler<AppEvent> for TentApp {
+impl ApplicationHandler for TentApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -34,40 +32,25 @@ impl ApplicationHandler<AppEvent> for TentApp {
             .unwrap_or_else(SavedState::default_home);
         self.sidebar_state = saved.sidebar_state;
 
-        let mut attrs = Window::default_attributes().with_title("TenT");
+        let mut attrs = WindowAttributes::default();
         if let Some(geom) = saved.window_geometry {
-            attrs = attrs
-                .with_inner_size(LogicalSize::new(
-                    f64::from(geom.width),
-                    f64::from(geom.height),
-                ))
-                .with_position(LogicalPosition::new(geom.x, geom.y));
-        } else {
-            attrs = attrs.with_inner_size(LogicalSize::new(1440.0, 880.0));
+            attrs.inner_size = LogicalSize::new(f64::from(geom.width), f64::from(geom.height));
+            attrs.position = Some(LogicalPosition::new(geom.x, geom.y));
         }
-        let window = Arc::new(
-            event_loop
-                .create_window(attrs)
-                .expect("failed to create window"),
-        );
-        window.set_ime_allowed(true);
+        let window = event_loop.create_window(attrs);
 
         // Dock / Cmd+Tab に TenT のカスタムアイコンを適用
         macos::install_app_icon();
         // WKWebView フォーカス中でも Cmd+1..0 / Cmd+B / Cmd+L 等を拾えるようにする
         install_macos_shortcut_monitor(self.proxy.clone());
-        // Finder ファイル・スクショ右下サムネイル等の D&D を確実に受け取る
-        macos::install_file_drop_handler(&window, self.proxy.clone());
-        // WKWebView 上の CSS カーソル（リンクのポインタ等）が WinitView に上書きされないようにする
-        macos::install_cursor_rect_passthrough(&window);
 
         let scale = window.scale_factor() as f32;
         let gap = (6.0 * scale).round();
         let size = window.inner_size();
         let layout = AppLayout::compute(size.width, size.height, scale, self.sidebar_state);
 
-        let renderer =
-            Renderer::new(Arc::clone(&window), scale).expect("failed to initialize wgpu renderer");
+        let renderer = Renderer::new(window.surface_target(), size.width, size.height, scale)
+            .expect("failed to initialize wgpu renderer");
 
         // デーモンへ接続（未起動なら自動デタッチ起動）し、生きたペインをすべて再接続
         // スリープや描画停止中に GUI 側キューが際限なく膨張するのを防ぐため有界チャネルを使用し、
@@ -136,14 +119,18 @@ impl ApplicationHandler<AppEvent> for TentApp {
                 self.update_control_flow(event_loop);
             }
             AppEvent::WebViewClicked { px, py } => {
-                let mut changed = self.url_bar_edit.take().is_some();
-                if self.search.is_some() {
-                    self.close_search();
-                    changed = true;
-                }
+                let mut changed = false;
                 if let Some(ws) = self.workspace.as_mut()
                     && ws.focus_pane_at(px, py).is_some()
                 {
+                    changed = true;
+                }
+                if self.url_bar_edit.is_some() {
+                    self.close_url_bar_edit();
+                    changed = true;
+                }
+                if self.search.is_some() {
+                    self.close_search();
                     changed = true;
                 }
                 if changed {
@@ -280,6 +267,12 @@ impl ApplicationHandler<AppEvent> for TentApp {
                         self.request_redraw_now();
                     }
                 }
+            }
+            AppEvent::UrlBarSubmit(text) => {
+                self.submit_url_bar_edit(&text);
+            }
+            AppEvent::UrlBarCancel => {
+                self.close_url_bar_edit();
             }
         }
     }
@@ -468,12 +461,7 @@ impl ApplicationHandler<AppEvent> for TentApp {
         self.update_control_flow(event_loop);
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
-        event: WindowEvent,
-    ) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         self.handle_window_event(event_loop, event);
     }
 }

@@ -8,6 +8,7 @@ mod hook_cli;
 mod key_map;
 mod layout;
 mod macos;
+mod platform;
 mod renderer;
 mod slot;
 mod state;
@@ -15,15 +16,17 @@ mod terminal_pane;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ghostty_vt::key::Encoder;
-use winit::dpi::{LogicalPosition, LogicalSize};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::ModifiersState;
-use winit::window::{CursorIcon, Window};
+
+use crate::platform::{
+    ActiveEventLoop, AppProxy, ControlFlow, LogicalPosition, LogicalSize, ModifiersState,
+    NativeWindow,
+};
 
 pub(crate) use crate::app_state::{
     ClickTracker, DividerDragState, SEARCH_RESYNC_INTERVAL, SearchState, SearchTarget,
@@ -36,7 +39,7 @@ use crate::layout::{AppLayout, Rect, SidebarState};
 use crate::renderer::Renderer;
 use crate::slot::Workspace;
 use crate::state::{SavedState, WindowGeometry};
-use crate::terminal_pane::{AppEvent, PaneId, UrlMatch};
+use crate::terminal_pane::{PaneId, UrlMatch};
 
 pub(crate) const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 pub(crate) const CWD_POLL_INTERVAL: Duration = Duration::from_millis(1000);
@@ -50,15 +53,16 @@ pub(crate) const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(400);
 pub(crate) const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub(crate) struct TentApp {
-    pub(crate) proxy: EventLoopProxy<AppEvent>,
+    pub(crate) proxy: AppProxy,
     pub(crate) initial_state: Option<SavedState>,
     pub(crate) daemon: Option<DaemonClient>,
     /// 初回接続時に取得した常駐デーモンの PID（メモリ合算用。デーモン異常終了後に PID が再利用される可能性は極めて低いため接続時値を保持）
     pub(crate) daemon_pid: Option<i32>,
     pub(crate) daemon_rx: Option<Receiver<DaemonEvent>>,
 
-    pub(crate) window: Option<Arc<Window>>,
+    /// `wgpu::Surface` が `NativeWindow` より先に確実に drop されるよう `renderer` を前に置く
     pub(crate) renderer: Option<Renderer>,
+    pub(crate) window: Option<Rc<NativeWindow>>,
     pub(crate) workspace: Option<Workspace>,
     pub(crate) browsers: BrowserManager,
     pub(crate) layout: Option<AppLayout>,
@@ -103,7 +107,7 @@ pub(crate) struct TentApp {
 }
 
 impl TentApp {
-    fn new(proxy: EventLoopProxy<AppEvent>) -> Self {
+    fn new(proxy: AppProxy) -> Self {
         let key_encoder = Encoder::new().expect("failed to create ghostty key encoder");
         let saved = SavedState::load();
         let sidebar_state = saved.sidebar_state;
@@ -171,7 +175,7 @@ impl TentApp {
     fn current_window_geometry(&self) -> Option<WindowGeometry> {
         let window = self.window.as_ref()?;
         let scale = window.scale_factor();
-        let pos = window.outer_position().ok()?;
+        let pos = window.outer_position()?;
         let size = window.inner_size();
         let logical_pos: LogicalPosition<i32> = pos.to_logical(scale);
         let logical_size: LogicalSize<u32> = size.to_logical(scale);
@@ -181,6 +185,12 @@ impl TentApp {
             width: logical_size.width,
             height: logical_size.height,
         })
+    }
+
+    pub(crate) fn focus_terminal_view(&self) {
+        if let Some(window) = &self.window {
+            window.focus_terminal();
+        }
     }
 
     /// WKWebView の最新 URL（YouTube 等の SPA 遷移含む）を Workspace へ同期する
@@ -218,8 +228,8 @@ impl TentApp {
         let scale = window.scale_factor();
         let live_ids = ws.all_browser_ids();
         if self.browsers.retain_ids(&live_ids) {
-            // 最後の表示中 WebView を閉じた直後でも WinitView のカーソル矩形を張り直す
-            crate::macos::invalidate_cursor_rects(window);
+            // 最後の表示中 WebView を閉じた直後でも TentMetalView のカーソル矩形を張り直す
+            window.invalidate_cursor_rects();
         }
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.retain_browser_textures(&live_ids);
@@ -228,7 +238,7 @@ impl TentApp {
         if self.show_help {
             // ヘルプダイアログ表示中は WKWebView を一時的に非表示にして前面に描画する
             self.browsers.sync(window, &[], scale);
-            self.browsers.focus_parent();
+            window.focus_terminal();
             return;
         }
 
@@ -243,7 +253,7 @@ impl TentApp {
             if let Some(b) = ws.focused_browser() {
                 self.browsers.focus_webview(b.id);
             } else {
-                self.browsers.focus_parent();
+                window.focus_terminal();
             }
         }
     }
@@ -337,6 +347,12 @@ impl TentApp {
             }
         }
         self.layout = Some(layout);
+        if self.url_bar_edit.is_some()
+            && let Some(rect) = self.current_url_bar_rect()
+            && let Some(window) = &self.window
+        {
+            window.reposition_url_bar(rect);
+        }
         self.sync_browsers();
         self.request_redraw_now();
     }
@@ -552,15 +568,8 @@ impl TentApp {
         };
         if self.cursor_kind != next_kind {
             self.cursor_kind = next_kind;
-            macos::set_app_cursor_kind(next_kind);
             if let Some(window) = &self.window {
-                let icon = match next_kind {
-                    macos::AppCursorKind::Default => CursorIcon::Default,
-                    macos::AppCursorKind::Pointer => CursorIcon::Pointer,
-                    macos::AppCursorKind::EwResize => CursorIcon::EwResize,
-                    macos::AppCursorKind::NsResize => CursorIcon::NsResize,
-                };
-                window.set_cursor(icon);
+                window.set_cursor_kind(next_kind);
             }
         }
     }
@@ -629,12 +638,9 @@ fn main() {
         _ => {}
     }
 
-    let event_loop = EventLoop::<AppEvent>::with_user_event()
-        .build()
-        .expect("failed to build event loop");
-    let proxy = event_loop.create_proxy();
-    let mut app = TentApp::new(proxy);
-    event_loop.run_app(&mut app).expect("event loop error");
+    let proxy = AppProxy::new();
+    let app = TentApp::new(proxy.clone());
+    platform::run_app(proxy, app);
 }
 
 #[cfg(test)]

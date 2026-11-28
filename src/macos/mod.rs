@@ -12,10 +12,9 @@ pub use clipboard::{
     read_clipboard_text, resolve_terminal_paste_payload, save_clipboard_image_to_temp,
     shell_escape_path, write_clipboard_text,
 };
-pub use cursor_rects::{
-    AppCursorKind, install_cursor_rect_passthrough, invalidate_cursor_rects, set_app_cursor_kind,
-};
-pub use file_drop::install_file_drop_handler;
+pub use cursor_rects::{AppCursorKind, subtract_cursor_rects};
+#[cfg(target_os = "macos")]
+pub use file_drop::{handle_perform_drag, notify_drag_hover, register_dragged_types};
 #[cfg(test)]
 pub use process::detect_ai_tool_from_process;
 pub use process::{detect_ai_tool_for_pid, format_memory_bytes, get_pid_cwd, get_pid_memory_bytes};

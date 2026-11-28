@@ -5,17 +5,30 @@ use std::sync::Arc;
 #[cfg(target_os = "macos")]
 use std::sync::atomic::Ordering;
 
-use winit::event_loop::EventLoopProxy;
-
 #[cfg(target_os = "macos")]
 use crate::key_map::{AppShortcut, FocusDir};
+use crate::platform::{AppProxy, ModifiersState};
 use crate::terminal_pane::AppEvent;
 
-/// WKWebView (WryWebView) にフォーカスがある間も TenT のグローバルショートカット
+#[cfg(target_os = "macos")]
+fn is_native_terminal_view(win: &objc2_app_kit::NSWindow, obj: &objc2::runtime::NSObject) -> bool {
+    let name = obj.class().name().to_string_lossy();
+    name.contains("TentMetalView")
+        || name.contains("TentRootView")
+        || crate::platform::is_url_field_or_editor(win, obj)
+}
+
+#[cfg(target_os = "macos")]
+fn is_native_text_field_focused(win: &objc2_app_kit::NSWindow) -> bool {
+    win.firstResponder()
+        .is_some_and(|fr| crate::platform::is_url_field_or_editor(win, &fr))
+}
+
+/// WKWebView にフォーカスがある間も TenT のグローバルショートカット
 /// （Cmd+1..0, Cmd+B, Cmd+Shift+B, Cmd+L, Cmd+R, Cmd+D, Cmd+W 等）を受け取り、
 /// 分割内のブラウザクリックでもペインフォーカスを同期するための macOS AppKit モニタ
 #[cfg(target_os = "macos")]
-pub fn install_macos_shortcut_monitor(proxy: EventLoopProxy<AppEvent>) {
+pub fn install_macos_shortcut_monitor(proxy: AppProxy) {
     use block2::RcBlock;
     use objc2::MainThreadMarker;
     use objc2::runtime::NSObject;
@@ -38,8 +51,7 @@ pub fn install_macos_shortcut_monitor(proxy: EventLoopProxy<AppEvent>) {
                 let loc = event.locationInWindow();
                 if let Some(hit_view) = content.hitTest(loc) {
                     let obj: &NSObject = &hit_view;
-                    let is_winit = obj.class().name().to_string_lossy().contains("Winit");
-                    if is_winit {
+                    if is_native_terminal_view(&win, obj) {
                         last_hovered_clone.store(0, Ordering::Relaxed);
                     } else {
                         let ptr = std::ptr::from_ref(obj) as usize;
@@ -62,14 +74,14 @@ pub fn install_macos_shortcut_monitor(proxy: EventLoopProxy<AppEvent>) {
                 && let Some(content) = win.contentView()
             {
                 let loc = event.locationInWindow();
-                let hit_is_winit = content
+                let hit_is_terminal = content
                     .hitTest(loc)
                     .map(|v| {
                         let obj: &NSObject = &v;
-                        obj.class().name().to_string_lossy().contains("Winit")
+                        is_native_terminal_view(&win, obj)
                     })
                     .unwrap_or(true);
-                if !hit_is_winit {
+                if !hit_is_terminal {
                     let scale = win.backingScaleFactor();
                     let content_h = content.frame().size.height;
                     let px = (loc.x * scale) as f32;
@@ -87,14 +99,14 @@ pub fn install_macos_shortcut_monitor(proxy: EventLoopProxy<AppEvent>) {
                 && let Some(content) = win.contentView()
             {
                 let loc = event.locationInWindow();
-                let hit_is_winit = content
+                let hit_is_terminal = content
                     .hitTest(loc)
                     .map(|v| {
                         let obj: &NSObject = &v;
-                        obj.class().name().to_string_lossy().contains("Winit")
+                        is_native_terminal_view(&win, obj)
                     })
                     .unwrap_or(true);
-                if !hit_is_winit {
+                if !hit_is_terminal {
                     use objc2_app_kit::NSEventPhase;
                     use std::cell::Cell;
                     use std::time::Instant;
@@ -214,14 +226,14 @@ pub fn install_macos_shortcut_monitor(proxy: EventLoopProxy<AppEvent>) {
                 && let Some(content) = win.contentView()
             {
                 let loc = event.locationInWindow();
-                let hit_is_winit = content
+                let hit_is_terminal = content
                     .hitTest(loc)
                     .map(|v| {
                         let obj: &NSObject = &v;
-                        obj.class().name().to_string_lossy().contains("Winit")
+                        is_native_terminal_view(&win, obj)
                     })
                     .unwrap_or(true);
-                if !hit_is_winit {
+                if !hit_is_terminal {
                     let dx = event.deltaX();
                     if dx > 0.0 {
                         let _ = proxy.send_event(AppEvent::Shortcut(AppShortcut::BrowserBack));
@@ -264,19 +276,17 @@ pub fn install_macos_shortcut_monitor(proxy: EventLoopProxy<AppEvent>) {
                 let key_code = event.keyCode();
 
                 if let Some(shortcut) = match_macos_keycode_shortcut(key_code, shift, opt) {
+                    // ネイティブ URL バー（NSTextField）編集中は Cmd+←/→ を行頭/行末移動へ譲る
+                    if matches!(
+                        shortcut,
+                        AppShortcut::BrowserBack | AppShortcut::BrowserForward
+                    ) && let Some(mtm) = MainThreadMarker::new()
+                        && let Some(win) = event.window(mtm)
+                        && is_native_text_field_focused(&win)
+                    {
+                        return event_ptr.as_ptr();
+                    }
                     let _ = proxy.send_event(AppEvent::Shortcut(shortcut));
-                    return std::ptr::null_mut();
-                }
-
-                // winit 標準アプリには Edit メニューが存在せず WryWebView 子ビューの
-                // performKeyEquivalent も抑止されるため、WKWebView フォーカス中の基本編集
-                // ショートカット（Cmd+C/V/X/A/Z/Shift+Z/Shift+V）を First Responder へ直接配送する
-                if let Some(action) = match_webview_edit_action(key_code, shift, opt)
-                    && let Some(mtm) = MainThreadMarker::new()
-                    && let Some(win) = event.window(mtm)
-                    && unsafe { is_webview_first_responder(&win) }
-                {
-                    let _ = unsafe { dispatch_webview_edit_action(action) };
                     return std::ptr::null_mut();
                 }
             }
@@ -298,13 +308,12 @@ pub fn install_macos_shortcut_monitor(proxy: EventLoopProxy<AppEvent>) {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn install_macos_shortcut_monitor(_proxy: EventLoopProxy<AppEvent>) {}
+pub fn install_macos_shortcut_monitor(_proxy: AppProxy) {}
 
-/// macOS の現在の物理修飾キー状態をライブ取得する（WKWebView ⇔ WinitView フォーカス切替時の修飾キーずれ防止）
+/// macOS の現在の物理修飾キー状態をライブ取得する（WKWebView ⇔ TentMetalView フォーカス切替時の修飾キーずれ防止）
 #[cfg(target_os = "macos")]
-pub fn current_macos_modifiers() -> winit::keyboard::ModifiersState {
+pub fn current_macos_modifiers() -> ModifiersState {
     use objc2_app_kit::{NSEvent, NSEventModifierFlags};
-    use winit::keyboard::ModifiersState;
 
     let flags = NSEvent::modifierFlags_class();
     let mut state = ModifiersState::empty();
@@ -324,89 +333,8 @@ pub fn current_macos_modifiers() -> winit::keyboard::ModifiersState {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn current_macos_modifiers() -> winit::keyboard::ModifiersState {
-    winit::keyboard::ModifiersState::empty()
-}
-
-/// WKWebView フォーカス中に First Responder へ配送する基本編集アクション
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WebViewEditAction {
-    Copy,
-    Paste,
-    PasteAsPlainText,
-    Cut,
-    SelectAll,
-    Undo,
-    Redo,
-}
-
-#[cfg(target_os = "macos")]
-fn match_webview_edit_action(key_code: u16, shift: bool, opt: bool) -> Option<WebViewEditAction> {
-    if opt {
-        return None;
-    }
-    if shift {
-        return match key_code {
-            0x06 => Some(WebViewEditAction::Redo),             // Shift+Z
-            0x09 => Some(WebViewEditAction::PasteAsPlainText), // Shift+V
-            _ => None,
-        };
-    }
-    match key_code {
-        0x08 => Some(WebViewEditAction::Copy),      // C
-        0x09 => Some(WebViewEditAction::Paste),     // V
-        0x07 => Some(WebViewEditAction::Cut),       // X
-        0x00 => Some(WebViewEditAction::SelectAll), // A
-        0x06 => Some(WebViewEditAction::Undo),      // Z
-        _ => None,
-    }
-}
-
-#[cfg(target_os = "macos")]
-unsafe fn is_webview_first_responder(win: &objc2_app_kit::NSWindow) -> bool {
-    use objc2::ffi::object_getClass;
-    use objc2::msg_send;
-    use objc2::runtime::AnyObject;
-
-    let resp: *mut AnyObject = unsafe { msg_send![win, firstResponder] };
-    if resp.is_null() {
-        return false;
-    }
-    let cls = unsafe { object_getClass(resp.cast()) };
-    if cls.is_null() {
-        return false;
-    }
-    let name = unsafe { (*cls).name().to_string_lossy() };
-    !name.contains("Winit") && name != "NSWindow"
-}
-
-#[cfg(target_os = "macos")]
-unsafe fn dispatch_webview_edit_action(action: WebViewEditAction) -> bool {
-    use objc2::runtime::{AnyClass, AnyObject, Bool};
-    use objc2::{msg_send, sel};
-
-    let Some(app_cls) = AnyClass::get(c"NSApplication") else {
-        return false;
-    };
-    let app: *mut AnyObject = unsafe { msg_send![app_cls, sharedApplication] };
-    if app.is_null() {
-        return false;
-    }
-    let nil: *const AnyObject = std::ptr::null();
-    let send = |sel_val: objc2::runtime::Sel| -> bool {
-        let ok: Bool = unsafe { msg_send![app, sendAction: sel_val, to: nil, from: nil] };
-        ok.as_bool()
-    };
-    match action {
-        WebViewEditAction::Copy => send(sel!(copy:)),
-        WebViewEditAction::Paste => send(sel!(paste:)),
-        WebViewEditAction::PasteAsPlainText => send(sel!(pasteAsPlainText:)) || send(sel!(paste:)),
-        WebViewEditAction::Cut => send(sel!(cut:)),
-        WebViewEditAction::SelectAll => send(sel!(selectAll:)),
-        WebViewEditAction::Undo => send(sel!(undo:)),
-        WebViewEditAction::Redo => send(sel!(redo:)),
-    }
+pub fn current_macos_modifiers() -> ModifiersState {
+    ModifiersState::empty()
 }
 
 /// macOS Carbon 仮想キーコードから TenT ショートカットへ変換
@@ -476,39 +404,5 @@ mod tests {
             match_macos_keycode_shortcut(0x03, false, false),
             Some(AppShortcut::Find)
         );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn test_match_webview_edit_action() {
-        assert_eq!(
-            match_webview_edit_action(0x08, false, false),
-            Some(WebViewEditAction::Copy)
-        );
-        assert_eq!(
-            match_webview_edit_action(0x09, false, false),
-            Some(WebViewEditAction::Paste)
-        );
-        assert_eq!(
-            match_webview_edit_action(0x09, true, false),
-            Some(WebViewEditAction::PasteAsPlainText)
-        );
-        assert_eq!(
-            match_webview_edit_action(0x07, false, false),
-            Some(WebViewEditAction::Cut)
-        );
-        assert_eq!(
-            match_webview_edit_action(0x00, false, false),
-            Some(WebViewEditAction::SelectAll)
-        );
-        assert_eq!(
-            match_webview_edit_action(0x06, false, false),
-            Some(WebViewEditAction::Undo)
-        );
-        assert_eq!(
-            match_webview_edit_action(0x06, true, false),
-            Some(WebViewEditAction::Redo)
-        );
-        assert_eq!(match_webview_edit_action(0x08, false, true), None);
     }
 }

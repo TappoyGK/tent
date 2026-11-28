@@ -6,8 +6,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use winit::event_loop::EventLoopProxy;
-use winit::window::Window;
 use wry::dpi::{LogicalPosition, LogicalSize};
 use wry::{NewWindowResponse, Rect as WryRect, WebView, WebViewBuilder};
 
@@ -16,6 +14,7 @@ use scripts::IN_TAB_FULLSCREEN_JS;
 pub use url::{BrowserPaneMeta, DEFAULT_BROWSER_URL, escape_js_string, normalize_url_input};
 
 use crate::layout::Rect;
+use crate::platform::{AppProxy, NativeWindow};
 use crate::terminal_pane::{AppEvent, PaneId};
 
 struct ManagedWebView {
@@ -25,14 +24,14 @@ struct ManagedWebView {
     in_flight: Arc<AtomicBool>,
 }
 
-/// winit Window 上の子 WKWebView 群のライフサイクル・位置・可視性を管理する
+/// NativeWindow のコンテナビュー（TentRootView）上に兄弟配置する WKWebView 群を管理する
 pub struct BrowserManager {
     views: HashMap<PaneId, ManagedWebView>,
-    proxy: EventLoopProxy<AppEvent>,
+    proxy: AppProxy,
 }
 
 impl BrowserManager {
-    pub fn new(proxy: EventLoopProxy<AppEvent>) -> Self {
+    pub fn new(proxy: AppProxy) -> Self {
         Self {
             views: HashMap::new(),
             proxy,
@@ -42,7 +41,7 @@ impl BrowserManager {
     /// 現在表示すべきブラウザ一覧に合わせて WKWebView を生成・リサイズ・表示切替する
     pub fn sync(
         &mut self,
-        window: &Window,
+        window: &NativeWindow,
         visible_browsers: &[(PaneId, Rect, &str)],
         scale_factor: f64,
     ) {
@@ -146,7 +145,8 @@ impl BrowserManager {
                     // bare binary 起動でも Cookie・ログイン状態を永続化するための固定 DataStore UUID
                     builder = builder.with_data_store_identifier(*b"TenTBrowserStore");
                 }
-                match builder.build_as_child(window) {
+                let container = window.browser_container_handle();
+                match builder.build_as_child(&container) {
                     Ok(webview) => {
                         #[cfg(target_os = "macos")]
                         {
@@ -175,14 +175,14 @@ impl BrowserManager {
             }
         }
         if cursor_rects_dirty {
-            crate::macos::invalidate_cursor_rects(window);
+            window.invalidate_cursor_rects();
         }
     }
 
     /// 非アクティブスロットのブラウザを非表示（フォーカスを奪わない）のまま裏で順次生成する
     pub fn warm_up_hidden(
         &mut self,
-        window: &Window,
+        window: &NativeWindow,
         id: PaneId,
         phys_rect: Rect,
         url: &str,
@@ -249,7 +249,8 @@ impl BrowserManager {
             use wry::WebViewBuilderExtDarwin;
             builder = builder.with_data_store_identifier(*b"TenTBrowserStore");
         }
-        match builder.build_as_child(window) {
+        let container = window.browser_container_handle();
+        match builder.build_as_child(&container) {
             Ok(webview) => {
                 #[cfg(target_os = "macos")]
                 {
@@ -400,13 +401,6 @@ impl BrowserManager {
     pub fn focus_webview(&self, pane_id: PaneId) {
         if let Some(managed) = self.views.get(&pane_id) {
             let _ = managed.webview.focus();
-        }
-    }
-
-    /// 親の WinitView へフォーカスを戻す（ターミナルや URL バー入力へ切り替えるとき用）
-    pub fn focus_parent(&self) {
-        if let Some(managed) = self.views.values().next() {
-            let _ = managed.webview.focus_parent();
         }
     }
 

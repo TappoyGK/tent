@@ -1,115 +1,79 @@
 use ghostty_vt::terminal::ScrollViewport;
-use winit::event::{ElementState, KeyEvent};
-use winit::keyboard::{Key, NamedKey};
 
 use crate::browser::{DEFAULT_BROWSER_URL, normalize_url_input};
 use crate::key_map::AppShortcut;
 use crate::macos;
+use crate::platform::{ElementState, Key, KeyEvent, NamedKey};
 use crate::slot::{SplitAxis, Workspace};
 use crate::{SearchState, SearchTarget, TentApp, UrlBarEdit};
 
 impl TentApp {
+    pub(crate) fn current_url_bar_rect(&self) -> Option<crate::layout::Rect> {
+        let layout = self.layout.as_ref()?;
+        let scale = self
+            .window
+            .as_ref()
+            .map(|w| w.scale_factor() as f32)
+            .unwrap_or(1.0);
+        let ctrl = layout.status_bar_controls(scale, true, self.daemon_version_mismatch);
+        Some(ctrl.url_bar_rect)
+    }
+
     pub(crate) fn start_url_bar_edit(&mut self) {
         self.sync_live_browser_urls();
-        let Some(ws) = &self.workspace else {
+        let Some((pane_id, url)) = self
+            .workspace
+            .as_ref()
+            .and_then(Workspace::focused_browser)
+            .map(|b| (b.id, b.url.clone()))
+        else {
             return;
         };
-        let Some(b) = ws.focused_browser() else {
+        let Some(url_rect) = self.current_url_bar_rect() else {
             return;
         };
-        self.url_bar_edit = Some(UrlBarEdit {
-            pane_id: b.id,
-            text: b.url.clone(),
-            select_all: true,
-        });
-        self.browsers.focus_parent();
+        self.url_bar_edit = Some(UrlBarEdit { pane_id });
+        if let Some(window) = &self.window {
+            window.show_url_bar(url_rect, &url);
+        }
         self.request_redraw_now();
     }
 
-    pub(crate) fn handle_url_bar_key(&mut self, event: &KeyEvent) -> bool {
-        if event.state != ElementState::Pressed {
-            return true;
+    pub(crate) fn close_url_bar_edit(&mut self) {
+        if self.url_bar_edit.take().is_some() {
+            if let Some(window) = &self.window {
+                window.hide_url_bar();
+            }
+            if self.search.is_none()
+                && let Some(b) = self.workspace.as_ref().and_then(Workspace::focused_browser)
+            {
+                self.browsers.focus_webview(b.id);
+            } else {
+                self.focus_terminal_view();
+            }
+            self.request_redraw_now();
         }
-        let Some(edit) = self.url_bar_edit.as_mut() else {
-            return false;
+    }
+
+    pub(crate) fn submit_url_bar_edit(&mut self, raw_text: &str) {
+        let Some(edit) = self.url_bar_edit.take() else {
+            return;
         };
-
-        if self.modifiers.super_key() && !self.modifiers.control_key() {
-            match &event.logical_key {
-                Key::Character(c) if c.eq_ignore_ascii_case("a") => {
-                    edit.select_all = true;
-                    self.request_redraw_now();
-                    return true;
-                }
-                Key::Character(c) if c.eq_ignore_ascii_case("c") => {
-                    macos::write_clipboard_text(&edit.text);
-                    return true;
-                }
-                Key::Character(c) if c.eq_ignore_ascii_case("v") => {
-                    if let Some(clip) = macos::read_clipboard_text() {
-                        let single_line = clip.replace(['\r', '\n'], "");
-                        if edit.select_all {
-                            edit.text.clear();
-                            edit.select_all = false;
-                        }
-                        edit.text.push_str(&single_line);
-                        self.request_redraw_now();
-                    }
-                    return true;
-                }
-                _ => {}
-            }
+        if let Some(window) = &self.window {
+            window.hide_url_bar();
         }
-
-        match &event.logical_key {
-            Key::Named(NamedKey::Escape) => {
-                let pid = edit.pane_id;
-                self.url_bar_edit = None;
-                self.browsers.focus_webview(pid);
-                self.request_redraw_now();
-            }
-            Key::Named(NamedKey::Enter) => {
-                let edit = self.url_bar_edit.take().unwrap();
-                let url = normalize_url_input(&edit.text);
-                if let Some(ws) = self.workspace.as_mut() {
-                    ws.update_browser_url(edit.pane_id, url.clone());
-                }
-                self.browsers.navigate(edit.pane_id, &url);
-                self.browsers.focus_webview(edit.pane_id);
-                self.save_state();
-                self.request_redraw_now();
-            }
-            Key::Named(NamedKey::Backspace) => {
-                if edit.select_all {
-                    edit.text.clear();
-                    edit.select_all = false;
-                } else {
-                    edit.text.pop();
-                }
-                self.request_redraw_now();
-            }
-            _ => {
-                if !self.modifiers.super_key()
-                    && !self.modifiers.control_key()
-                    && let Some(text) = &event.text
-                {
-                    let filtered: String = text.chars().filter(|c| !c.is_control()).collect();
-                    if !filtered.is_empty() {
-                        if edit.select_all {
-                            edit.text.clear();
-                            edit.select_all = false;
-                        }
-                        edit.text.push_str(&filtered);
-                        self.request_redraw_now();
-                    }
-                }
-            }
+        let url = normalize_url_input(raw_text);
+        if let Some(ws) = self.workspace.as_mut() {
+            ws.update_browser_url(edit.pane_id, url.clone());
         }
-        true
+        self.browsers.navigate(edit.pane_id, &url);
+        self.browsers.focus_webview(edit.pane_id);
+        self.save_state();
+        self.request_redraw_now();
     }
 
     pub(crate) fn start_search(&mut self) {
-        self.url_bar_edit = None;
+        self.close_url_bar_edit();
         let Some(ws) = self.workspace.as_mut() else {
             return;
         };
@@ -131,7 +95,7 @@ impl TentApp {
         {
             search.select_all = true;
             if target.is_browser() {
-                self.browsers.focus_parent();
+                self.focus_terminal_view();
             }
             self.request_redraw_now();
             return;
@@ -169,7 +133,7 @@ impl TentApp {
             last_sync_at: std::time::Instant::now(),
         });
         if target.is_browser() {
-            self.browsers.focus_parent();
+            self.focus_terminal_view();
         }
         if has_initial {
             self.update_search_results(true);
@@ -444,7 +408,7 @@ impl TentApp {
             shortcut,
             AppShortcut::Copy | AppShortcut::Paste | AppShortcut::FocusUrlBar
         ) {
-            self.url_bar_edit = None;
+            self.close_url_bar_edit();
         }
         // 検索バー編集中でも検索操作以外のナビゲーションを受けたら検索を閉じる
         if !matches!(
@@ -590,7 +554,9 @@ impl TentApp {
                 self.request_redraw_now();
             }
             AppShortcut::Copy => {
-                if let Some(sel) = &self.selection {
+                if let Some(search) = &self.search {
+                    macos::write_clipboard_text(&search.query);
+                } else if let Some(sel) = &self.selection {
                     if let Some(ws) = self.workspace.as_mut()
                         && let Some(root) = ws.active_slot_mut().root.as_mut()
                         && let Some(pane) = root.terminal_pane_mut(sel.pane_id)
@@ -605,7 +571,18 @@ impl TentApp {
                 }
             }
             AppShortcut::Paste => {
-                if let Some(ws) = self.workspace.as_mut()
+                if let Some(search) = self.search.as_mut() {
+                    if let Some(clip) = macos::read_clipboard_text() {
+                        let single_line = clip.replace(['\r', '\n'], "");
+                        if search.select_all {
+                            search.query.clear();
+                            search.select_all = false;
+                        }
+                        search.query.push_str(&single_line);
+                        self.update_search_results(true);
+                        self.request_redraw_now();
+                    }
+                } else if let Some(ws) = self.workspace.as_mut()
                     && let Some(pane) = ws.active_pane_mut()
                     && let Some(text) = macos::resolve_terminal_paste_payload(
                         macos::read_clipboard_text(),

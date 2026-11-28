@@ -1,15 +1,13 @@
 use std::time::Instant;
 
-use ghostty_vt::terminal::ScrollViewport;
-use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::ActiveEventLoop;
-use winit::keyboard::{Key, NamedKey};
-
 use crate::browser::current_macos_modifiers;
 use crate::key_map::{AppShortcut, encode_key_event, match_app_shortcut};
 use crate::layout::{SidebarHit, StatusBarHit};
 use crate::macos;
+use crate::platform::{
+    ActiveEventLoop, ElementState, Ime, Key, MouseButton, MouseScrollDelta, NamedKey,
+    PhysicalPosition, PhysicalSize, WindowEvent,
+};
 use crate::renderer::{
     RenderOverlays, SearchBarOverlay, SearchHighlightOverlay, SelectionOverlay, UrlHoverOverlay,
 };
@@ -18,6 +16,7 @@ use crate::{
     ClickTracker, DividerDragState, MULTI_CLICK_INTERVAL, SelectionMode, SelectionState,
     SlotDragState, TentApp,
 };
+use ghostty_vt::terminal::ScrollViewport;
 
 impl TentApp {
     pub(crate) fn handle_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
@@ -34,11 +33,11 @@ impl TentApp {
                     self.update_cursor_icon();
                 }
             }
-            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+            WindowEvent::Resized | WindowEvent::ScaleFactorChanged => {
                 self.recompute_layout_and_resize();
             }
             WindowEvent::ModifiersChanged(new_mods) => {
-                self.modifiers = new_mods.state();
+                self.modifiers = new_mods;
                 self.update_url_hover();
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -306,9 +305,7 @@ impl TentApp {
                 }
 
                 // URL バー外をクリックしたら編集終了
-                if self.url_bar_edit.take().is_some() {
-                    self.request_redraw_now();
-                }
+                self.close_url_bar_edit();
 
                 // 2. 右サイドバー判定
                 let hit = self
@@ -588,20 +585,6 @@ impl TentApp {
                 if !self.ime_preedit.is_empty() {
                     return;
                 }
-                if self.url_bar_edit.is_some() {
-                    // URL バー編集中でもスロット切替等のアプリショートカットは通す
-                    if let Some(shortcut) = match_app_shortcut(&event, self.modifiers)
-                        && !matches!(
-                            shortcut,
-                            AppShortcut::Copy | AppShortcut::Paste | AppShortcut::FocusUrlBar
-                        )
-                    {
-                        self.handle_shortcut(shortcut);
-                        return;
-                    }
-                    self.handle_url_bar_key(&event);
-                    return;
-                }
                 if self.search.is_some() {
                     // 検索バー編集中でもスロット切替・Cmd+F 全選択等のアプリショートカットは通す
                     if let Some(shortcut) = match_app_shortcut(&event, self.modifiers)
@@ -653,13 +636,7 @@ impl TentApp {
                 Ime::Commit(text) => {
                     self.ime_preedit.clear();
                     if !text.is_empty() {
-                        if let Some(edit) = self.url_bar_edit.as_mut() {
-                            if edit.select_all {
-                                edit.text.clear();
-                                edit.select_all = false;
-                            }
-                            edit.text.push_str(&text);
-                        } else if let Some(search) = self.search.as_mut() {
+                        if let Some(search) = self.search.as_mut() {
                             if search.select_all {
                                 search.query.clear();
                                 search.select_all = false;
@@ -676,30 +653,7 @@ impl TentApp {
                     }
                     self.request_redraw_now();
                 }
-                Ime::Disabled => {
-                    if !self.ime_preedit.is_empty() {
-                        self.ime_preedit.clear();
-                        self.request_redraw_now();
-                    }
-                }
-                Ime::Enabled => {}
             },
-            WindowEvent::DroppedFile(path) => {
-                // スクショ等のファイル D&D: フォーカス中のターミナルペインへエスケープ済みパスを貼り付ける
-                let escaped = format!("{} ", macos::shell_escape_path(&path));
-                if let Some(ws) = self.workspace.as_mut() {
-                    if ws.active_slot_ref().is_dormant() {
-                        let idx = ws.active_slot;
-                        ws.ensure_slot_started(idx);
-                    }
-                    if let Some(pane) = ws.active_pane_mut() {
-                        pane.terminal.scroll_viewport(ScrollViewport::Bottom);
-                        pane.mark_dirty();
-                        pane.paste_text(&escaped);
-                        self.request_redraw_now();
-                    }
-                }
-            }
             WindowEvent::RedrawRequested => {
                 self.drain_daemon_events();
                 self.sync_search_matches_if_needed(false);
@@ -749,10 +703,7 @@ impl TentApp {
                         start_col: m.start_col,
                         end_col: m.end_col,
                     }),
-                    url_bar_editing: self
-                        .url_bar_edit
-                        .as_ref()
-                        .map(|e| (e.text.as_str(), e.select_all)),
+                    url_bar_editing: self.url_bar_edit.is_some(),
                     search_highlights: self.search.as_ref().and_then(|s| {
                         let crate::SearchTarget::Terminal(pid) = s.target else {
                             return None;

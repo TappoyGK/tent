@@ -64,8 +64,6 @@ pub(crate) fn selection_autoscroll_delta(py: f32, pane_rect: Rect, cell_h: f32) 
 
 pub(crate) struct UrlBarEdit {
     pub(crate) pane_id: PaneId,
-    pub(crate) text: String,
-    pub(crate) select_all: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
