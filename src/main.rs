@@ -30,7 +30,7 @@ use crate::layout::{AppLayout, Rect, SidebarState};
 use crate::renderer::Renderer;
 use crate::slot::Workspace;
 use crate::state::{SavedState, WindowGeometry};
-use crate::terminal_pane::{AppEvent, PaneId, TrackedGridRef, UrlMatch};
+use crate::terminal_pane::{AppEvent, PaneId, SearchMatch, TrackedGridRef, UrlMatch};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const CWD_POLL_INTERVAL: Duration = Duration::from_millis(1000);
@@ -101,6 +101,32 @@ struct UrlBarEdit {
     pane_id: PaneId,
     text: String,
     select_all: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SearchTarget {
+    Terminal(PaneId),
+    Browser(PaneId),
+}
+
+impl SearchTarget {
+    pub(crate) fn pane_id(self) -> PaneId {
+        match self {
+            Self::Terminal(id) | Self::Browser(id) => id,
+        }
+    }
+
+    pub(crate) fn is_browser(self) -> bool {
+        matches!(self, Self::Browser(_))
+    }
+}
+
+pub(crate) struct SearchState {
+    pub(crate) target: SearchTarget,
+    pub(crate) query: String,
+    pub(crate) select_all: bool,
+    pub(crate) matches: Vec<SearchMatch>,
+    pub(crate) current_match: Option<usize>,
 }
 
 #[derive(Default)]
@@ -243,6 +269,7 @@ struct TentApp {
     last_autoscroll: Instant,
     hovered_url: Option<(PaneId, UrlMatch)>,
     url_bar_edit: Option<UrlBarEdit>,
+    search: Option<SearchState>,
     show_help: bool,
     restart_requested: bool,
     daemon_version_mismatch: bool,
@@ -295,6 +322,7 @@ impl TentApp {
             last_autoscroll: now - AUTOSCROLL_INTERVAL,
             hovered_url: None,
             url_bar_edit: None,
+            search: None,
             show_help: false,
             restart_requested: false,
             daemon_version_mismatch: false,
@@ -384,7 +412,7 @@ impl TentApp {
             .collect();
         self.browsers.sync(window, &refs, scale);
 
-        if self.url_bar_edit.is_none() {
+        if self.url_bar_edit.is_none() && self.search.is_none() {
             if let Some(b) = ws.focused_browser() {
                 self.browsers.focus_webview(b.id);
             } else {
@@ -414,6 +442,13 @@ impl TentApp {
                         .is_some_and(|s| s.pane_id == pane_id)
                     {
                         self.selection = None;
+                    }
+                    if self
+                        .search
+                        .as_ref()
+                        .is_some_and(|s| s.target.pane_id() == pane_id)
+                    {
+                        self.search = None;
                     }
                     pane_exited = true;
                     changed = true;

@@ -10,7 +10,9 @@ use crate::browser::current_macos_modifiers;
 use crate::key_map::{AppShortcut, encode_key_event, match_app_shortcut};
 use crate::layout::{SidebarHit, StatusBarHit};
 use crate::macos;
-use crate::renderer::{RenderOverlays, SelectionOverlay, UrlHoverOverlay};
+use crate::renderer::{
+    RenderOverlays, SearchBarOverlay, SearchHighlightOverlay, SelectionOverlay, UrlHoverOverlay,
+};
 use crate::slot::{Workspace, ratio_from_pointer};
 use crate::{
     ClickTracker, DividerDragState, MULTI_CLICK_INTERVAL, SelectionMode, SelectionState,
@@ -96,6 +98,7 @@ impl TentApp {
                     && !is_selecting
                     && self.hovered_divider.is_none()
                     && self.url_bar_edit.is_none()
+                    && self.search.is_none()
                 {
                     let needs_focus = self.workspace.as_ref().is_some_and(|ws| {
                         ws.pane_at(px, py)
@@ -583,6 +586,20 @@ impl TentApp {
                     self.handle_url_bar_key(&event);
                     return;
                 }
+                if self.search.is_some() {
+                    // 検索バー編集中でもスロット切替等のアプリショートカットは通す
+                    if let Some(shortcut) = match_app_shortcut(&event, self.modifiers)
+                        && !matches!(
+                            shortcut,
+                            AppShortcut::Copy | AppShortcut::Paste | AppShortcut::Find
+                        )
+                    {
+                        self.handle_shortcut(shortcut);
+                        return;
+                    }
+                    self.handle_search_key(&event);
+                    return;
+                }
                 if let Some(shortcut) = match_app_shortcut(&event, self.modifiers) {
                     self.handle_shortcut(shortcut);
                     if self.restart_requested {
@@ -629,6 +646,13 @@ impl TentApp {
                                 edit.select_all = false;
                             }
                             edit.text.push_str(&text);
+                        } else if let Some(search) = self.search.as_mut() {
+                            if search.select_all {
+                                search.query.clear();
+                                search.select_all = false;
+                            }
+                            search.query.push_str(&text);
+                            self.update_search_results(true);
                         } else if let Some(ws) = self.workspace.as_mut()
                             && let Some(pane) = ws.active_pane_mut()
                         {
@@ -715,6 +739,69 @@ impl TentApp {
                         .url_bar_edit
                         .as_ref()
                         .map(|e| (e.text.as_str(), e.select_all)),
+                    search_highlights: self.search.as_ref().and_then(|s| {
+                        let crate::SearchTarget::Terminal(pid) = s.target else {
+                            return None;
+                        };
+                        if s.matches.is_empty() {
+                            return None;
+                        }
+                        let pane = self
+                            .workspace
+                            .as_ref()?
+                            .active_slot_ref()
+                            .root
+                            .as_ref()?
+                            .terminal_pane(pid)?;
+                        let vp_top = pane.viewport_top_screen_row();
+                        let vp_bottom =
+                            vp_top.saturating_add(u32::from(pane.rows.saturating_sub(1)));
+                        let visible: Vec<(u16, u16, u16, bool)> = s
+                            .matches
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, m)| m.screen_row >= vp_top && m.screen_row <= vp_bottom)
+                            .map(|(idx, m)| {
+                                (
+                                    (m.screen_row - vp_top) as u16,
+                                    m.start_col,
+                                    m.end_col,
+                                    s.current_match == Some(idx),
+                                )
+                            })
+                            .collect();
+                        if visible.is_empty() {
+                            None
+                        } else {
+                            Some(SearchHighlightOverlay {
+                                pane_id: pid,
+                                matches: visible,
+                            })
+                        }
+                    }),
+                    search_bar: self.search.as_ref().map(|s| {
+                        let count_label = if s.target.is_browser() {
+                            if s.query.is_empty() {
+                                String::new()
+                            } else {
+                                "Enter/⇧Enter".to_string()
+                            }
+                        } else if s.query.is_empty() {
+                            String::new()
+                        } else if s.matches.is_empty() {
+                            "0/0".to_string()
+                        } else {
+                            let cur = s.current_match.map_or(1, |i| i + 1);
+                            format!("{cur}/{}", s.matches.len())
+                        };
+                        SearchBarOverlay {
+                            pane_id: s.target.pane_id(),
+                            is_browser: s.target.is_browser(),
+                            query: s.query.as_str(),
+                            select_all: s.select_all,
+                            count_label,
+                        }
+                    }),
                     battery: self.battery_status.lock().ok().and_then(|g| *g),
                     wifi: self.wifi_status.lock().ok().and_then(|g| *g),
                     show_help: self.show_help,

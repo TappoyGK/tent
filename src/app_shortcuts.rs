@@ -6,7 +6,7 @@ use crate::browser::{DEFAULT_BROWSER_URL, normalize_url_input};
 use crate::key_map::AppShortcut;
 use crate::macos;
 use crate::slot::{SplitAxis, Workspace};
-use crate::{TentApp, UrlBarEdit};
+use crate::{SearchState, SearchTarget, TentApp, UrlBarEdit};
 
 impl TentApp {
     pub(crate) fn start_url_bar_edit(&mut self) {
@@ -108,6 +108,260 @@ impl TentApp {
         true
     }
 
+    pub(crate) fn start_search(&mut self) {
+        self.url_bar_edit = None;
+        let Some(ws) = self.workspace.as_mut() else {
+            return;
+        };
+        if ws.active_slot_ref().is_dormant() {
+            let idx = ws.active_slot;
+            ws.ensure_slot_started(idx);
+        }
+        let target = if let Some(b) = ws.focused_browser() {
+            SearchTarget::Browser(b.id)
+        } else if let Some(p) = ws.active_pane_mut() {
+            SearchTarget::Terminal(p.id)
+        } else {
+            return;
+        };
+
+        // 既に同じペインで検索バーが開いていれば全選択状態にする
+        if let Some(search) = self.search.as_mut()
+            && search.target == target
+        {
+            search.select_all = true;
+            if target.is_browser() {
+                self.browsers.focus_parent();
+            }
+            self.request_redraw_now();
+            return;
+        }
+
+        // 別のブラウザペインで検索中だった場合はハイライトを解除
+        if let Some(prev) = self.search.take()
+            && let SearchTarget::Browser(prev_id) = prev.target
+        {
+            self.browsers.clear_find_highlight(prev_id);
+        }
+
+        // ターミナルでテキスト選択中なら、その文字列を初期クエリとして引き継ぐ
+        let initial_query = if let SearchTarget::Terminal(pid) = target
+            && let Some(sel) = &self.selection
+            && sel.pane_id == pid
+            && let Some(root) = ws.active_slot_ref().root.as_ref()
+            && let Some(pane) = root.terminal_pane(pid)
+        {
+            let text = pane.extract_tracked_selection_text(&sel.start, &sel.end);
+            text.lines().next().unwrap_or("").trim().to_string()
+        } else {
+            String::new()
+        };
+
+        let has_initial = !initial_query.is_empty();
+        self.search = Some(SearchState {
+            target,
+            query: initial_query,
+            select_all: has_initial,
+            matches: Vec::new(),
+            current_match: None,
+        });
+        if target.is_browser() {
+            self.browsers.focus_parent();
+        }
+        if has_initial {
+            self.update_search_results(true);
+        }
+        self.request_redraw_now();
+    }
+
+    pub(crate) fn close_search(&mut self) {
+        if let Some(search) = self.search.take() {
+            if let SearchTarget::Browser(pid) = search.target {
+                self.browsers.clear_find_highlight(pid);
+                if self
+                    .workspace
+                    .as_ref()
+                    .and_then(Workspace::focused_browser)
+                    .is_some_and(|b| b.id == pid)
+                {
+                    self.browsers.focus_webview(pid);
+                }
+            }
+            self.request_redraw_now();
+        }
+    }
+
+    pub(crate) fn update_search_results(&mut self, jump_to_match: bool) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        let query = search.query.clone();
+        match search.target {
+            SearchTarget::Terminal(pid) => {
+                let mut found = Vec::new();
+                if let Some(ws) = self.workspace.as_mut()
+                    && let Some(root) = ws.active_slot_mut().root.as_mut()
+                    && let Some(pane) = root.terminal_pane_mut(pid)
+                {
+                    found = pane.search_screen(&query);
+                    if jump_to_match && let Some(last) = found.last() {
+                        pane.scroll_to_screen_row(last.screen_row);
+                    }
+                }
+                search.current_match = if found.is_empty() {
+                    None
+                } else {
+                    Some(found.len() - 1)
+                };
+                search.matches = found;
+            }
+            SearchTarget::Browser(pid) => {
+                self.browsers.find_in_page(pid, &query, false, true);
+            }
+        }
+    }
+
+    pub(crate) fn step_search_match(&mut self, backwards: bool) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        match search.target {
+            SearchTarget::Terminal(pid) => {
+                if search.query.is_empty() {
+                    return;
+                }
+                // 新規出力でスクロールバックが変化している可能性があるため最新結果へ更新
+                let query = search.query.clone();
+                let mut found = Vec::new();
+                if let Some(ws) = self.workspace.as_mut()
+                    && let Some(root) = ws.active_slot_mut().root.as_mut()
+                    && let Some(pane) = root.terminal_pane_mut(pid)
+                {
+                    found = pane.search_screen(&query);
+                }
+                if found.is_empty() {
+                    search.matches.clear();
+                    search.current_match = None;
+                    return;
+                }
+                let len = found.len();
+                let next_idx = match search.current_match {
+                    Some(cur) if cur < len => {
+                        if backwards {
+                            (cur + len - 1) % len
+                        } else {
+                            (cur + 1) % len
+                        }
+                    }
+                    _ => {
+                        if backwards {
+                            len - 1
+                        } else {
+                            0
+                        }
+                    }
+                };
+                let target_row = found[next_idx].screen_row;
+                search.matches = found;
+                search.current_match = Some(next_idx);
+                if let Some(ws) = self.workspace.as_mut()
+                    && let Some(root) = ws.active_slot_mut().root.as_mut()
+                    && let Some(pane) = root.terminal_pane_mut(pid)
+                {
+                    pane.scroll_to_screen_row(target_row);
+                }
+            }
+            SearchTarget::Browser(pid) => {
+                let query = search.query.clone();
+                if !query.is_empty() {
+                    self.browsers.find_in_page(pid, &query, backwards, false);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn handle_search_key(&mut self, event: &KeyEvent) -> bool {
+        if event.state != ElementState::Pressed {
+            return true;
+        }
+        let Some(search) = self.search.as_mut() else {
+            return false;
+        };
+
+        if self.modifiers.super_key() && !self.modifiers.control_key() {
+            match &event.logical_key {
+                Key::Character(c) if c.eq_ignore_ascii_case("a") => {
+                    search.select_all = true;
+                    self.request_redraw_now();
+                    return true;
+                }
+                Key::Character(c) if c.eq_ignore_ascii_case("c") => {
+                    macos::write_clipboard_text(&search.query);
+                    return true;
+                }
+                Key::Character(c) if c.eq_ignore_ascii_case("v") => {
+                    if let Some(clip) = macos::read_clipboard_text() {
+                        let single_line = clip.replace(['\r', '\n'], "");
+                        if search.select_all {
+                            search.query.clear();
+                            search.select_all = false;
+                        }
+                        search.query.push_str(&single_line);
+                        self.update_search_results(true);
+                        self.request_redraw_now();
+                    }
+                    return true;
+                }
+                Key::Character(c) if c.eq_ignore_ascii_case("g") => {
+                    let backwards = self.modifiers.shift_key();
+                    self.step_search_match(backwards);
+                    self.request_redraw_now();
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.close_search();
+            }
+            Key::Named(NamedKey::Enter) => {
+                let backwards = self.modifiers.shift_key();
+                self.step_search_match(backwards);
+                self.request_redraw_now();
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if search.select_all {
+                    search.query.clear();
+                    search.select_all = false;
+                } else {
+                    search.query.pop();
+                }
+                self.update_search_results(true);
+                self.request_redraw_now();
+            }
+            _ => {
+                if !self.modifiers.super_key()
+                    && !self.modifiers.control_key()
+                    && let Some(text) = &event.text
+                {
+                    let filtered: String = text.chars().filter(|c| !c.is_control()).collect();
+                    if !filtered.is_empty() {
+                        if search.select_all {
+                            search.query.clear();
+                            search.select_all = false;
+                        }
+                        search.query.push_str(&filtered);
+                        self.update_search_results(true);
+                        self.request_redraw_now();
+                    }
+                }
+            }
+        }
+        true
+    }
+
     pub(crate) fn handle_shortcut(&mut self, shortcut: AppShortcut) {
         // URL バー編集中でもスロット切替やブラウザ切替を受けたら編集を閉じる
         if !matches!(
@@ -115,6 +369,13 @@ impl TentApp {
             AppShortcut::Copy | AppShortcut::Paste | AppShortcut::FocusUrlBar
         ) {
             self.url_bar_edit = None;
+        }
+        // 検索バー編集中でも検索操作以外のナビゲーションを受けたら検索を閉じる
+        if !matches!(
+            shortcut,
+            AppShortcut::Copy | AppShortcut::Paste | AppShortcut::Find
+        ) {
+            self.close_search();
         }
 
         match shortcut {
@@ -289,6 +550,9 @@ impl TentApp {
                     pane.clear_screen_and_scrollback();
                     self.request_redraw_now();
                 }
+            }
+            AppShortcut::Find => {
+                self.start_search();
             }
         }
     }
