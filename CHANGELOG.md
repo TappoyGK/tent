@@ -21,7 +21,7 @@
 - 内蔵ブラウザ（`WKWebView`）フォーカス中に基本的な編集ショートカット（`Cmd+C` / `Cmd+V` / `Cmd+Shift+V` / `Cmd+X` / `Cmd+A` / `Cmd+Z` / `Cmd+Shift+Z`）が効くように修正
 - リサイズによる折り返し変化・ビューポート上部の処理中表示・再出力後の古い通知フラグ保持によるターミナル状態（黄色／オレンジ）の偽陽性を修正
 - 不可視 PTY 再描画や AI TUI の下部 UI 更新によるターミナル状態（緑／黄／時刻）の偽陽性を修正（AI フック受信セッションでは PTY 出力由来の汎用判定を抑止）
-- サブエージェント完了フック（`SubagentStop` / `agent_id` / `parentConversationId` 等）や `agy` のバックグラウンド残存（`fullyIdle: false`）・Claude Code の `stop_hook_active: true` による親ペインの入力待ち（黄）偽陽性を修正
+- `tent hook` が stdin JSON のトップレベルフィールドを厳密に解析し、`SubagentStop` / `SubagentStart`・サブエージェント由来の完了イベント・`agy` のバックグラウンド残存（`fullyIdle: false`、`USER_CANCELED` を除く）を無視するよう修正（サブエージェントの許可待ち `PermissionRequest` / `Notification` は維持）
 
 ## [0.1.22] - 2026-11-27
 
