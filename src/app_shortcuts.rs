@@ -16,9 +16,12 @@ impl TentApp {
         let Some(b) = ws.focused_browser() else {
             return;
         };
+        let text = b.url.clone();
+        let cursor = text.len();
         self.url_bar_edit = Some(UrlBarEdit {
             pane_id: b.id,
-            text: b.url.clone(),
+            text,
+            cursor,
             select_all: true,
         });
         self.focus_terminal_view();
@@ -37,6 +40,7 @@ impl TentApp {
             match &event.logical_key {
                 Key::Character(c) if c.eq_ignore_ascii_case("a") => {
                     edit.select_all = true;
+                    edit.cursor = edit.text.len();
                     self.request_redraw_now();
                     return true;
                 }
@@ -44,16 +48,57 @@ impl TentApp {
                     macos::write_clipboard_text(&edit.text);
                     return true;
                 }
+                Key::Character(c) if c.eq_ignore_ascii_case("x") => {
+                    macos::write_clipboard_text(&edit.text);
+                    edit.text.clear();
+                    edit.cursor = 0;
+                    edit.select_all = false;
+                    self.request_redraw_now();
+                    return true;
+                }
                 Key::Character(c) if c.eq_ignore_ascii_case("v") => {
                     if let Some(clip) = macos::read_clipboard_text() {
                         let single_line = clip.replace(['\r', '\n'], "");
-                        if edit.select_all {
-                            edit.text.clear();
-                            edit.select_all = false;
-                        }
-                        edit.text.push_str(&single_line);
+                        edit.insert_str(&single_line);
                         self.request_redraw_now();
                     }
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        if self.modifiers.control_key() && !self.modifiers.super_key() && !self.modifiers.alt_key()
+        {
+            match &event.logical_key {
+                Key::Character(c) if c.eq_ignore_ascii_case("a") => {
+                    edit.move_home();
+                    self.request_redraw_now();
+                    return true;
+                }
+                Key::Character(c) if c.eq_ignore_ascii_case("e") => {
+                    edit.move_end();
+                    self.request_redraw_now();
+                    return true;
+                }
+                Key::Character(c) if c.eq_ignore_ascii_case("b") => {
+                    edit.move_left();
+                    self.request_redraw_now();
+                    return true;
+                }
+                Key::Character(c) if c.eq_ignore_ascii_case("f") => {
+                    edit.move_right();
+                    self.request_redraw_now();
+                    return true;
+                }
+                Key::Character(c) if c.eq_ignore_ascii_case("d") => {
+                    edit.delete_forward();
+                    self.request_redraw_now();
+                    return true;
+                }
+                Key::Character(c) if c.eq_ignore_ascii_case("h") => {
+                    edit.backspace();
+                    self.request_redraw_now();
                     return true;
                 }
                 _ => {}
@@ -79,12 +124,27 @@ impl TentApp {
                 self.request_redraw_now();
             }
             Key::Named(NamedKey::Backspace) => {
-                if edit.select_all {
-                    edit.text.clear();
-                    edit.select_all = false;
-                } else {
-                    edit.text.pop();
-                }
+                edit.backspace();
+                self.request_redraw_now();
+            }
+            Key::Named(NamedKey::Delete) => {
+                edit.delete_forward();
+                self.request_redraw_now();
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                edit.move_left();
+                self.request_redraw_now();
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                edit.move_right();
+                self.request_redraw_now();
+            }
+            Key::Named(NamedKey::Home) => {
+                edit.move_home();
+                self.request_redraw_now();
+            }
+            Key::Named(NamedKey::End) => {
+                edit.move_end();
                 self.request_redraw_now();
             }
             _ => {
@@ -92,13 +152,15 @@ impl TentApp {
                     && !self.modifiers.control_key()
                     && let Some(text) = &event.text
                 {
-                    let filtered: String = text.chars().filter(|c| !c.is_control()).collect();
+                    let filtered: String = text
+                        .chars()
+                        .filter(|&c| {
+                            let cp = c as u32;
+                            !c.is_control() && !(0xF700..=0xF8FF).contains(&cp)
+                        })
+                        .collect();
                     if !filtered.is_empty() {
-                        if edit.select_all {
-                            edit.text.clear();
-                            edit.select_all = false;
-                        }
-                        edit.text.push_str(&filtered);
+                        edit.insert_str(&filtered);
                         self.request_redraw_now();
                     }
                 }

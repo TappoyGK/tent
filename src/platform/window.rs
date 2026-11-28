@@ -515,13 +515,31 @@ fn nsevent_to_key_event(event: &NSEvent, state: ElementState) -> KeyEvent {
         }
     };
 
+    let text = match &logical_key {
+        Key::Named(n) if *n != crate::platform::NamedKey::Space => None,
+        _ => chars.and_then(|s| {
+            let cleaned: String = s
+                .chars()
+                .filter(|&c| {
+                    let cp = c as u32;
+                    cp >= 0x20 && cp != 0x7f && !(0xF700..=0xF8FF).contains(&cp)
+                })
+                .collect();
+            if cleaned.is_empty() {
+                None
+            } else {
+                Some(cleaned)
+            }
+        }),
+    };
+
     KeyEvent {
         physical_key,
         logical_key,
         unshifted_char,
         state,
         repeat,
-        text: chars.filter(|s| !s.is_empty()),
+        text,
     }
 }
 

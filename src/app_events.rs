@@ -653,11 +653,7 @@ impl TentApp {
                     self.ime_preedit.clear();
                     if !text.is_empty() {
                         if let Some(edit) = self.url_bar_edit.as_mut() {
-                            if edit.select_all {
-                                edit.text.clear();
-                                edit.select_all = false;
-                            }
-                            edit.text.push_str(&text);
+                            edit.insert_str(&text);
                         } else if let Some(search) = self.search.as_mut() {
                             if search.select_all {
                                 search.query.clear();
@@ -728,7 +724,7 @@ impl TentApp {
                     url_bar_editing: self
                         .url_bar_edit
                         .as_ref()
-                        .map(|e| (e.text.as_str(), e.select_all)),
+                        .map(|e| (e.text.as_str(), e.cursor, e.select_all)),
                     search_highlights: self.search.as_ref().and_then(|s| {
                         let crate::SearchTarget::Terminal(pid) = s.target else {
                             return None;

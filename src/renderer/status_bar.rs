@@ -413,7 +413,7 @@ impl Renderer {
 
             // URL バー背景・枠線・全選択ハイライト・テキスト
             let is_editing = overlays.url_bar_editing.is_some();
-            let is_select_all = overlays.url_bar_editing.is_some_and(|(_, sa)| sa);
+            let is_select_all = overlays.url_bar_editing.is_some_and(|(_, _, sa)| sa);
             let url_bg = if is_editing {
                 [0.07, 0.09, 0.13, 1.0]
             } else {
@@ -436,15 +436,22 @@ impl Renderer {
                 url_border,
             );
 
-            let display_url = if let Some((edit_text, select_all)) = overlays.url_bar_editing {
-                if select_all {
-                    edit_text.to_string()
+            let display_url =
+                if let Some((edit_text, cursor, select_all)) = overlays.url_bar_editing {
+                    if select_all {
+                        edit_text.to_string()
+                    } else {
+                        let pos = cursor.min(edit_text.len());
+                        let pos = if edit_text.is_char_boundary(pos) {
+                            pos
+                        } else {
+                            edit_text.len()
+                        };
+                        format!("{}|{}", &edit_text[..pos], &edit_text[pos..])
+                    }
                 } else {
-                    format!("{edit_text}|")
-                }
-            } else {
-                active_browser.map(|b| b.url.clone()).unwrap_or_default()
-            };
+                    active_browser.map(|b| b.url.clone()).unwrap_or_default()
+                };
             if is_select_all && !display_url.is_empty() {
                 let char_w = (11.5 * scale_factor).round().max(10.0) * 0.61;
                 let text_w = (display_url.chars().count() as f32 * char_w)

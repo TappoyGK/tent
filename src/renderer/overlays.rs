@@ -89,7 +89,7 @@ pub struct RenderOverlays<'a> {
     pub drag_hover_slot: Option<usize>,
     pub selection: Option<SelectionOverlay>,
     pub hovered_url: Option<UrlHoverOverlay>,
-    pub url_bar_editing: Option<(&'a str, bool)>,
+    pub url_bar_editing: Option<(&'a str, usize, bool)>,
     pub search_highlights: Option<SearchHighlightOverlay>,
     pub search_bar: Option<SearchBarOverlay<'a>>,
     pub battery: Option<crate::macos::BatteryStatus>,

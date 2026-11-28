@@ -65,7 +65,90 @@ pub(crate) fn selection_autoscroll_delta(py: f32, pane_rect: Rect, cell_h: f32) 
 pub(crate) struct UrlBarEdit {
     pub(crate) pane_id: PaneId,
     pub(crate) text: String,
+    /// UTF-8 バイト位置（常に文字境界）
+    pub(crate) cursor: usize,
     pub(crate) select_all: bool,
+}
+
+impl UrlBarEdit {
+    pub(crate) fn move_left(&mut self) {
+        if self.select_all {
+            self.select_all = false;
+            self.cursor = 0;
+            return;
+        }
+        if self.cursor > 0 {
+            self.cursor = self.text[..self.cursor]
+                .char_indices()
+                .next_back()
+                .map_or(0, |(idx, _)| idx);
+        }
+    }
+
+    pub(crate) fn move_right(&mut self) {
+        if self.select_all {
+            self.select_all = false;
+            self.cursor = self.text.len();
+            return;
+        }
+        if self.cursor < self.text.len()
+            && let Some(ch) = self.text[self.cursor..].chars().next()
+        {
+            self.cursor += ch.len_utf8();
+        }
+    }
+
+    pub(crate) fn move_home(&mut self) {
+        self.select_all = false;
+        self.cursor = 0;
+    }
+
+    pub(crate) fn move_end(&mut self) {
+        self.select_all = false;
+        self.cursor = self.text.len();
+    }
+
+    pub(crate) fn insert_str(&mut self, s: &str) {
+        if self.select_all {
+            self.text.clear();
+            self.cursor = 0;
+            self.select_all = false;
+        }
+        let pos = self.cursor.min(self.text.len());
+        self.text.insert_str(pos, s);
+        self.cursor = pos + s.len();
+    }
+
+    pub(crate) fn backspace(&mut self) {
+        if self.select_all {
+            self.text.clear();
+            self.cursor = 0;
+            self.select_all = false;
+            return;
+        }
+        if self.cursor > 0 {
+            let prev = self.text[..self.cursor]
+                .char_indices()
+                .next_back()
+                .map_or(0, |(idx, _)| idx);
+            self.text.drain(prev..self.cursor);
+            self.cursor = prev;
+        }
+    }
+
+    pub(crate) fn delete_forward(&mut self) {
+        if self.select_all {
+            self.text.clear();
+            self.cursor = 0;
+            self.select_all = false;
+            return;
+        }
+        if self.cursor < self.text.len()
+            && let Some(ch) = self.text[self.cursor..].chars().next()
+        {
+            self.text.drain(self.cursor..self.cursor + ch.len_utf8());
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,5 +327,39 @@ mod tests {
         assert_eq!(selection_autoscroll_delta(405.0, pane, cell_h), 1);
         assert!(selection_autoscroll_delta(440.0, pane, cell_h) > 1);
         assert_eq!(selection_autoscroll_delta(1000.0, pane, cell_h), 4);
+    }
+
+    #[test]
+    fn test_url_bar_edit_cursor_and_editing() {
+        let mut edit = UrlBarEdit {
+            pane_id: 1,
+            text: "https://a.jp".to_string(),
+            cursor: 12,
+            select_all: true,
+        };
+        // 全選択中に → を押すと末尾で選択解除される
+        edit.move_right();
+        assert!(!edit.select_all);
+        assert_eq!(edit.cursor, 12);
+
+        // 左に3文字戻って文字挿入（途中編集）
+        edit.move_left();
+        edit.move_left();
+        edit.move_left();
+        edit.insert_str("bc");
+        assert_eq!(edit.text, "https://abc.jp");
+        assert_eq!(edit.cursor, 11);
+
+        // Backspace / Delete
+        edit.backspace();
+        assert_eq!(edit.text, "https://ab.jp");
+        edit.delete_forward();
+        assert_eq!(edit.text, "https://abjp");
+
+        // Home / End
+        edit.move_home();
+        assert_eq!(edit.cursor, 0);
+        edit.move_end();
+        assert_eq!(edit.cursor, edit.text.len());
     }
 }
