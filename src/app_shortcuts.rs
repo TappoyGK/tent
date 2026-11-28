@@ -1,10 +1,9 @@
 use ghostty_vt::terminal::ScrollViewport;
-use winit::event::{ElementState, KeyEvent};
-use winit::keyboard::{Key, NamedKey};
 
 use crate::browser::{DEFAULT_BROWSER_URL, normalize_url_input};
 use crate::key_map::AppShortcut;
 use crate::macos;
+use crate::platform::{ElementState, Key, KeyEvent, NamedKey};
 use crate::slot::{SplitAxis, Workspace};
 use crate::{SearchState, SearchTarget, TentApp, UrlBarEdit};
 
@@ -22,7 +21,7 @@ impl TentApp {
             text: b.url.clone(),
             select_all: true,
         });
-        self.browsers.focus_parent();
+        self.focus_terminal_view();
         self.request_redraw_now();
     }
 
@@ -131,7 +130,7 @@ impl TentApp {
         {
             search.select_all = true;
             if target.is_browser() {
-                self.browsers.focus_parent();
+                self.focus_terminal_view();
             }
             self.request_redraw_now();
             return;
@@ -169,7 +168,7 @@ impl TentApp {
             last_sync_at: std::time::Instant::now(),
         });
         if target.is_browser() {
-            self.browsers.focus_parent();
+            self.focus_terminal_view();
         }
         if has_initial {
             self.update_search_results(true);

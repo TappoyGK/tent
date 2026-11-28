@@ -4,13 +4,12 @@ use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use super::clipboard::extract_pasteboard_image_to_temp;
 
-/// macOS の `WinitView` にファイル／スクショ画像 D&D ハンドラを登録する。
-/// `winit` 標準は非推奨の `NSFilenamesPboardType` のみ対応のため、
+/// macOS の `TentMetalView` にファイル／スクショ画像 D&D ハンドラを登録する。
 /// `public.file-url` およびスクショ右下サムネイル等の `public.png` / `public.tiff` も受け取れるようにする。
 #[cfg(target_os = "macos")]
 pub fn install_file_drop_handler(
-    window: &winit::window::Window,
-    proxy: winit::event_loop::EventLoopProxy<crate::terminal_pane::AppEvent>,
+    window: &crate::platform::NativeWindow,
+    proxy: crate::platform::AppProxy,
 ) {
     use std::ffi::c_char;
     use std::ptr::NonNull;
@@ -24,10 +23,8 @@ pub fn install_file_drop_handler(
     use objc2::{msg_send, sel};
     use objc2_core_foundation::{CGPoint, CGRect};
     use objc2_foundation::{NSArray, NSDictionary, NSString, NSURL};
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-    static DROP_PROXY: OnceLock<winit::event_loop::EventLoopProxy<crate::terminal_pane::AppEvent>> =
-        OnceLock::new();
+    static DROP_PROXY: OnceLock<crate::platform::AppProxy> = OnceLock::new();
     let _ = DROP_PROXY.set(proxy);
 
     unsafe fn drag_location_px(sender: *mut AnyObject) -> Option<(f32, f32)> {
@@ -280,13 +277,7 @@ pub fn install_file_drop_handler(
         Bool::NO
     }
 
-    let Ok(handle) = window.window_handle() else {
-        return;
-    };
-    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
-        return;
-    };
-    let view = appkit.ns_view.as_ptr().cast::<AnyObject>();
+    let view = window.metal_view_ptr();
     if view.is_null() {
         return;
     }
@@ -379,7 +370,7 @@ pub fn install_file_drop_handler(
 
 #[cfg(not(target_os = "macos"))]
 pub fn install_file_drop_handler(
-    _window: &winit::window::Window,
-    _proxy: winit::event_loop::EventLoopProxy<crate::terminal_pane::AppEvent>,
+    _window: &crate::platform::NativeWindow,
+    _proxy: crate::platform::AppProxy,
 ) {
 }

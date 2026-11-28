@@ -17,7 +17,8 @@ use glyphon::{
     TextRenderer, Viewport, Wrap,
 };
 use wgpu::util::DeviceExt;
-use winit::window::Window;
+
+use crate::platform::NativeWindow as Window;
 
 pub use overlays::{
     MemoryOverlay, RenderOutcome, RenderOverlays, SearchBarOverlay, SearchHighlightOverlay,

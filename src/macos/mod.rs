@@ -12,9 +12,7 @@ pub use clipboard::{
     read_clipboard_text, resolve_terminal_paste_payload, save_clipboard_image_to_temp,
     shell_escape_path, write_clipboard_text,
 };
-pub use cursor_rects::{
-    AppCursorKind, install_cursor_rect_passthrough, invalidate_cursor_rects, set_app_cursor_kind,
-};
+pub use cursor_rects::{AppCursorKind, subtract_cursor_rects};
 pub use file_drop::install_file_drop_handler;
 #[cfg(test)]
 pub use process::detect_ai_tool_from_process;

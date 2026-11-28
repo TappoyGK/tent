@@ -1,8 +1,7 @@
 use ghostty_vt::Terminal;
 use ghostty_vt::key::{Action, Encoder, Event as VtKeyEvent, Key as VtKey, Mods, OptionAsAlt};
-use winit::event::{ElementState, KeyEvent};
-use winit::keyboard::{Key, KeyCode, ModifiersState, PhysicalKey};
-use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+
+use crate::platform::{ElementState, Key, KeyCode, KeyEvent, ModifiersState, PhysicalKey};
 
 /// ペインフォーカス移動方向
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,7 +120,7 @@ pub fn match_app_shortcut(event: &KeyEvent, mods: ModifiersState) -> Option<AppS
     }
 }
 
-/// winit の KeyEvent に依存しない純粋なキー入力情報（ユニットテスト可能）
+/// プラットフォームの KeyEvent に依存しない純粋なキー入力情報（ユニットテスト可能）
 pub struct KeyInput<'a> {
     pub action: Action,
     pub key: VtKey,
@@ -132,7 +131,7 @@ pub struct KeyInput<'a> {
     pub text: Option<&'a str>,
 }
 
-/// winit のキーイベントを ghostty_vt::key::Encoder でエスケープシーケンスに変換する
+/// プラットフォームのキーイベントを ghostty_vt::key::Encoder でエスケープシーケンスに変換する
 pub fn encode_key_event(
     encoder: &mut Encoder,
     terminal: &Terminal,
@@ -150,12 +149,9 @@ pub fn encode_key_event(
         ElementState::Released => return Vec::new(),
     };
 
-    let unshifted_char = match event.key_without_modifiers() {
-        Key::Character(ref s) => s.chars().next(),
-        _ => None,
-    };
+    let unshifted_char = event.unshifted_char;
 
-    // winit の logical_key は macOS の charactersIgnoringModifiers に由来するため、
+    // logical_key は macOS の charactersIgnoringModifiers に由来するため、
     // Ctrl/Option 併用時でも現在のOSキーボード配列（JIS/US等）における Shift 適用後文字を保持する
     let shifted_char = if mods.shift_key() {
         match &event.logical_key {
@@ -419,7 +415,6 @@ fn map_physical_key(key: PhysicalKey) -> VtKey {
         KeyCode::AltRight => VtKey::AltRight,
         KeyCode::Backspace => VtKey::Backspace,
         KeyCode::CapsLock => VtKey::CapsLock,
-        KeyCode::ContextMenu => VtKey::ContextMenu,
         KeyCode::ControlLeft => VtKey::ControlLeft,
         KeyCode::ControlRight => VtKey::ControlRight,
         KeyCode::Enter => VtKey::Enter,
@@ -453,7 +448,6 @@ fn map_physical_key(key: PhysicalKey) -> VtKey {
         KeyCode::F11 => VtKey::F11,
         KeyCode::F12 => VtKey::F12,
         KeyCode::NumpadEnter => VtKey::NumpadEnter,
-        _ => VtKey::Unidentified,
     }
 }
 

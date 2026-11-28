@@ -2,16 +2,14 @@ use std::collections::VecDeque;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalPosition, LogicalSize};
-use winit::event::WindowEvent;
-use winit::event_loop::ActiveEventLoop;
-use winit::window::{Window, WindowId};
-
 use crate::browser::{current_macos_modifiers, install_macos_shortcut_monitor};
 use crate::daemon::{DaemonClient, DaemonEvent, default_socket_path};
 use crate::layout::AppLayout;
 use crate::macos;
+use crate::platform::{
+    ActiveEventLoop, ApplicationHandler, LogicalPosition, LogicalSize, WindowAttributes,
+    WindowEvent,
+};
 use crate::renderer::Renderer;
 use crate::slot::Workspace;
 use crate::state::SavedState;
@@ -22,7 +20,7 @@ use crate::{
     selection_autoscroll_delta, spawn_replacement_instance,
 };
 
-impl ApplicationHandler<AppEvent> for TentApp {
+impl ApplicationHandler for TentApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -34,23 +32,12 @@ impl ApplicationHandler<AppEvent> for TentApp {
             .unwrap_or_else(SavedState::default_home);
         self.sidebar_state = saved.sidebar_state;
 
-        let mut attrs = Window::default_attributes().with_title("TenT");
+        let mut attrs = WindowAttributes::default();
         if let Some(geom) = saved.window_geometry {
-            attrs = attrs
-                .with_inner_size(LogicalSize::new(
-                    f64::from(geom.width),
-                    f64::from(geom.height),
-                ))
-                .with_position(LogicalPosition::new(geom.x, geom.y));
-        } else {
-            attrs = attrs.with_inner_size(LogicalSize::new(1440.0, 880.0));
+            attrs.inner_size = LogicalSize::new(f64::from(geom.width), f64::from(geom.height));
+            attrs.position = Some(LogicalPosition::new(geom.x, geom.y));
         }
-        let window = Arc::new(
-            event_loop
-                .create_window(attrs)
-                .expect("failed to create window"),
-        );
-        window.set_ime_allowed(true);
+        let window = event_loop.create_window(attrs);
 
         // Dock / Cmd+Tab に TenT のカスタムアイコンを適用
         macos::install_app_icon();
@@ -58,8 +45,6 @@ impl ApplicationHandler<AppEvent> for TentApp {
         install_macos_shortcut_monitor(self.proxy.clone());
         // Finder ファイル・スクショ右下サムネイル等の D&D を確実に受け取る
         macos::install_file_drop_handler(&window, self.proxy.clone());
-        // WKWebView 上の CSS カーソル（リンクのポインタ等）が WinitView に上書きされないようにする
-        macos::install_cursor_rect_passthrough(&window);
 
         let scale = window.scale_factor() as f32;
         let gap = (6.0 * scale).round();
@@ -468,12 +453,7 @@ impl ApplicationHandler<AppEvent> for TentApp {
         self.update_control_flow(event_loop);
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
-        event: WindowEvent,
-    ) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         self.handle_window_event(event_loop, event);
     }
 }
